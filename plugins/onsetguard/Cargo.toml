@@ -14,4 +14,5 @@ crate-type = ["lib", "cdylib"]
 nih_plug = { path = "../../", features = ["assert_process_allocs"] }
 nih_plug_vizia = { path = "../../nih_plug_vizia" }
 realfft = "3.0"
+atomic_float = "0.1"
 

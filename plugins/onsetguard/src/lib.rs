@@ -15,8 +15,10 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use atomic_float::AtomicF32;
 use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 pub mod dsp;
@@ -27,9 +29,32 @@ use dsp::{Engine, Settings};
 pub struct OnsetGuard {
     params: Arc<OnsetGuardParams>,
     engine: Option<Engine>,
+    meters: Arc<Meters>,
     sample_rate: f32,
     max_block: usize,
     num_channels: usize,
+}
+
+/// Values shared with the editor for metering.
+pub struct Meters {
+    /// Gain reduction of the spectral (per-bin ceiling) stage, dB <= 0.
+    pub gr_spec_db: AtomicF32,
+    /// Gain reduction of the post soft clipper, dB <= 0.
+    pub gr_post_db: AtomicF32,
+    /// K-weighted level of the dry and processed signals (LUFS-style, 3 s window).
+    pub dry_lufs: AtomicF32,
+    pub wet_lufs: AtomicF32,
+}
+
+impl Default for Meters {
+    fn default() -> Self {
+        Meters {
+            gr_spec_db: AtomicF32::new(0.0),
+            gr_post_db: AtomicF32::new(0.0),
+            dry_lufs: AtomicF32::new(-100.0),
+            wet_lufs: AtomicF32::new(-100.0),
+        }
+    }
 }
 
 #[derive(Enum, Debug, PartialEq, Eq, Clone, Copy)]
@@ -379,6 +404,7 @@ impl Default for OnsetGuard {
         OnsetGuard {
             params: Arc::new(OnsetGuardParams::default()),
             engine: None,
+            meters: Arc::new(Meters::default()),
             sample_rate: 48000.0,
             max_block: 0,
             num_channels: 2,
@@ -416,7 +442,11 @@ impl Plugin for OnsetGuard {
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        editor::create(self.params.clone(), self.params.editor_state.clone())
+        editor::create(
+            self.params.clone(),
+            self.meters.clone(),
+            self.params.editor_state.clone(),
+        )
     }
 
     fn initialize(
@@ -463,6 +493,14 @@ impl Plugin for OnsetGuard {
         engine.process(buffer.as_slice(), len, &s);
         if engine.latency() != before {
             context.set_latency_samples(engine.latency() as u32);
+        }
+        if self.params.editor_state.is_open() {
+            let (gr_spec, gr_post) = engine.gain_reduction();
+            let (_, dry, wet) = engine.meters();
+            self.meters.gr_spec_db.store(gr_spec, Ordering::Relaxed);
+            self.meters.gr_post_db.store(gr_post, Ordering::Relaxed);
+            self.meters.dry_lufs.store(dry, Ordering::Relaxed);
+            self.meters.wet_lufs.store(wet, Ordering::Relaxed);
         }
         ProcessStatus::Normal
     }

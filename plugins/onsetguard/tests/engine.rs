@@ -236,3 +236,44 @@ fn e_extra(lat: usize) -> usize {
     let _ = lat;
     0
 }
+
+#[test]
+fn gain_reduction_meters_split_spectral_and_post() {
+    // Drive hard: spectral stage must take most of the reduction with a low spectral ceiling,
+    // and the post clipper most of it when the spectral ceiling is at 0 dB.
+    let clap = synth_clap(5);
+    let zap = synth_zap();
+    let mut e = Engine::new(1, SR, BLOCK);
+    let mut s = Settings::default();
+    s.drive_db = 12.0;
+    s.trans_clip = 1.0;
+    s.protect_on = false;
+    for (name, src, bin_ceil, expect_spec_dominant) in [
+        ("zap", &zap, -12.0f32, Some(true)),
+        ("zap", &zap, 0.0, Some(false)),
+        ("clap", &clap, -12.0, None),
+        ("clap", &clap, -30.0, None),
+    ] {
+        let clap = src;
+        s.bin_ceil_db = bin_ceil;
+        e.set_windows(s.long_order, s.short_order, s.oversample);
+        let mut pos = 0;
+        let total = clap.len() + e.latency();
+        let (mut min_spec, mut min_post) = (0.0f32, 0.0f32);
+        while pos < total {
+            let n = BLOCK.min(total - pos);
+            let mut c: Vec<f32> = (0..n).map(|i| clap.get(pos + i).copied().unwrap_or(0.0)).collect();
+            { let mut r: Vec<&mut [f32]> = vec![&mut c[..]]; e.process(&mut r, n, &s); }
+            let (gs, gp) = e.gain_reduction();
+            min_spec = min_spec.min(gs);
+            min_post = min_post.min(gp);
+            pos += n;
+        }
+        println!("{name}, bin ceil {bin_ceil} dB: spectral GR {min_spec:.1} dB, post GR {min_post:.1} dB");
+        match expect_spec_dominant {
+            Some(true) => assert!(min_spec < min_post, "spectral stage should dominate"),
+            Some(false) => assert!(min_post < min_spec, "post clipper should dominate"),
+            None => {}
+        }
+    }
+}

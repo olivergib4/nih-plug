@@ -200,6 +200,11 @@ pub struct Engine {
     k_dry: loudness::KMeter,
     k_wet: loudness::KMeter,
     match_gain: f32,
+    /// Gain reduction meters (dB, <= 0): spectral (per-bin ceiling) stage and post soft clip.
+    gr_spec_db: f32,
+    gr_post_db: f32,
+    pending_pk_spec: f32,
+    pending_clip_on: bool,
 
     // scratch, sized max_block
     wide: Vec<Vec<f32>>, // 2*num_channels for the long stage
@@ -245,6 +250,10 @@ impl Engine {
             k_dry: loudness::KMeter::new(sample_rate, num_channels, 3.0),
             k_wet: loudness::KMeter::new(sample_rate, num_channels, 3.0),
             match_gain: 1.0,
+            gr_spec_db: 0.0,
+            gr_post_db: 0.0,
+            pending_pk_spec: 0.0,
+            pending_clip_on: false,
             wide: vec![vec![0.0; max_block]; 2 * num_channels],
             a: vec![vec![0.0; max_block]; num_channels],
             refd: vec![vec![0.0; max_block]; num_channels],
@@ -308,11 +317,19 @@ impl Engine {
         self.k_dry.reset();
         self.k_wet.reset();
         self.match_gain = 1.0;
+        self.gr_spec_db = 0.0;
+        self.gr_post_db = 0.0;
     }
 
     /// Current loudness-match gain (wet/dry, linear) and K-weighted levels, for meters.
     pub fn meters(&self) -> (f32, f32, f32) {
         (self.match_gain, self.k_dry.lufs(), self.k_wet.lufs())
+    }
+
+    /// Gain reduction in dB (<= 0) of the spectral (per-bin ceiling) stage and the post soft
+    /// clipper, measured on block peaks with a slow release.
+    pub fn gain_reduction(&self) -> (f32, f32) {
+        (self.gr_spec_db, self.gr_post_db)
     }
 
     /// Process `len` samples in place. `channels.len()` must equal `num_channels`.
@@ -464,6 +481,7 @@ impl Engine {
                     }
                 }
             });
+            let pk_spec = block_peak(&self.cl, nc, len);
             let mut refs = self.cl.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
             if clip_on {
                 self.oversampler.process(refs.as_mut(), len, ceil, s.hardness);
@@ -471,15 +489,25 @@ impl Engine {
                 // keep latency constant: plain delay through the oversampler path
                 self.oversampler.process(refs.as_mut(), len, 1e6, 0.999);
             }
+            let pk_post = block_peak(&self.cl, nc, len);
+            // The post-clip signal is 16 samples later than pk_spec's; negligible for a block meter.
+            let gr_post = if clip_on && pk_spec > 1e-6 { (20.0 * (pk_post / pk_spec).log10()).min(0.0) } else { 0.0 };
+            self.gr_post_db = if gr_post < self.gr_post_db { gr_post } else { self.gr_post_db + (gr_post - self.gr_post_db) * (len as f32 / (0.3 * sr)).min(1.0) };
+            self.pending_pk_spec = pk_spec;
+            self.pending_clip_on = clip_on;
         }
         let l_clip = self.clip_stft.window_size() + clip::LATENCY;
         let gain = s.output_gain;
         let mix = s.mix.clamp(0.0, 1.0);
+        let mut pk_in = 0.0f32;
         for i in 0..len {
             for ch in 0..nc {
                 self.tmp_in[ch] = self.driven[ch][i];
             }
             self.driven_delay.tick(&self.tmp_in[..nc], &mut self.tmp_out[..nc]);
+            for ch in 0..nc {
+                pk_in = pk_in.max(self.tmp_out[ch].abs());
+            }
             let t_in = base_t + i;
             let t = t_in.wrapping_sub(l_spec_total + l_clip);
             let pc = if t_in >= l_spec_total + l_clip { self.pc_ring.take(t) } else { 0.0 };
@@ -508,9 +536,24 @@ impl Engine {
                 channels[ch][i] = out;
             }
         }
+        {
+            // spectral-stage GR: block peak after the per-bin ceiling vs the aligned driven input
+            let gr_spec = if self.pending_clip_on && pk_in > 1e-6 { (20.0 * (self.pending_pk_spec / pk_in).log10()).min(0.0) } else { 0.0 };
+            self.gr_spec_db = if gr_spec < self.gr_spec_db { gr_spec } else { self.gr_spec_db + (gr_spec - self.gr_spec_db) * (len as f32 / (0.3 * sr)).min(1.0) };
+        }
         self.pos += len;
         self.cur = *s;
     }
+}
+
+fn block_peak(bufs: &[Vec<f32>], nc: usize, len: usize) -> f32 {
+    let mut m = 0.0f32;
+    for ch in 0..nc {
+        for v in &bufs[ch][..len] {
+            m = m.max(v.abs());
+        }
+    }
+    m
 }
 
 /// Mono-below applied directly to a stereo spectrum pair (zero-phase, one-octave crossfade).

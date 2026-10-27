@@ -2,17 +2,20 @@ use nih_plug::prelude::Editor;
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::OnsetGuardParams;
+use crate::{Meters, OnsetGuardParams};
 
 const COLUMN_WIDTH: Units = Pixels(340.0);
 const GUI_WIDTH: u32 = 1040;
-const GUI_HEIGHT: u32 = 640;
+const GUI_HEIGHT: u32 = 720;
 
 #[derive(Clone, Lens)]
 pub struct Data {
     pub params: Arc<OnsetGuardParams>,
+    pub meters: Arc<Meters>,
 }
 
 impl Model for Data {}
@@ -23,6 +26,7 @@ pub(crate) fn default_state() -> Arc<ViziaState> {
 
 pub(crate) fn create(
     params: Arc<OnsetGuardParams>,
+    meters: Arc<Meters>,
     editor_state: Arc<ViziaState>,
 ) -> Option<Box<dyn Editor>> {
     create_vizia_editor(editor_state, ViziaTheming::Custom, move |cx, _| {
@@ -31,6 +35,7 @@ pub(crate) fn create(
 
         Data {
             params: params.clone(),
+            meters: meters.clone(),
         }
         .build(cx);
 
@@ -94,6 +99,27 @@ pub(crate) fn create(
                 });
             })
             .size(Auto);
+
+            // --- meters: how much each clip stage is doing ---
+            HStack::new(cx, |cx| {
+                meter(cx, "Spectral clip GR", Data::meters.map(|m| m.gr_spec_db.load(Ordering::Relaxed)));
+                meter(cx, "Post clip GR", Data::meters.map(|m| m.gr_post_db.load(Ordering::Relaxed)));
+                meter(cx, "Dry K-level", Data::meters.map(|m| m.dry_lufs.load(Ordering::Relaxed)));
+                meter(cx, "Processed K-level", Data::meters.map(|m| m.wet_lufs.load(Ordering::Relaxed)));
+            })
+            .col_between(Pixels(16.0))
+            .child_left(Stretch(1.0))
+            .child_right(Stretch(1.0))
+            .size(Auto);
+
+            Label::new(
+                cx,
+                "If Post clip GR is doing most of the work, lower Spectral Ceiling or Drive: \
+                 the spectral stage should take the bulk of the reduction.",
+            )
+            .font_size(11.0)
+            .left(Stretch(1.0))
+            .right(Stretch(1.0));
         })
         .row_between(Pixels(10.0))
         .child_left(Stretch(1.0))
@@ -101,6 +127,15 @@ pub(crate) fn create(
 
         ResizeHandle::new(cx);
     })
+}
+
+fn meter(cx: &mut Context, title: &str, value_db: impl Lens<Target = f32>) {
+    VStack::new(cx, |cx| {
+        Label::new(cx, title).font_size(12.0);
+        PeakMeter::new(cx, value_db, Some(Duration::from_millis(600))).top(Pixels(4.0));
+    })
+    .width(Pixels(230.0))
+    .height(Auto);
 }
 
 fn make_column(cx: &mut Context, title: &str, contents: impl FnOnce(&mut Context)) {

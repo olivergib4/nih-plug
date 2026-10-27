@@ -19,17 +19,22 @@ use atomic_float::AtomicF32;
 use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use triple_buffer::TripleBuffer;
 
+pub mod analyzer;
 pub mod dsp;
 mod editor;
 
+use dsp::dynamics::Weighting;
 use dsp::{Engine, Settings};
 
 pub struct OnsetGuard {
     params: Arc<OnsetGuardParams>,
     engine: Option<Engine>,
     meters: Arc<Meters>,
+    analyzer_in: triple_buffer::Input<analyzer::AnalyzerData>,
+    analyzer_out: Arc<Mutex<triple_buffer::Output<analyzer::AnalyzerData>>>,
     sample_rate: f32,
     max_block: usize,
     num_channels: usize,
@@ -55,6 +60,19 @@ impl Default for Meters {
             wet_lufs: AtomicF32::new(-100.0),
         }
     }
+}
+
+#[derive(Enum, Debug, PartialEq, Eq, Clone, Copy)]
+pub enum DetectorWeighting {
+    #[id = "off"]
+    #[name = "Flat"]
+    Off,
+    #[id = "k"]
+    #[name = "K-weighted"]
+    K,
+    #[id = "equal_loudness"]
+    #[name = "Equal loudness"]
+    EqualLoudness,
 }
 
 #[derive(Enum, Debug, PartialEq, Eq, Clone, Copy)]
@@ -116,6 +134,8 @@ pub struct ResolutionParams {
 
 #[derive(Params)]
 pub struct ThresholdParams {
+    #[id = "weighting"]
+    pub weighting: EnumParam<DetectorWeighting>,
     #[id = "threshold"]
     pub threshold_db: FloatParam,
     #[id = "center"]
@@ -176,6 +196,8 @@ pub struct ClipParams {
     pub hardness: FloatParam,
     #[id = "trans_clip"]
     pub trans_clip: FloatParam,
+    #[id = "clip_link"]
+    pub clip_link: FloatParam,
     #[id = "oversample"]
     pub oversample: EnumParam<Oversample>,
 }
@@ -269,6 +291,7 @@ impl Default for OnsetGuardParams {
             .with_step_size(1.0),
             }),
             threshold: Arc::new(ThresholdParams {
+            weighting: EnumParam::new("Detector Weighting", DetectorWeighting::Off),
             threshold_db: db_param("Threshold", d.dyn_.threshold_db, -80.0, 0.0),
             center_hz: FloatParam::new(
                 "Threshold Center",
@@ -349,6 +372,7 @@ impl Default for OnsetGuardParams {
             ceil_db: db_param("Output Ceiling", d.ceil_db, -12.0, 0.0),
             hardness: pct_param("Clip Hardness", d.hardness),
             trans_clip: pct_param("Transient Clip Amount", d.trans_clip),
+            clip_link: pct_param("Clip Stereo Link", d.clip_link),
             oversample: EnumParam::new("Oversample", Oversample::X4),
             }),
         }
@@ -358,6 +382,11 @@ impl Default for OnsetGuardParams {
 impl OnsetGuardParams {
     fn settings(&self) -> Settings {
         let mut s = Settings::default();
+        s.dyn_.weighting = match self.threshold.weighting.value() {
+            DetectorWeighting::Off => Weighting::Off,
+            DetectorWeighting::K => Weighting::K,
+            DetectorWeighting::EqualLoudness => Weighting::EqualLoudness,
+        };
         s.dyn_.threshold_db = self.threshold.threshold_db.value();
         s.dyn_.center_hz = self.threshold.center_hz.value();
         s.dyn_.slope_db_oct = self.threshold.slope_db_oct.value();
@@ -386,6 +415,7 @@ impl OnsetGuardParams {
         s.ceil_db = self.clip.ceil_db.value();
         s.hardness = self.clip.hardness.value();
         s.trans_clip = self.clip.trans_clip.value();
+        s.clip_link = self.clip.clip_link.value();
         s.oversample = match self.clip.oversample.value() {
             Oversample::X1 => 1,
             Oversample::X2 => 2,
@@ -401,10 +431,13 @@ impl OnsetGuardParams {
 
 impl Default for OnsetGuard {
     fn default() -> Self {
+        let (analyzer_in, analyzer_out) = TripleBuffer::default().split();
         OnsetGuard {
             params: Arc::new(OnsetGuardParams::default()),
             engine: None,
             meters: Arc::new(Meters::default()),
+            analyzer_in,
+            analyzer_out: Arc::new(Mutex::new(analyzer_out)),
             sample_rate: 48000.0,
             max_block: 0,
             num_channels: 2,
@@ -445,6 +478,7 @@ impl Plugin for OnsetGuard {
         editor::create(
             self.params.clone(),
             self.meters.clone(),
+            self.analyzer_out.clone(),
             self.params.editor_state.clone(),
         )
     }
@@ -501,6 +535,10 @@ impl Plugin for OnsetGuard {
             self.meters.gr_post_db.store(gr_post, Ordering::Relaxed);
             self.meters.dry_lufs.store(dry, Ordering::Relaxed);
             self.meters.wet_lufs.store(wet, Ordering::Relaxed);
+            let a = self.analyzer_in.input_buffer();
+            engine.analyzer(analyzer::F_LO, analyzer::F_HI, &mut a.env_db, &mut a.gain_db, &mut a.thr_db);
+            a.protect = engine.protect_activity();
+            self.analyzer_in.publish();
         }
         ProcessStatus::Normal
     }

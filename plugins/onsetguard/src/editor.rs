@@ -3,19 +3,21 @@ use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::analyzer::{Analyzer, AnalyzerData};
 use crate::{Meters, OnsetGuardParams};
 
 const COLUMN_WIDTH: Units = Pixels(340.0);
 const GUI_WIDTH: u32 = 1040;
-const GUI_HEIGHT: u32 = 720;
+const GUI_HEIGHT: u32 = 900;
 
 #[derive(Clone, Lens)]
 pub struct Data {
     pub params: Arc<OnsetGuardParams>,
     pub meters: Arc<Meters>,
+    pub analyzer: Arc<Mutex<triple_buffer::Output<AnalyzerData>>>,
 }
 
 impl Model for Data {}
@@ -27,6 +29,7 @@ pub(crate) fn default_state() -> Arc<ViziaState> {
 pub(crate) fn create(
     params: Arc<OnsetGuardParams>,
     meters: Arc<Meters>,
+    analyzer: Arc<Mutex<triple_buffer::Output<AnalyzerData>>>,
     editor_state: Arc<ViziaState>,
 ) -> Option<Box<dyn Editor>> {
     create_vizia_editor(editor_state, ViziaTheming::Custom, move |cx, _| {
@@ -36,6 +39,7 @@ pub(crate) fn create(
         Data {
             params: params.clone(),
             meters: meters.clone(),
+            analyzer: analyzer.clone(),
         }
         .build(cx);
 
@@ -53,6 +57,19 @@ pub(crate) fn create(
             })
             .height(Pixels(40.0))
             .top(Pixels(6.0));
+
+            // --- analyzer: detector spectrum, threshold curve, applied gain ---
+            Analyzer::new(cx, Data::analyzer)
+                .width(Pixels(1010.0))
+                .height(Pixels(190.0));
+            Label::new(
+                cx,
+                "grey: what the detector hears · orange: threshold curve · blue/green bars: \
+                 cut/boost per frequency · yellow strip: a hit is being protected",
+            )
+            .font_size(11.0)
+            .left(Stretch(1.0))
+            .right(Stretch(1.0));
 
             HStack::new(cx, |cx| {
                 make_column(cx, "Threshold", |cx| {

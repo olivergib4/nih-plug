@@ -16,7 +16,7 @@ pub mod loudness;
 pub mod onset;
 pub mod stft;
 
-use dynamics::{Band, Dynamics, DynamicsSettings};
+use dynamics::{Band, Dynamics, DynamicsSettings, Weighting};
 use realfft::num_complex::Complex32;
 
 pub const MIN_LONG_ORDER: usize = 9;
@@ -48,6 +48,7 @@ pub struct Settings {
     pub ceil_db: f32,
     pub hardness: f32,
     pub trans_clip: f32,
+    pub clip_link: f32,
     pub oversample: usize,
 
     pub mix: f32,
@@ -59,6 +60,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             dyn_: DynamicsSettings {
+                weighting: Weighting::Off,
                 threshold_db: -24.0,
                 center_hz: 1000.0,
                 slope_db_oct: -4.5,
@@ -69,7 +71,7 @@ impl Default for Settings {
                 attack_ms: 10.0,
                 release_ms: 120.0,
                 smooth_oct: 0.17,
-                stereo_link: 0.8,
+                stereo_link: 1.0,
                 crossover_hz: 300.0,
                 mono_below_hz: 120.0,
             },
@@ -88,6 +90,7 @@ impl Default for Settings {
             ceil_db: 0.0,
             hardness: 0.6,
             trans_clip: 0.5,
+            clip_link: 1.0,
             oversample: 4,
             mix: 1.0,
             output_gain: 1.0,
@@ -205,6 +208,8 @@ pub struct Engine {
     gr_post_db: f32,
     pending_pk_spec: f32,
     pending_clip_on: bool,
+    /// Fraction of the last block where the protection envelope was active (for display).
+    protect_vis: f32,
 
     // scratch, sized max_block
     wide: Vec<Vec<f32>>, // 2*num_channels for the long stage
@@ -254,6 +259,7 @@ impl Engine {
             gr_post_db: 0.0,
             pending_pk_spec: 0.0,
             pending_clip_on: false,
+            protect_vis: 0.0,
             wide: vec![vec![0.0; max_block]; 2 * num_channels],
             a: vec![vec![0.0; max_block]; num_channels],
             refd: vec![vec![0.0; max_block]; num_channels],
@@ -324,6 +330,27 @@ impl Engine {
     /// Current loudness-match gain (wet/dry, linear) and K-weighted levels, for meters.
     pub fn meters(&self) -> (f32, f32, f32) {
         (self.match_gain, self.k_dry.lufs(), self.k_wet.lufs())
+    }
+
+    /// Fill analyzer arrays on a log-frequency grid from `f_lo` to `f_hi` Hz: envelope dB, gain dB
+    /// and threshold dB. Each point comes from whichever resolution stage owns that frequency.
+    pub fn analyzer(&self, f_lo: f32, f_hi: f32, env: &mut [f32], gain: &mut [f32], thr: &mut [f32]) {
+        let n = env.len();
+        let (l0, l1) = (f_lo.ln(), f_hi.ln());
+        for i in 0..n {
+            let f = (l0 + (l1 - l0) * i as f32 / (n - 1).max(1) as f32).exp();
+            let (e_l, g_l, t_l, w_l) = self.low_dyn.sample_at(f);
+            let (e_h, g_h, t_h, w_h) = self.high_dyn.sample_at(f);
+            let wl = w_l / (w_l + w_h).max(1e-6);
+            env[i] = e_l * wl + e_h * (1.0 - wl);
+            gain[i] = g_l + g_h; // stages are in series and each is band-weighted
+            thr[i] = t_l * wl + t_h * (1.0 - wl);
+        }
+    }
+
+    /// Protection activity for display: 1 while hits are being guarded, decaying to 0.
+    pub fn protect_activity(&self) -> f32 {
+        self.protect_vis
     }
 
     /// Gain reduction in dB (<= 0) of the spectral (per-bin ceiling) stage and the post soft
@@ -437,6 +464,7 @@ impl Engine {
         let drive = 10f32.powf(s.drive_db / 20.0);
         let base_t = self.pos; // input time of channels[..][0]
         let l_spec_total = self.long_stft.window_size() + self.short_stft.window_size() + self.extra_delay;
+        let mut prot_count = 0usize;
         for i in 0..len {
             for ch in 0..nc {
                 self.tmp_in[ch] = self.a[ch][i];
@@ -454,12 +482,20 @@ impl Engine {
             } else {
                 (1.0, 0.0)
             };
+            if p < 0.999 {
+                prot_count += 1;
+            }
             for ch in 0..nc {
                 let r = self.tmp_out[ch];
                 let y = r + (self.a[ch][i] - r) * p + r * tb;
                 self.driven[ch][i] = y * drive;
                 self.cl[ch][i] = y * drive;
             }
+        }
+
+        {
+            let frac = prot_count as f32 / len as f32;
+            self.protect_vis = if frac > self.protect_vis { frac } else { self.protect_vis * 0.9 };
         }
 
         // --- spectral clip + oversampled clip on cl; driven delayed to match ---
@@ -484,10 +520,10 @@ impl Engine {
             let pk_spec = block_peak(&self.cl, nc, len);
             let mut refs = self.cl.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
             if clip_on {
-                self.oversampler.process(refs.as_mut(), len, ceil, s.hardness);
+                self.oversampler.process(refs.as_mut(), len, ceil, s.hardness, s.clip_link);
             } else {
                 // keep latency constant: plain delay through the oversampler path
-                self.oversampler.process(refs.as_mut(), len, 1e6, 0.999);
+                self.oversampler.process(refs.as_mut(), len, 1e6, 0.999, 0.0);
             }
             let pk_post = block_peak(&self.cl, nc, len);
             // The post-clip signal is 16 samples later than pk_spec's; negligible for a block meter.

@@ -17,6 +17,8 @@ pub struct Oversampler {
     /// Plain delay for os == 1 so latency stays constant.
     delay: Vec<Vec<f32>>,
     delay_pos: usize,
+    /// Per-channel upsampled sample for the current phase.
+    stage: Vec<f32>,
 }
 
 fn blackman_sinc(taps: usize, fc_norm: f32) -> Vec<f32> {
@@ -56,6 +58,7 @@ impl Oversampler {
             down_pos: vec![0; num_channels],
             delay: vec![vec![0.0; HALF]; num_channels],
             delay_pos: 0,
+            stage: vec![0.0; num_channels],
         };
         o.set_os(max_os);
         o
@@ -94,17 +97,29 @@ impl Oversampler {
         self.delay_pos = 0;
     }
 
-    /// Clip in place. `ceil` linear, `hard` 0..1 (knee start as a fraction of the ceiling).
-    pub fn process(&mut self, channels: &mut [&mut [f32]], len: usize, ceil: f32, hard: f32) {
+    /// Clip in place. `ceil` linear, `hard` 0..1 (knee start as a fraction of the ceiling),
+    /// `link` 0..1: at 1 both channels get the same gain, driven by the louder one, so the
+    /// stereo image is untouched; at 0 each channel clips on its own.
+    pub fn process(&mut self, channels: &mut [&mut [f32]], len: usize, ceil: f32, hard: f32, link: f32) {
         let ceil = ceil.max(1e-4);
+        let nc = self.num_channels;
+        let link = if nc > 1 { link.clamp(0.0, 1.0) } else { 0.0 };
         if self.os == 1 {
             for i in 0..len {
-                for ch in 0..self.num_channels {
+                let mut peak = 0.0f32;
+                for ch in 0..nc {
                     let x = channels[ch][i];
                     let d = &mut self.delay[ch];
                     let y = d[self.delay_pos];
                     d[self.delay_pos] = x;
-                    channels[ch][i] = ceil * soft_clip(y / ceil, hard);
+                    channels[ch][i] = y;
+                    peak = peak.max(y.abs());
+                }
+                let g_link = clip_gain(peak, ceil, hard);
+                for ch in 0..nc {
+                    let y = channels[ch][i];
+                    let g = clip_gain(y.abs(), ceil, hard);
+                    channels[ch][i] = y * (g + (g_link - g) * link);
                 }
                 self.delay_pos = (self.delay_pos + 1) % HALF;
             }
@@ -112,27 +127,32 @@ impl Oversampler {
         }
         let os = self.os;
         let taps = self.taps;
-        for ch in 0..self.num_channels {
-            let uh = &mut self.up_hist[ch];
-            let dh = &mut self.down_hist[ch];
-            let mut up = self.up_pos[ch];
-            let mut dp = self.down_pos[ch];
-            for i in 0..len {
-                let x = channels[ch][i] * os as f32;
-                let mut out = 0.0;
-                for p in 0..os {
-                    // upsample: push x for phase 0, zeros otherwise
-                    uh[up] = if p == 0 { x } else { 0.0 };
+        for i in 0..len {
+            for p in 0..os {
+                // upsample every channel for this phase
+                let mut peak = 0.0f32;
+                for ch in 0..nc {
+                    let uh = &mut self.up_hist[ch];
+                    let up = self.up_pos[ch];
+                    uh[up] = if p == 0 { channels[ch][i] * os as f32 } else { 0.0 };
                     let mut acc = 0.0f32;
                     let mut idx = up;
                     for t in 0..taps {
                         acc += uh[idx] * self.coeffs[t];
                         idx = if idx == 0 { taps - 1 } else { idx - 1 };
                     }
-                    up = (up + 1) % taps;
-                    // clip at the oversampled rate
-                    let c = ceil * soft_clip(acc / ceil, hard);
-                    // downsample FIR; only phase os-1 output is used
+                    self.up_pos[ch] = (up + 1) % taps;
+                    self.stage[ch] = acc;
+                    peak = peak.max(acc.abs());
+                }
+                let g_link = clip_gain(peak, ceil, hard);
+                // clip at the oversampled rate, then push into the downsample FIR
+                for ch in 0..nc {
+                    let a = self.stage[ch];
+                    let g = clip_gain(a.abs(), ceil, hard);
+                    let c = a * (g + (g_link - g) * link);
+                    let dh = &mut self.down_hist[ch];
+                    let dp = self.down_pos[ch];
                     dh[dp] = c;
                     if p == os - 1 {
                         let mut acc2 = 0.0f32;
@@ -141,17 +161,23 @@ impl Oversampler {
                             acc2 += dh[idx2] * self.coeffs[t];
                             idx2 = if idx2 == 0 { taps - 1 } else { idx2 - 1 };
                         }
-                        out = acc2;
+                        // guarantee the ceiling after decimation (filter overshoot)
+                        channels[ch][i] = acc2.clamp(-ceil, ceil);
                     }
-                    dp = (dp + 1) % taps;
+                    self.down_pos[ch] = (dp + 1) % taps;
                 }
-                // guarantee the ceiling after decimation (filter overshoot)
-                channels[ch][i] = out.clamp(-ceil, ceil);
             }
-            self.up_pos[ch] = up;
-            self.down_pos[ch] = dp;
         }
     }
+}
+
+/// Gain (<= 1) that the soft clipper applies to a sample of magnitude `a`.
+#[inline]
+pub fn clip_gain(a: f32, ceil: f32, hard: f32) -> f32 {
+    if a <= 1e-9 {
+        return 1.0;
+    }
+    ceil * soft_clip(a / ceil, hard) / a
 }
 
 #[inline]

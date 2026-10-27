@@ -30,6 +30,13 @@ input ─┬─ long STFT  (mono-below + low-band dynamics)  ─ short STFT (hig
 * **Mono below** a set frequency, done in the long STFT (zero-phase).
 * **Matched Bypass** plays the dry signal at the processed signal's K-weighted level so you
   compare shape, not volume.
+* **Clip Stereo Link** (default 100%) gives both channels the same clip gain, driven by the
+  louder one, so the clipper cannot move the stereo image.
+* **Detector Weighting** (Flat / K-weighted / Equal loudness) shapes what the compressor hears:
+  weighted, it controls the lows harder and leaves presence alone.
+* **Analyzer** shows the detector spectrum, the threshold curve, the per-frequency cut/boost
+  from both resolution stages, and a strip that lights while a hit is protected. Four meters
+  show spectral-clip vs post-clip gain reduction and dry/processed K-weighted level.
 
 ## Latency
 

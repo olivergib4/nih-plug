@@ -52,3 +52,61 @@ fn mono_below_sums_out_of_phase_sub() {
     assert!(a60 < 0.01);
     assert!((a1k - 0.3).abs() < 0.03);
 }
+
+/// Clip link: with decorrelated stereo content, independent clipping changes the L/R
+/// correlation (the image moves on every hit); a linked gain keeps it where the dry signal had it.
+#[test]
+fn clip_link_preserves_stereo_image() {
+    use onsetguard::dsp::clip::Oversampler;
+    let sr = 48000.0f32;
+    let n = 8192;
+    let mut seed = 9u32;
+    let mut rnd = move || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); (seed as f32 / 4294967296.0) * 2.0 - 1.0 };
+    let mut l0 = vec![0.0f32; n];
+    let mut r0 = vec![0.0f32; n];
+    for i in 0..n {
+        let t = i as f32 / sr;
+        let shared = 1.5 * (2.0 * std::f32::consts::PI * 70.0 * t).sin() * (-(t % 0.5) / 0.12).exp();
+        l0[i] = shared + 0.35 * rnd();
+        r0[i] = shared + 0.35 * rnd();
+    }
+    let corr = |l: &[f32], r: &[f32]| -> f32 {
+        let (mut lr, mut ll, mut rr) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 512..n { lr += l[i] * r[i]; ll += l[i] * l[i]; rr += r[i] * r[i]; }
+        lr / (ll * rr).sqrt()
+    };
+    let dry = corr(&l0, &r0);
+    let mut out = Vec::new();
+    for link in [0.0f32, 1.0] {
+        let mut o = Oversampler::new(2, 8);
+        o.set_os(4);
+        let (mut l, mut r) = (l0.clone(), r0.clone());
+        { let mut refs: Vec<&mut [f32]> = vec![&mut l[..], &mut r[..]]; o.process(&mut refs, n, 1.0, 0.6, link); }
+        let c = corr(&l, &r);
+        println!("link {link}: L/R correlation {c:.4} (dry {dry:.4})");
+        out.push(c);
+    }
+    // Unlinked clipping changes the image (here it collapses the tops of both channels onto the
+    // ceiling, raising correlation); linked gain keeps the dry image.
+    assert!((out[1] - dry).abs() < (out[0] - dry).abs(), "linked should stay closer to dry");
+    assert!((out[1] - dry).abs() < 0.01, "linked clipping should keep the dry correlation");
+}
+
+#[test]
+fn weighting_curves_have_the_expected_shape() {
+    use onsetguard::dsp::dynamics::{weighting_db, Weighting};
+    let sr = 48000.0;
+    for (name, w) in [("K", Weighting::K), ("EqualLoudness", Weighting::EqualLoudness)] {
+        let v: Vec<(f32, f32)> = [30.0f32, 60.0, 100.0, 250.0, 1000.0, 3000.0, 8000.0, 12000.0].iter().map(|&f| (f, weighting_db(w, sr, f))).collect();
+        println!("{name}: {}", v.iter().map(|(f, d)| format!("{f:.0}Hz {d:+.1}")).collect::<Vec<_>>().join("  "));
+    }
+    // K: ~0 dB at 1 kHz, about +4 dB at high frequencies, strong cut below 40 Hz
+    assert!(weighting_db(Weighting::K, sr, 1000.0).abs() < 0.8); // the shelf is already rising at 1 kHz
+    assert!((weighting_db(Weighting::K, sr, 8000.0) - 4.0).abs() < 0.6);
+    assert!(weighting_db(Weighting::K, sr, 30.0) < -3.0);
+    // Equal loudness: 0 at 1 kHz, lows strongly down, 3-4 kHz slightly up
+    assert!(weighting_db(Weighting::EqualLoudness, sr, 1000.0).abs() < 0.1);
+    assert!(weighting_db(Weighting::EqualLoudness, sr, 50.0) < -15.0);
+    assert!(weighting_db(Weighting::EqualLoudness, sr, 3500.0) > 2.0);
+    assert!(weighting_db(Weighting::Off, sr, 50.0) == 0.0);
+}

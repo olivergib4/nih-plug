@@ -9,8 +9,21 @@ pub enum Band {
     High,
 }
 
+/// Frequency weighting applied to the detector (what the compressor "hears"), not the audio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Weighting {
+    /// Flat: every bin counts by its raw magnitude.
+    Off,
+    /// BS.1770 K-weighting: +4 dB shelf above ~1.7 kHz, high-pass below ~40 Hz.
+    K,
+    /// Equal-loudness (ISO 226 shape at ~80 phon): the detector sees roughly what the ear
+    /// weighs, so lows are controlled harder and presence is left alone.
+    EqualLoudness,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct DynamicsSettings {
+    pub weighting: Weighting,
     pub threshold_db: f32,
     pub center_hz: f32,
     pub slope_db_oct: f32,
@@ -37,10 +50,15 @@ pub struct Dynamics {
 
     thresholds_db: Vec<f32>,
     band_weight: Vec<f32>,
+    /// Detector weight per bin (linear), from `weighting`.
+    det_weight: Vec<f32>,
     mono_weight: Vec<f32>,
     envelopes: Vec<Vec<f32>>, // [channel][bin], linear magnitude
     gain_db: Vec<f32>,
     gain_smooth: Vec<f32>,
+    /// For the analyzer: channel-averaged weighted envelope (dB) and applied gain (dB) per bin.
+    vis_env_db: Vec<f32>,
+    vis_gain_db: Vec<f32>,
     prefix: Vec<f64>,
     /// First bin index treated as audio (skips DC/near-DC).
     first_bin: usize,
@@ -67,10 +85,13 @@ impl Dynamics {
             cached: None,
             thresholds_db: vec![0.0; nb],
             band_weight: vec![0.0; nb],
+            det_weight: vec![1.0; nb],
             mono_weight: vec![0.0; nb],
             envelopes: vec![vec![1e-4; nb]; num_channels],
             gain_db: vec![0.0; nb],
             gain_smooth: vec![0.0; nb],
+            vis_env_db: vec![-100.0; nb],
+            vis_gain_db: vec![0.0; nb],
             prefix: vec![0.0; nb + 1],
             first_bin: 1,
         }
@@ -116,6 +137,7 @@ impl Dynamics {
                 w = 0.0;
             }
             self.band_weight[k] = w;
+            self.det_weight[k] = lin(weighting_db(s.weighting, self.sample_rate, f));
             // mono-below: full below mono_hz, crossfade over one octave above it
             self.mono_weight[k] = if mono <= 0.0 {
                 0.0
@@ -153,6 +175,7 @@ impl Dynamics {
                     || c.curve_db_oct2 != s.curve_db_oct2
                     || c.crossover_hz != s.crossover_hz
                     || c.mono_below_hz != s.mono_below_hz
+                    || c.weighting != s.weighting
             }
         };
         if needs {
@@ -206,7 +229,12 @@ impl Dynamics {
                     }
                     e = e + (mx - e) * link;
                 }
-                let e_db = db(e);
+                let e_db = db(e * self.det_weight[k]);
+                if ch == 0 {
+                    self.vis_env_db[k] = e_db;
+                } else {
+                    self.vis_env_db[k] = self.vis_env_db[k].max(e_db);
+                }
                 let over = e_db - self.thresholds_db[k];
                 let mut g = 0.0;
                 if k >= self.first_bin {
@@ -223,7 +251,27 @@ impl Dynamics {
             for k in 0..num_bins {
                 sp[k] *= lin(self.gain_smooth[k]);
             }
+            if ch == 0 {
+                self.vis_gain_db[..num_bins].copy_from_slice(&self.gain_smooth[..num_bins]);
+            } else {
+                for k in 0..num_bins {
+                    self.vis_gain_db[k] = 0.5 * (self.vis_gain_db[k] + self.gain_smooth[k]);
+                }
+            }
         }
+    }
+
+    /// Sample the analyzer state at frequency `f` (Hz): (envelope dB, gain dB, threshold dB,
+    /// band weight). Linear interpolation between bins.
+    pub fn sample_at(&self, f: f32) -> (f32, f32, f32, f32) {
+        if self.num_bins < 2 {
+            return (-100.0, 0.0, 0.0, 0.0);
+        }
+        let pos = f * self.window_size as f32 / self.sample_rate;
+        let k = (pos.floor() as usize).min(self.num_bins - 2);
+        let t = (pos - k as f32).clamp(0.0, 1.0);
+        let lerp = |a: &[f32]| a[k] + (a[k + 1] - a[k]) * t;
+        (lerp(&self.vis_env_db), lerp(&self.vis_gain_db), lerp(&self.thresholds_db), lerp(&self.band_weight))
     }
 
     /// Octave-proportional moving average of `gain_db` into `gain_smooth`.
@@ -247,6 +295,32 @@ impl Dynamics {
             }
             b = b.min(nb - 1);
             self.gain_smooth[k] = ((self.prefix[b + 1] - self.prefix[a]) / (b - a + 1) as f64) as f32;
+        }
+    }
+}
+
+/// Detector weighting in dB at frequency `f`.
+pub fn weighting_db(w: Weighting, sr: f32, f: f32) -> f32 {
+    match w {
+        Weighting::Off => 0.0,
+        Weighting::K => crate::dsp::loudness::k_weight_db(sr, f),
+        Weighting::EqualLoudness => {
+            // Inverse of an 80-phon equal-loudness contour, normalised to 0 dB at 1 kHz.
+            // Piecewise-linear in log-frequency from ISO 226:2003 (80 phon), interpolated.
+            const F: [f32; 12] = [20.0, 31.5, 50.0, 80.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 12500.0];
+            // SPL needed for 80 phon at each frequency, minus 80 (so 1 kHz = 0).
+            const SPL: [f32; 12] = [38.6, 29.2, 20.0, 12.7, 7.3, 2.6, 0.3, 0.0, -1.3, -5.7, 6.0, 12.1];
+            let lf = f.clamp(20.0, 12500.0).ln();
+            let mut i = 0;
+            while i + 2 < F.len() && lf > F[i + 1].ln() {
+                i += 1;
+            }
+            let (a, b) = (F[i].ln(), F[i + 1].ln());
+            let t = ((lf - a) / (b - a)).clamp(0.0, 1.0);
+            let needed = SPL[i] + (SPL[i + 1] - SPL[i]) * t;
+            // The ear needs `needed` dB more at this frequency to sound as loud, so it hears it
+            // that much quieter: weight the detector by -needed.
+            -needed
         }
     }
 }

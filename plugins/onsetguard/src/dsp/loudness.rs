@@ -100,3 +100,23 @@ impl KMeter {
         -0.691 + 10.0 * self.mean_square.max(1e-12).log10()
     }
 }
+
+/// Magnitude response of a biquad at frequency `f` (Hz) for sample rate `sr`, in dB.
+fn biquad_mag_db(b: &Biquad, sr: f32, f: f32) -> f32 {
+    let w = 2.0 * std::f32::consts::PI * f / sr;
+    let (c1, s1) = (w.cos(), w.sin());
+    let (c2, s2) = ((2.0 * w).cos(), (2.0 * w).sin());
+    // H(z) = (b0 + b1 z^-1 + b2 z^-2) / (1 + a1 z^-1 + a2 z^-2), z = e^{jw}
+    let nr = b.b0 + b.b1 * c1 + b.b2 * c2;
+    let ni = -(b.b1 * s1 + b.b2 * s2);
+    let dr = 1.0 + b.a1 * c1 + b.a2 * c2;
+    let di = -(b.a1 * s1 + b.a2 * s2);
+    10.0 * ((nr * nr + ni * ni) / (dr * dr + di * di).max(1e-20)).max(1e-20).log10()
+}
+
+/// K-weighting (BS.1770) gain in dB at frequency `f` for sample rate `sr`.
+pub fn k_weight_db(sr: f32, f: f32) -> f32 {
+    let sh = high_shelf(sr, 1681.97, 3.9998, 0.7072);
+    let hp = high_pass(sr, 38.135, 0.5003);
+    biquad_mag_db(&sh, sr, f) + biquad_mag_db(&hp, sr, f)
+}

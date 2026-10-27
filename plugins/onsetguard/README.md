@@ -28,6 +28,13 @@ input ─┬─ long STFT  (mono-below + low-band dynamics)  ─ short STFT (hig
   clipper with a hard output ceiling. Transient Clip Amount decides how much of each hit the
   clipper is allowed to touch.
 * **Mono below** a set frequency, done in the long STFT (zero-phase).
+* **Sub Split.** The band below Sub Split Freq is separated at the long resolution (sharp,
+  zero-phase) and carried through the same onset protection as the full signal, so
+  `full - sub` is an exact remainder. *Protect*: the sub bypasses both clippers and its peak
+  envelope reserves headroom; the rest is clipped into what is left (a clean sub costs loudness
+  above it). *Clip separately*: the sub is clipped on its own at Sub Ceiling, the rest into the
+  remaining headroom; no intermodulation between sub and the rest (measured: intermod products
+  drop from -24 dB to below -90 dB on a 50 Hz + 2 kHz test).
 * **Matched Bypass** plays the dry signal at the processed signal's K-weighted level so you
   compare shape, not volume.
 * **Clip Stereo Link** (default 100%) gives both channels the same clip gain, driven by the

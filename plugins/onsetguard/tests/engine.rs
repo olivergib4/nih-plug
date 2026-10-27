@@ -277,3 +277,64 @@ fn gain_reduction_meters_split_spectral_and_post() {
         }
     }
 }
+
+fn goertzel(x: &[f32], sr: f32, f: f32) -> f32 {
+    let k = 2.0 * std::f32::consts::PI * f / sr;
+    let (mut s1, mut s2) = (0.0f32, 0.0f32);
+    let c = 2.0 * k.cos();
+    for &v in x {
+        let s0 = v + c * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    (s1 * s1 + s2 * s2 - c * s1 * s2).max(0.0).sqrt() * 2.0 / x.len() as f32
+}
+
+/// Sub split: 50 Hz sub + 2 kHz tone driven into the clipper.
+/// Off: harmonics of 50 Hz and intermod (2 kHz ± 50) both appear.
+/// Separate: 50 Hz harmonics appear (sub clipped alone) but intermod is gone.
+/// Protect: 50 Hz harmonics gone, the sub comes through at its driven level, and the ceiling holds.
+#[test]
+fn sub_split_modes_do_what_they_say() {
+    use onsetguard::dsp::SubMode;
+    let len = (1.0 * SR) as usize;
+    let x: Vec<f32> = (0..len)
+        .map(|i| {
+            let t = i as f32 / SR;
+            0.35 * (2.0 * std::f32::consts::PI * 50.0 * t).sin() + 0.5 * (2.0 * std::f32::consts::PI * 2000.0 * t).sin()
+        })
+        .collect();
+    let mut base = Settings::default();
+    base.drive_db = 6.0; // sub → 0.7, tone → 1.0, sum peaks ~1.7 against a 0 dB ceiling
+    base.trans_clip = 1.0;
+    base.protect_on = false;
+    base.dyn_.down_ratio = 1.0;
+    base.dyn_.up_ratio = 1.0;
+    base.dyn_.mono_below_hz = 0.0;
+    base.sub_hz = 100.0;
+    base.bin_ceil_db = 0.0; // keep the per-bin ceiling out of the way; this tests the soft clip paths
+    let mut results = Vec::new();
+    for mode in [SubMode::Off, SubMode::Separate, SubMode::Protect] {
+        let mut s = base;
+        s.sub_mode = mode;
+        let out = run(&[x.clone()], &s);
+        let seg = &out[0][len / 2..];
+        let peak = seg.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let a50 = goertzel(seg, SR, 50.0);
+        let harm = goertzel(seg, SR, 150.0).max(goertzel(seg, SR, 250.0));
+        let im = goertzel(seg, SR, 1950.0).max(goertzel(seg, SR, 2050.0)).max(goertzel(seg, SR, 2100.0));
+        println!(
+            "{mode:?}: peak {:.2} dBFS, 50 Hz {:.1} dB, sub harmonics {:.1} dB, intermod {:.1} dB",
+            db(peak), db(a50), db(harm), db(im)
+        );
+        results.push((peak, a50, harm, im));
+    }
+    let (off, sep, prot) = (results[0], results[1], results[2]);
+    for r in &results {
+        assert!(r.0 <= 1.0 + 1e-3, "ceiling exceeded: {}", r.0);
+    }
+    assert!(db(sep.3) < db(off.3) - 12.0, "Separate should remove intermod products");
+    assert!(db(prot.2) < db(off.2) - 20.0, "Protect should remove sub harmonics");
+    assert!((db(prot.1) - db(0.7)).abs() < 0.5, "Protect should pass the sub at its driven level (0.7)");
+    assert!(sep.2 > prot.2 * 10.0, "Separate still clips the sub on its own");
+}

@@ -101,11 +101,19 @@ impl Oversampler {
     /// `link` 0..1: at 1 both channels get the same gain, driven by the louder one, so the
     /// stereo image is untouched; at 0 each channel clips on its own.
     pub fn process(&mut self, channels: &mut [&mut [f32]], len: usize, ceil: f32, hard: f32, link: f32) {
-        let ceil = ceil.max(1e-4);
+        self.process_dyn(channels, len, ceil, None, hard, link);
+    }
+
+    /// Like [`process`](Self::process) but with an optional per-sample ceiling (`ceil_t[i]`,
+    /// linear, at the input rate) that overrides `ceil`. Used to reserve headroom for a band that
+    /// is summed back in later.
+    pub fn process_dyn(&mut self, channels: &mut [&mut [f32]], len: usize, ceil: f32, ceil_t: Option<&[f32]>, hard: f32, link: f32) {
+        let ceil_fixed = ceil.max(1e-4);
         let nc = self.num_channels;
         let link = if nc > 1 { link.clamp(0.0, 1.0) } else { 0.0 };
         if self.os == 1 {
             for i in 0..len {
+                let ceil = ceil_t.map_or(ceil_fixed, |c| c[i].max(1e-4));
                 let mut peak = 0.0f32;
                 for ch in 0..nc {
                     let x = channels[ch][i];
@@ -128,6 +136,7 @@ impl Oversampler {
         let os = self.os;
         let taps = self.taps;
         for i in 0..len {
+            let ceil = ceil_t.map_or(ceil_fixed, |c| c[i].max(1e-4));
             for p in 0..os {
                 // upsample every channel for this phase
                 let mut peak = 0.0f32;

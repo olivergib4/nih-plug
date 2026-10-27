@@ -27,7 +27,7 @@ pub mod dsp;
 mod editor;
 
 use dsp::dynamics::Weighting;
-use dsp::{Engine, Settings};
+use dsp::{Engine, Settings, SubMode};
 
 pub struct OnsetGuard {
     params: Arc<OnsetGuardParams>,
@@ -73,6 +73,19 @@ pub enum DetectorWeighting {
     #[id = "equal_loudness"]
     #[name = "Equal loudness"]
     EqualLoudness,
+}
+
+#[derive(Enum, Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SubSplit {
+    #[id = "off"]
+    #[name = "Off"]
+    Off,
+    #[id = "protect"]
+    #[name = "Protect (clean sub)"]
+    Protect,
+    #[id = "separate"]
+    #[name = "Clip separately"]
+    Separate,
 }
 
 #[derive(Enum, Debug, PartialEq, Eq, Clone, Copy)]
@@ -200,6 +213,12 @@ pub struct ClipParams {
     pub clip_link: FloatParam,
     #[id = "oversample"]
     pub oversample: EnumParam<Oversample>,
+    #[id = "sub_split"]
+    pub sub_split: EnumParam<SubSplit>,
+    #[id = "sub_hz"]
+    pub sub_hz: FloatParam,
+    #[id = "sub_ceil"]
+    pub sub_ceil_db: FloatParam,
 }
 
 fn db_param(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
@@ -374,6 +393,19 @@ impl Default for OnsetGuardParams {
             trans_clip: pct_param("Transient Clip Amount", d.trans_clip),
             clip_link: pct_param("Clip Stereo Link", d.clip_link),
             oversample: EnumParam::new("Oversample", Oversample::X4),
+            sub_split: EnumParam::new("Sub Split", SubSplit::Off),
+            sub_hz: FloatParam::new(
+                "Sub Split Freq",
+                d.sub_hz,
+                FloatRange::Skewed {
+                    min: 30.0,
+                    max: 250.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_unit(" Hz")
+            .with_step_size(1.0),
+            sub_ceil_db: db_param("Sub Ceiling (separate)", d.sub_ceil_db, -24.0, 0.0),
             }),
         }
     }
@@ -416,6 +448,13 @@ impl OnsetGuardParams {
         s.hardness = self.clip.hardness.value();
         s.trans_clip = self.clip.trans_clip.value();
         s.clip_link = self.clip.clip_link.value();
+        s.sub_mode = match self.clip.sub_split.value() {
+            SubSplit::Off => SubMode::Off,
+            SubSplit::Protect => SubMode::Protect,
+            SubSplit::Separate => SubMode::Separate,
+        };
+        s.sub_hz = self.clip.sub_hz.value();
+        s.sub_ceil_db = self.clip.sub_ceil_db.value();
         s.oversample = match self.clip.oversample.value() {
             Oversample::X1 => 1,
             Oversample::X2 => 2,

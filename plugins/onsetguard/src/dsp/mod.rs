@@ -1,0 +1,558 @@
+//! OnsetGuard DSP engine. Pure DSP, no plugin-framework types, so it can be unit tested.
+//!
+//! Signal flow (per channel, all stages zero-phase and sample-aligned):
+//!   input ─┬─ long STFT (mono-below + low-band dynamics) ─ short STFT (high-band dynamics) ─┐
+//!          ├─ long STFT (mono-below only, reference) ─ delay ───────────────────────────────┤
+//!          ├─ onset detector ─ protection / transient rings ─────────────────────────────── blend
+//!          │                                                                                  │
+//!          │   drive ─ short STFT (per-bin ceiling) ─ oversampled soft clip ─ transient blend ─┤
+//!          └─ dry delay ──────────────────────────────────────────────────── mix / matched bypass
+
+#![allow(clippy::needless_range_loop)]
+
+pub mod clip;
+pub mod dynamics;
+pub mod loudness;
+pub mod onset;
+pub mod stft;
+
+use dynamics::{Band, Dynamics, DynamicsSettings};
+use realfft::num_complex::Complex32;
+
+pub const MIN_LONG_ORDER: usize = 9;
+pub const MAX_LONG_ORDER: usize = 15;
+pub const MIN_SHORT_ORDER: usize = 6;
+pub const MAX_SHORT_ORDER: usize = 12;
+pub const MAX_OVERSAMPLE: usize = 8;
+/// Maximum protection pre-window the latency budget accounts for.
+pub const MAX_PRE_MS: f32 = 120.0;
+const TIMING_FADE_S: f32 = 0.15;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Settings {
+    pub dyn_: DynamicsSettings,
+    pub long_order: usize,
+    pub short_order: usize,
+
+    pub protect_on: bool,
+    pub onset_sens: f32,
+    pub pre_ms: f32,
+    pub hold_ms: f32,
+    pub post_ms: f32,
+    pub trans_boost_db: f32,
+    pub trans_boost_ms: f32,
+
+    pub clip_on: bool,
+    pub drive_db: f32,
+    pub bin_ceil_db: f32,
+    pub ceil_db: f32,
+    pub hardness: f32,
+    pub trans_clip: f32,
+    pub oversample: usize,
+
+    pub mix: f32,
+    pub output_gain: f32,
+    pub matched_bypass: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            dyn_: DynamicsSettings {
+                threshold_db: -24.0,
+                center_hz: 1000.0,
+                slope_db_oct: -4.5,
+                curve_db_oct2: 0.0,
+                down_ratio: 3.0,
+                up_ratio: 2.0,
+                up_range_db: 12.0,
+                attack_ms: 10.0,
+                release_ms: 120.0,
+                smooth_oct: 0.17,
+                stereo_link: 0.8,
+                crossover_hz: 300.0,
+                mono_below_hz: 120.0,
+            },
+            long_order: 13,
+            short_order: 10,
+            protect_on: true,
+            onset_sens: 0.6,
+            pre_ms: 25.0,
+            hold_ms: 4.0,
+            post_ms: 30.0,
+            trans_boost_db: 0.0,
+            trans_boost_ms: 15.0,
+            clip_on: true,
+            drive_db: 0.0,
+            bin_ceil_db: -12.0,
+            ceil_db: 0.0,
+            hardness: 0.6,
+            trans_clip: 0.5,
+            oversample: 4,
+            mix: 1.0,
+            output_gain: 1.0,
+            matched_bypass: false,
+        }
+    }
+}
+
+/// Multi-channel delay line with a fixed maximum and a settable current delay.
+struct Delay {
+    buf: Vec<Vec<f32>>,
+    len: usize,
+    pos: usize,
+    delay: usize,
+}
+
+impl Delay {
+    fn new(num_channels: usize, max_delay: usize) -> Self {
+        let len = (max_delay + 1).next_power_of_two();
+        Delay { buf: vec![vec![0.0; len]; num_channels], len, pos: 0, delay: 0 }
+    }
+    fn set(&mut self, d: usize) {
+        assert!(d < self.len);
+        self.delay = d;
+    }
+    fn reset(&mut self) {
+        for b in &mut self.buf {
+            b.fill(0.0);
+        }
+        self.pos = 0;
+    }
+    /// Push one sample per channel, returning the delayed values into `out`.
+    #[inline]
+    fn tick(&mut self, input: &[f32], out: &mut [f32]) {
+        let rp = (self.pos + self.len - self.delay) & (self.len - 1);
+        for ch in 0..input.len() {
+            self.buf[ch][self.pos] = input[ch];
+            out[ch] = self.buf[ch][rp];
+        }
+        self.pos = (self.pos + 1) & (self.len - 1);
+    }
+}
+
+/// A ring of per-sample envelope values indexed by absolute input time, with a reset value.
+struct EnvRing {
+    buf: Vec<f32>,
+    mask: usize,
+    reset_value: f32,
+}
+
+impl EnvRing {
+    fn new(min_len: usize, reset_value: f32) -> Self {
+        let len = min_len.next_power_of_two();
+        EnvRing { buf: vec![reset_value; len], mask: len - 1, reset_value }
+    }
+    fn clear(&mut self) {
+        self.buf.fill(self.reset_value);
+    }
+    #[inline]
+    fn take(&mut self, t: usize) -> f32 {
+        let i = t & self.mask;
+        let v = self.buf[i];
+        self.buf[i] = self.reset_value;
+        v
+    }
+    #[inline]
+    fn min_at(&mut self, t: usize, v: f32) {
+        let i = t & self.mask;
+        if v < self.buf[i] {
+            self.buf[i] = v;
+        }
+    }
+    #[inline]
+    fn max_at(&mut self, t: usize, v: f32) {
+        let i = t & self.mask;
+        if v > self.buf[i] {
+            self.buf[i] = v;
+        }
+    }
+}
+
+pub struct Engine {
+    num_channels: usize,
+    sample_rate: f32,
+    max_block: usize,
+
+    long_stft: stft::StftStage, // 2*num_channels: [proc.., ref..]
+    short_stft: stft::StftStage,
+    clip_stft: stft::StftStage,
+    low_dyn: Dynamics,
+    high_dyn: Dynamics,
+    oversampler: clip::Oversampler,
+    detector: onset::OnsetDetector,
+
+    ref_delay: Delay,   // reference after long stage: + short + extra
+    proc_delay: Delay,  // processed after short stage: + extra
+    driven_delay: Delay, // driven signal: + clip stft + oversampler
+    dry_delay: Delay,   // total latency
+
+    p_ring: EnvRing,  // protection (1 = processed, 0 = reference)
+    t_ring: EnvRing,  // transient boost (0 = none)
+    pc_ring: EnvRing, // clip protection (1 = clip fully, 0 = per trans_clip)
+
+    /// Absolute input sample counter.
+    pos: usize,
+    extra_delay: usize,
+    latency: usize,
+
+    timing_scale: f32,
+    k_dry: loudness::KMeter,
+    k_wet: loudness::KMeter,
+    match_gain: f32,
+
+    // scratch, sized max_block
+    wide: Vec<Vec<f32>>, // 2*num_channels for the long stage
+    a: Vec<Vec<f32>>,
+    refd: Vec<Vec<f32>>,
+    driven: Vec<Vec<f32>>,
+    cl: Vec<Vec<f32>>,
+    dry: Vec<Vec<f32>>,
+    tmp_in: Vec<f32>,
+    tmp_out: Vec<f32>,
+    cur: Settings,
+}
+
+impl Engine {
+    pub fn new(num_channels: usize, sample_rate: f32, max_block: usize) -> Self {
+        let max_long = 1 << MAX_LONG_ORDER;
+        let max_short = 1 << MAX_SHORT_ORDER;
+        let pre_max = (MAX_PRE_MS / 1000.0 * sample_rate).ceil() as usize;
+        let extra_max = pre_max + onset::MAX_LATENCY;
+        let ring_len = max_long + 2 * max_short + extra_max + 2 * pre_max + sample_rate as usize + max_block + clip::LATENCY;
+        let mut e = Engine {
+            num_channels,
+            sample_rate,
+            max_block,
+            long_stft: stft::StftStage::new(2 * num_channels, MIN_LONG_ORDER, MAX_LONG_ORDER),
+            short_stft: stft::StftStage::new(num_channels, MIN_SHORT_ORDER, MAX_SHORT_ORDER),
+            clip_stft: stft::StftStage::new(num_channels, MIN_SHORT_ORDER, MAX_SHORT_ORDER),
+            low_dyn: Dynamics::new(Band::Low, num_channels, max_long),
+            high_dyn: Dynamics::new(Band::High, num_channels, max_short),
+            oversampler: clip::Oversampler::new(num_channels, MAX_OVERSAMPLE),
+            detector: onset::OnsetDetector::new(sample_rate),
+            ref_delay: Delay::new(num_channels, max_short + extra_max),
+            proc_delay: Delay::new(num_channels, extra_max),
+            driven_delay: Delay::new(num_channels, max_short + clip::LATENCY),
+            dry_delay: Delay::new(num_channels, max_long + 2 * max_short + extra_max + clip::LATENCY),
+            p_ring: EnvRing::new(ring_len, 1.0),
+            t_ring: EnvRing::new(ring_len, 0.0),
+            pc_ring: EnvRing::new(ring_len, 0.0),
+            pos: 0,
+            extra_delay: 0,
+            latency: 0,
+            timing_scale: 0.0,
+            k_dry: loudness::KMeter::new(sample_rate, num_channels, 3.0),
+            k_wet: loudness::KMeter::new(sample_rate, num_channels, 3.0),
+            match_gain: 1.0,
+            wide: vec![vec![0.0; max_block]; 2 * num_channels],
+            a: vec![vec![0.0; max_block]; num_channels],
+            refd: vec![vec![0.0; max_block]; num_channels],
+            driven: vec![vec![0.0; max_block]; num_channels],
+            cl: vec![vec![0.0; max_block]; num_channels],
+            dry: vec![vec![0.0; max_block]; num_channels],
+            tmp_in: vec![0.0; 2 * num_channels],
+            tmp_out: vec![0.0; 2 * num_channels],
+            cur: Settings::default(),
+        };
+        let s = Settings::default();
+        e.set_windows(s.long_order, s.short_order, s.oversample);
+        e
+    }
+
+    pub fn latency(&self) -> usize {
+        self.latency
+    }
+
+    /// Reconfigure window sizes / oversampling. Resets all state. Call when they change.
+    pub fn set_windows(&mut self, long_order: usize, short_order: usize, oversample: usize) {
+        let n_l = 1usize << long_order.clamp(MIN_LONG_ORDER, MAX_LONG_ORDER);
+        let n_s = 1usize << short_order.clamp(MIN_SHORT_ORDER, MAX_SHORT_ORDER);
+        self.long_stft.set_window_size(n_l);
+        self.short_stft.set_window_size(n_s);
+        self.clip_stft.set_window_size(n_s);
+        self.low_dyn.configure(self.sample_rate, n_l);
+        self.high_dyn.configure(self.sample_rate, n_s);
+        self.oversampler.set_os(oversample.clamp(1, MAX_OVERSAMPLE));
+        let pre_max = (MAX_PRE_MS / 1000.0 * self.sample_rate).ceil() as usize;
+        let l_spec = n_l + n_s;
+        self.extra_delay = (pre_max + onset::MAX_LATENCY).saturating_sub(l_spec);
+        self.ref_delay.set(n_s + self.extra_delay);
+        self.proc_delay.set(self.extra_delay);
+        self.driven_delay.set(n_s + clip::LATENCY);
+        self.latency = l_spec + self.extra_delay + n_s + clip::LATENCY;
+        self.dry_delay.set(self.latency);
+        self.cur.long_order = long_order;
+        self.cur.short_order = short_order;
+        self.cur.oversample = oversample;
+        self.reset();
+    }
+
+    pub fn reset(&mut self) {
+        self.long_stft.reset();
+        self.short_stft.reset();
+        self.clip_stft.reset();
+        self.low_dyn.reset();
+        self.high_dyn.reset();
+        self.oversampler.reset();
+        self.detector.reset();
+        self.ref_delay.reset();
+        self.proc_delay.reset();
+        self.driven_delay.reset();
+        self.dry_delay.reset();
+        self.p_ring.clear();
+        self.t_ring.clear();
+        self.pc_ring.clear();
+        self.pos = 0;
+        self.timing_scale = 0.0;
+        self.k_dry.reset();
+        self.k_wet.reset();
+        self.match_gain = 1.0;
+    }
+
+    /// Current loudness-match gain (wet/dry, linear) and K-weighted levels, for meters.
+    pub fn meters(&self) -> (f32, f32, f32) {
+        (self.match_gain, self.k_dry.lufs(), self.k_wet.lufs())
+    }
+
+    /// Process `len` samples in place. `channels.len()` must equal `num_channels`.
+    pub fn process(&mut self, channels: &mut [&mut [f32]], len: usize, s: &Settings) {
+        assert!(len <= self.max_block);
+        let nc = self.num_channels;
+        let sr = self.sample_rate;
+        if s.long_order != self.cur.long_order || s.short_order != self.cur.short_order || s.oversample != self.cur.oversample {
+            self.set_windows(s.long_order, s.short_order, s.oversample);
+        }
+
+        // --- dry delay, onset detection, protection ring writes (input timeline) ---
+        let pre = (s.pre_ms.clamp(0.0, MAX_PRE_MS) / 1000.0 * sr).round() as usize;
+        let hold = (s.hold_ms.max(0.0) / 1000.0 * sr).round() as usize;
+        let post = (s.post_ms.max(0.0) / 1000.0 * sr).round() as usize;
+        let tb_gain = 10f32.powf(s.trans_boost_db / 20.0) - 1.0;
+        let tb_tau = (s.trans_boost_ms.max(0.5) / 1000.0 * sr).max(1.0);
+        let pc_hold = (0.008 * sr) as usize;
+        let pc_post = (0.020 * sr) as usize;
+        for i in 0..len {
+            let mut mono = 0.0;
+            for ch in 0..nc {
+                let x = channels[ch][i];
+                self.tmp_in[ch] = x;
+                mono += x;
+            }
+            self.dry_delay.tick(&self.tmp_in[..nc], &mut self.tmp_out[..nc]);
+            for ch in 0..nc {
+                self.dry[ch][i] = self.tmp_out[ch];
+            }
+            mono /= nc as f32;
+            if let Some(t_on) = self.detector.push(mono, s.onset_sens) {
+                if s.protect_on {
+                    let start = t_on.saturating_sub(pre);
+                    for (j, t) in (start..t_on).enumerate() {
+                        let u = j as f32 / pre.max(1) as f32; // 0 → 1 approaching the hit
+                        let v = 0.5 + 0.5 * (std::f32::consts::PI * u).cos();
+                        self.p_ring.min_at(t, v);
+                    }
+                    for j in 0..hold {
+                        self.p_ring.min_at(t_on + j, 0.0);
+                    }
+                    for j in 0..post {
+                        let u = j as f32 / post.max(1) as f32;
+                        let v = 0.5 - 0.5 * (std::f32::consts::PI * u).cos();
+                        self.p_ring.min_at(t_on + hold + j, v);
+                    }
+                }
+                if tb_gain != 0.0 {
+                    let n = (tb_tau * 5.0) as usize;
+                    for j in 0..n {
+                        self.t_ring.max_at(t_on + j, tb_gain * (-(j as f32) / tb_tau).exp());
+                    }
+                }
+                for j in 0..pc_hold {
+                    self.pc_ring.max_at(t_on + j, 1.0);
+                }
+                for j in 0..pc_post {
+                    let u = j as f32 / pc_post.max(1) as f32;
+                    self.pc_ring.max_at(t_on + pc_hold + j, 0.5 + 0.5 * (std::f32::consts::PI * u).cos());
+                }
+            }
+        }
+
+        // --- long STFT on [proc.., ref..] ---
+        for ch in 0..nc {
+            self.wide[ch][..len].copy_from_slice(&channels[ch][..len]);
+            self.wide[nc + ch][..len].copy_from_slice(&channels[ch][..len]);
+        }
+        {
+            let dyn_s = s.dyn_;
+            let low = &mut self.low_dyn;
+            let ts = &mut self.timing_scale;
+            let frame_dt = self.long_stft.window_size() as f32 / 4.0 / sr;
+            let mut refs = self.wide.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
+            self.long_stft.process(refs.as_mut(), len, |spectra, nb, mag| {
+                // mono-below on the reference pair (channels nc..2nc) when stereo
+                if dyn_s.mono_below_hz > 0.0 && nc == 2 {
+                    let (first, second) = spectra.split_at_mut(nc);
+                    let _ = first;
+                    mono_below(second, nb, sr, dyn_s.mono_below_hz);
+                }
+                let (first, _) = spectra.split_at_mut(nc);
+                low.process_frame(first, nb, mag, &dyn_s, *ts);
+                *ts = (*ts + frame_dt / TIMING_FADE_S).min(1.0);
+            });
+        }
+        for ch in 0..nc {
+            self.a[ch][..len].copy_from_slice(&self.wide[ch][..len]);
+            self.refd[ch][..len].copy_from_slice(&self.wide[nc + ch][..len]);
+        }
+
+        // --- short STFT (high band) on proc ---
+        {
+            let dyn_s = s.dyn_;
+            let high = &mut self.high_dyn;
+            let ts = self.timing_scale;
+            let mut refs = self.a.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
+            self.short_stft.process(refs.as_mut(), len, |spectra, nb, mag| {
+                high.process_frame(spectra, nb, mag, &dyn_s, ts);
+            });
+        }
+
+        // --- align, protect, boost; then drive ---
+        let drive = 10f32.powf(s.drive_db / 20.0);
+        let base_t = self.pos; // input time of channels[..][0]
+        let l_spec_total = self.long_stft.window_size() + self.short_stft.window_size() + self.extra_delay;
+        for i in 0..len {
+            for ch in 0..nc {
+                self.tmp_in[ch] = self.a[ch][i];
+            }
+            self.proc_delay.tick(&self.tmp_in[..nc], &mut self.tmp_out[..nc]);
+            for ch in 0..nc {
+                self.a[ch][i] = self.tmp_out[ch];
+                self.tmp_in[ch] = self.refd[ch][i];
+            }
+            self.ref_delay.tick(&self.tmp_in[..nc], &mut self.tmp_out[..nc]);
+            // input time of the sample now emerging from the spectral path
+            let t = (base_t + i).wrapping_sub(l_spec_total);
+            let (p, tb) = if base_t + i >= l_spec_total {
+                (self.p_ring.take(t), self.t_ring.take(t))
+            } else {
+                (1.0, 0.0)
+            };
+            for ch in 0..nc {
+                let r = self.tmp_out[ch];
+                let y = r + (self.a[ch][i] - r) * p + r * tb;
+                self.driven[ch][i] = y * drive;
+                self.cl[ch][i] = y * drive;
+            }
+        }
+
+        // --- spectral clip + oversampled clip on cl; driven delayed to match ---
+        let ceil = 10f32.powf(s.ceil_db / 20.0);
+        let bin_ceil = 10f32.powf(s.bin_ceil_db / 20.0);
+        {
+            let clip_on = s.clip_on;
+            let mut refs = self.cl.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
+            self.clip_stft.process(refs.as_mut(), len, |spectra, nb, mag| {
+                if !clip_on {
+                    return;
+                }
+                for sp in spectra.iter_mut() {
+                    for k in 0..nb {
+                        let m = sp[k].norm() * mag;
+                        if m > bin_ceil {
+                            sp[k] *= bin_ceil / m;
+                        }
+                    }
+                }
+            });
+            let mut refs = self.cl.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
+            if clip_on {
+                self.oversampler.process(refs.as_mut(), len, ceil, s.hardness);
+            } else {
+                // keep latency constant: plain delay through the oversampler path
+                self.oversampler.process(refs.as_mut(), len, 1e6, 0.999);
+            }
+        }
+        let l_clip = self.clip_stft.window_size() + clip::LATENCY;
+        let gain = s.output_gain;
+        let mix = s.mix.clamp(0.0, 1.0);
+        for i in 0..len {
+            for ch in 0..nc {
+                self.tmp_in[ch] = self.driven[ch][i];
+            }
+            self.driven_delay.tick(&self.tmp_in[..nc], &mut self.tmp_out[..nc]);
+            let t_in = base_t + i;
+            let t = t_in.wrapping_sub(l_spec_total + l_clip);
+            let pc = if t_in >= l_spec_total + l_clip { self.pc_ring.take(t) } else { 0.0 };
+            let amt = if s.clip_on { 1.0 - (1.0 - s.trans_clip.clamp(0.0, 1.0)) * pc } else { 0.0 };
+            // meters on aligned dry / wet
+            for ch in 0..nc {
+                let d = self.tmp_out[ch];
+                let c = self.cl[ch][i];
+                let wet = d + (c - d) * amt;
+                self.cl[ch][i] = wet;
+                self.tmp_in[ch] = self.dry[ch][i];
+            }
+            self.k_dry.push_frame(&self.tmp_in[..nc]);
+            for ch in 0..nc {
+                self.tmp_in[ch] = self.cl[ch][i];
+            }
+            self.k_wet.push_frame(&self.tmp_in[..nc]);
+            let target = (self.k_wet.mean_square / self.k_dry.mean_square.max(1e-10)).sqrt().clamp(0.05, 20.0);
+            self.match_gain += (target - self.match_gain) * 0.0005;
+            for ch in 0..nc {
+                let out = if s.matched_bypass {
+                    self.dry[ch][i] * self.match_gain
+                } else {
+                    (self.dry[ch][i] * (1.0 - mix) + self.cl[ch][i] * mix) * gain
+                };
+                channels[ch][i] = out;
+            }
+        }
+        self.pos += len;
+        self.cur = *s;
+    }
+}
+
+/// Mono-below applied directly to a stereo spectrum pair (zero-phase, one-octave crossfade).
+fn mono_below(spectra: &mut [Vec<Complex32>], nb: usize, sr: f32, mono_hz: f32) {
+    if spectra.len() != 2 {
+        return;
+    }
+    let n = (nb - 1) * 2;
+    let (a, b) = spectra.split_at_mut(1);
+    let (l, r) = (&mut a[0], &mut b[0]);
+    for k in 0..nb {
+        let f = (k as f32 * sr / n as f32).max(1.0);
+        let om = (f / mono_hz).log2();
+        let m = if om <= 0.0 { 1.0 } else if om >= 1.0 { break } else { 0.5 + 0.5 * (std::f32::consts::PI * om).cos() };
+        let mid = (l[k] + r[k]) * 0.5;
+        l[k] = l[k] * (1.0 - m) + mid * m;
+        r[k] = r[k] * (1.0 - m) + mid * m;
+    }
+}
+
+/// Fixed-capacity collection of channel slices (avoids allocating in the process path).
+pub struct SmallRefs<'a> {
+    items: [Option<&'a mut [f32]>; 4],
+    len: usize,
+}
+
+impl<'a> SmallRefs<'a> {
+    fn as_mut(&mut self) -> &mut [&'a mut [f32]] {
+        // SAFETY: the first `len` entries are always `Some`; `Option<&mut [f32]>` has the same
+        // layout as `&mut [f32]` (niche optimization), so the reinterpretation is sound.
+        unsafe { std::slice::from_raw_parts_mut(self.items.as_mut_ptr() as *mut &'a mut [f32], self.len) }
+    }
+}
+
+impl<'a> std::iter::FromIterator<&'a mut [f32]> for SmallRefs<'a> {
+    fn from_iter<I: IntoIterator<Item = &'a mut [f32]>>(iter: I) -> Self {
+        let mut s = SmallRefs { items: [None, None, None, None], len: 0 };
+        for it in iter {
+            assert!(s.len < 4, "OnsetGuard supports at most 2 channels");
+            s.items[s.len] = Some(it);
+            s.len += 1;
+        }
+        s
+    }
+}

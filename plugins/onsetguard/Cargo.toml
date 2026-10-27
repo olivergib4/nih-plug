@@ -1,0 +1,17 @@
+[package]
+name = "onsetguard"
+version = "0.1.0"
+edition = "2021"
+authors = ["OGII"]
+license = "GPL-3.0-or-later"
+description = "Onset-protected zero-phase spectral dynamics with spectral clipping"
+homepage = "https://github.com/olivergib4/nih-plug/tree/master/plugins/onsetguard"
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+nih_plug = { path = "../../", features = ["assert_process_allocs"] }
+nih_plug_vizia = { path = "../../nih_plug_vizia" }
+realfft = "3.0"
+

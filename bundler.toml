@@ -30,3 +30,6 @@ name = "Safety Limiter"
 
 [spectral_compressor]
 name = "Spectral Compressor"
+
+[onsetguard]
+name = "OnsetGuard"

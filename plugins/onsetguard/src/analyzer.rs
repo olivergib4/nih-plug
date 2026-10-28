@@ -154,7 +154,8 @@ impl View for Analyzer {
     }
 }
 
-/// Loudness readout: two bars (dry at unity, processed) in phon with the sone value printed.
+/// Loudness bars: dry (unity) and processed, in phon (0-120). Text is drawn by Labels in the
+/// editor, since canvas text has no font in this Vizia build.
 pub struct SoneBars {
     meters: Arc<crate::Meters>,
 }
@@ -181,45 +182,30 @@ impl View for SoneBars {
         }
         let dry = self.meters.dry_sone.load(Ordering::Relaxed);
         let wet = self.meters.wet_sone.load(Ordering::Relaxed);
-        let match_db = self.meters.match_db.load(Ordering::Relaxed);
         let phon = |s: f32| if s <= 1e-3 { 0.0 } else { 40.0 + 10.0 * s.log2() };
         let row_h = b.h / 2.0;
-        let fg: vg::Color = cx.font_color().into();
-        let mut paint_text = vg::Paint::color(fg);
-        paint_text.set_font_size(12.0 * cx.scale_factor());
-        paint_text.set_text_align(vg::Align::Left);
-        paint_text.set_text_baseline(vg::Baseline::Middle);
-        for (row, (name, sone, color)) in [
-            ("dry (unity)", dry, vg::Color::rgbaf(0.55, 0.60, 0.66, 0.9)),
-            ("processed", wet, vg::Color::rgbaf(0.95, 0.55, 0.25, 0.9)),
+        for (row, (sone, color)) in [
+            (dry, vg::Color::rgbaf(0.55, 0.60, 0.66, 0.9)),
+            (wet, vg::Color::rgbaf(0.95, 0.55, 0.25, 0.9)),
         ]
         .iter()
         .enumerate()
         {
             let y = b.y + row as f32 * row_h;
-            let label_w = 190.0;
-            let bar_x = b.x + label_w;
-            let bar_w = b.w - label_w;
             let mut bg = vg::Path::new();
-            bg.rect(bar_x, y + 4.0, bar_w, row_h - 8.0);
+            bg.rect(b.x, y + 3.0, b.w, row_h - 6.0);
             canvas.fill_path(&bg, &vg::Paint::color(vg::Color::rgbaf(0.15, 0.15, 0.16, 1.0)));
-            let p = phon(*sone);
-            let t = (p / 120.0).clamp(0.0, 1.0);
+            let t = (phon(*sone) / 120.0).clamp(0.0, 1.0);
             let mut bar = vg::Path::new();
-            bar.rect(bar_x, y + 4.0, bar_w * t, row_h - 8.0);
+            bar.rect(b.x, y + 3.0, b.w * t, row_h - 6.0);
             canvas.fill_path(&bar, &vg::Paint::color(*color));
             for tick in [40.0f32, 60.0, 80.0, 100.0] {
-                let tx = bar_x + bar_w * tick / 120.0;
+                let tx = b.x + b.w * tick / 120.0;
                 let mut tp = vg::Path::new();
-                tp.move_to(tx, y + 4.0);
-                tp.line_to(tx, y + row_h - 4.0);
+                tp.move_to(tx, y + 3.0);
+                tp.line_to(tx, y + row_h - 3.0);
                 canvas.stroke_path(&tp, &vg::Paint::color(vg::Color::rgbaf(0.5, 0.5, 0.5, 0.5)).with_line_width(1.0));
             }
-            let text = format!("{name}: {sone:.1} sone · {p:.0} phon");
-            let _ = canvas.fill_text(b.x + 4.0, y + row_h / 2.0, &text, &paint_text);
         }
-        let text = format!("match {match_db:+.1} dB");
-        paint_text.set_text_align(vg::Align::Right);
-        let _ = canvas.fill_text(b.x + b.w - 4.0, b.y + b.h - 2.0, &text, &paint_text);
     }
 }

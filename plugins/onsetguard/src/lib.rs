@@ -285,7 +285,7 @@ impl Default for OnsetGuardParams {
             mix: pct_param("Mix", 1.0),
             matched_bypass: BoolParam::new("Matched Bypass", false),
             ref_spl: FloatParam::new(
-                "Reference Level (0 dBFS =)",
+                "Ref Level (0 dBFS)",
                 d.ref_spl,
                 FloatRange::Linear { min: 70.0, max: 115.0 },
             )
@@ -405,7 +405,7 @@ impl Default for OnsetGuardParams {
             hold_ms: ms_param("Protect Hold", d.hold_ms, 0.0, 30.0),
             post_ms: ms_param("Protect Post", d.post_ms, 0.0, 120.0),
             trans_boost_db: db_param("Transient Boost", d.trans_boost_db, 0.0, 12.0),
-            trans_boost_ms: ms_param("Transient Boost Length", d.trans_boost_ms, 2.0, 60.0),
+            trans_boost_ms: ms_param("Boost Length", d.trans_boost_ms, 2.0, 60.0),
             }),
             clip: Arc::new(ClipParams {
             clip_on: BoolParam::new("Clip", d.clip_on),
@@ -413,7 +413,7 @@ impl Default for OnsetGuardParams {
             bin_ceil_db: db_param("Spectral Ceiling", d.bin_ceil_db, -40.0, 0.0),
             ceil_db: db_param("Output Ceiling", d.ceil_db, -12.0, 0.0),
             hardness: pct_param("Clip Hardness", d.hardness),
-            trans_clip: pct_param("Transient Clip Amount", d.trans_clip),
+            trans_clip: pct_param("Transient Clip", d.trans_clip),
             clip_link: pct_param("Clip Stereo Link", d.clip_link),
             oversample: EnumParam::new("Oversample", Oversample::X4),
             hf_preserve: BoolParam::new("Preserve Highs", d.hf_preserve),
@@ -440,7 +440,7 @@ impl Default for OnsetGuardParams {
             )
             .with_unit(" Hz")
             .with_step_size(1.0),
-            sub_ceil_db: db_param("Sub Ceiling (separate)", d.sub_ceil_db, -24.0, 0.0),
+            sub_ceil_db: db_param("Sub Ceiling", d.sub_ceil_db, -24.0, 0.0),
             }),
         }
     }

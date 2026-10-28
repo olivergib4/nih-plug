@@ -12,11 +12,13 @@ use crate::help;
 use crate::presets::PRESETS;
 use crate::{Meters, OnsetGuardParams};
 
-const COLUMN_WIDTH: Units = Pixels(336.0);
-const CONTENT_WIDTH: f32 = 1008.0;
-/// Fits a 13" MacBook (900 px tall minus menu bar and the host's window chrome).
+const COLUMN_WIDTH: Units = Pixels(340.0);
+const CONTENT_WIDTH: f32 = 1020.0;
+/// Fits a 13" MacBook (900 px tall minus the menu bar and the host's window chrome).
 const GUI_WIDTH: u32 = 1040;
-const GUI_HEIGHT: u32 = 790;
+const GUI_HEIGHT: u32 = 780;
+/// Measured: one generic-UI row is 26 px tall at our stylesheet.
+const ROW_PX: f32 = 26.0;
 
 #[derive(Clone, Lens)]
 pub struct Data {
@@ -40,7 +42,73 @@ pub enum HelpEvent {
 impl Model for HelpModel {
     fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
         event.map(|e, _| match e {
-            HelpEvent::Show(t) => self.text = (*t).to_string(),
+            HelpEvent::Show(t) => {
+                if self.text != *t {
+                    self.text = (*t).to_string();
+                }
+            }
+        });
+    }
+}
+
+/// Text readouts for the meters. Updated by a background ticker (Vizia's baseview backend has
+/// no timers, and canvas text has no font), ten times a second while the editor is open.
+#[derive(Lens)]
+pub struct MeterModel {
+    pub dry: String,
+    pub wet: String,
+    pub matched: String,
+    meters: Arc<Meters>,
+}
+
+pub enum MeterEvent {
+    Tick,
+}
+
+fn phon(s: f32) -> f32 {
+    if s <= 1e-3 {
+        0.0
+    } else {
+        40.0 + 10.0 * s.log2()
+    }
+}
+
+impl Model for MeterModel {
+    fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
+        event.map(|e, _| match e {
+            MeterEvent::Tick => {
+                let d = self.meters.dry_sone.load(Ordering::Relaxed);
+                let w = self.meters.wet_sone.load(Ordering::Relaxed);
+                let m = self.meters.match_db.load(Ordering::Relaxed);
+                self.dry = format!("dry  {d:.1} sone · {:.0} phon", phon(d));
+                self.wet = format!("processed  {w:.1} sone · {:.0} phon", phon(w));
+                self.matched = format!("match {m:+.1} dB");
+            }
+        });
+    }
+}
+
+/// A container that shows `text` in the help panel whenever the mouse moves anywhere inside it.
+pub struct HelpArea {
+    text: &'static str,
+}
+
+impl HelpArea {
+    pub fn new<'a>(cx: &'a mut Context, text: &'static str, content: impl FnOnce(&mut Context)) -> Handle<'a, Self> {
+        Self { text }.build(cx, content)
+    }
+}
+
+impl View for HelpArea {
+    fn element(&self) -> Option<&'static str> {
+        Some("helparea")
+    }
+
+    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        event.map(|window_event, _| {
+            if let WindowEvent::MouseMove(_, _) = window_event {
+                cx.emit(HelpEvent::Show(self.text));
+            }
         });
     }
 }
@@ -55,6 +123,7 @@ pub(crate) fn create(
     analyzer: Arc<Mutex<triple_buffer::Output<AnalyzerData>>>,
     editor_state: Arc<ViziaState>,
 ) -> Option<Box<dyn Editor>> {
+    let state_for_ticker = editor_state.clone();
     create_vizia_editor(editor_state, ViziaTheming::Custom, move |cx, _| {
         assets::register_noto_sans_light(cx);
         assets::register_noto_sans_thin(cx);
@@ -75,6 +144,26 @@ pub(crate) fn create(
             ),
         }
         .build(cx);
+        MeterModel {
+            dry: String::from("dry"),
+            wet: String::from("processed"),
+            matched: String::new(),
+            meters: meters.clone(),
+        }
+        .build(cx);
+
+        // Ticker: emits MeterEvent::Tick into the window's event queue while the editor is open.
+        let state = state_for_ticker.clone();
+        cx.spawn(move |proxy| {
+            // give the window a moment to open before the first tick
+            std::thread::sleep(Duration::from_millis(200));
+            while state.is_open() {
+                if proxy.emit(MeterEvent::Tick).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
 
         VStack::new(cx, |cx| {
             // --- title + presets on one line ---
@@ -82,7 +171,7 @@ pub(crate) fn create(
                 Label::new(cx, "OnsetGuard")
                     .font_family(vec![FamilyOwned::Name(String::from(assets::NOTO_SANS))])
                     .font_weight(FontWeightKeyword::Thin)
-                    .font_size(26.0)
+                    .font_size(24.0)
                     .right(Pixels(18.0));
                 Label::new(cx, "presets").font_size(12.0).top(Pixels(8.0)).right(Pixels(6.0));
                 for preset in PRESETS {
@@ -93,76 +182,83 @@ pub(crate) fn create(
                         |cx| Label::new(cx, preset.name),
                     )
                     .on_hover(|cx| cx.emit(HelpEvent::Show(help::PRESET_HELP)))
-                    .top(Pixels(4.0))
+                    .on_press_down(|cx| cx.emit(HelpEvent::Show(help::PRESET_HELP)))
+                    .top(Pixels(3.0))
                     .right(Pixels(6.0));
                 }
             })
-            .height(Pixels(34.0))
-            .width(Pixels(CONTENT_WIDTH))
-            .child_left(Pixels(0.0));
+            .height(Pixels(32.0))
+            .width(Pixels(CONTENT_WIDTH));
 
             // --- analyzer ---
-            Analyzer::new(cx, Data::analyzer)
-                .width(Pixels(CONTENT_WIDTH))
-                .height(Pixels(140.0))
-                .on_hover(|cx| cx.emit(HelpEvent::Show(help::ANALYZER_HELP)));
+            HelpArea::new(cx, help::ANALYZER_HELP, |cx| {
+                Analyzer::new(cx, Data::analyzer).width(Pixels(CONTENT_WIDTH)).height(Pixels(140.0));
+            })
+            .width(Pixels(CONTENT_WIDTH))
+            .height(Pixels(140.0));
 
-            // --- loudness + help panel side by side ---
+            // --- loudness readout + help panel ---
             HStack::new(cx, |cx| {
-                SoneBars::new(cx, Data::meters)
-                    .width(Pixels(500.0))
-                    .height(Pixels(60.0))
-                    .on_hover(|cx| cx.emit(HelpEvent::Show(help::SONE_HELP)));
+                HelpArea::new(cx, help::SONE_HELP, |cx| {
+                    HStack::new(cx, |cx| {
+                        Label::new(cx, MeterModel::dry).font_size(11.0).width(Pixels(230.0));
+                        Label::new(cx, MeterModel::wet).font_size(11.0).width(Pixels(230.0));
+                    })
+                    .height(Pixels(16.0));
+                    SoneBars::new(cx, Data::meters).width(Pixels(460.0)).height(Pixels(40.0));
+                    Label::new(cx, MeterModel::matched).font_size(11.0).height(Pixels(16.0));
+                })
+                .layout_type(LayoutType::Column)
+                .width(Pixels(460.0))
+                .height(Pixels(74.0));
                 Label::new(cx, HelpModel::text)
                     .text_wrap(true)
-                    .font_size(12.0)
-                    .width(Pixels(CONTENT_WIDTH - 512.0))
-                    .height(Pixels(60.0))
+                    .font_size(11.0)
+                    .width(Pixels(CONTENT_WIDTH - 472.0))
+                    .height(Pixels(74.0))
                     .left(Pixels(12.0))
                     .class("helppanel");
             })
-            .height(Pixels(60.0))
+            .height(Pixels(74.0))
             .width(Pixels(CONTENT_WIDTH));
 
-            // --- controls, two rows of three columns ---
+            // --- controls: three columns, groups stacked to balance height ---
             HStack::new(cx, |cx| {
-                make_column(cx, "Threshold", |cx| {
-                    params_with_help(cx, Data::params.map(|p| p.threshold.clone()));
-                });
-                make_column(cx, "Dynamics", |cx| {
-                    params_with_help(cx, Data::params.map(|p| p.dynamics.clone()));
-                });
-                make_column(cx, "Onset Protection", |cx| {
-                    params_with_help(cx, Data::params.map(|p| p.protect.clone()));
-                });
-            })
-            .size(Auto);
-
-            HStack::new(cx, |cx| {
-                make_column(cx, "Clip", |cx| {
-                    params_with_help(cx, Data::params.map(|p| p.clip.clone()));
-                });
-                make_column(cx, "Resolution", |cx| {
-                    params_with_help(cx, Data::params.map(|p| p.resolution.clone()));
+                VStack::new(cx, |cx| {
+                    group(cx, "Clip", 13, |cx| params_with_help(cx, Data::params.map(|p| p.clip.clone())));
                     HStack::new(cx, |cx| {
                         meter(cx, "Spectral clip GR", Data::meters.map(|m| m.gr_spec_db.load(Ordering::Relaxed)), help::GR_SPEC_HELP);
                     })
                     .size(Auto)
-                    .top(Pixels(6.0));
-                });
-                make_column(cx, "Output", |cx| {
-                    params_with_help(cx, Data::params.map(|p| p.global.clone()));
+                    .top(Pixels(4.0));
+                })
+                .width(COLUMN_WIDTH)
+                .height(Auto);
+
+                VStack::new(cx, |cx| {
+                    group(cx, "Threshold", 5, |cx| params_with_help(cx, Data::params.map(|p| p.threshold.clone())));
+                    group(cx, "Dynamics", 7, |cx| params_with_help(cx, Data::params.map(|p| p.dynamics.clone())));
                     HStack::new(cx, |cx| {
                         meter(cx, "Post clip GR", Data::meters.map(|m| m.gr_post_db.load(Ordering::Relaxed)), help::GR_POST_HELP);
                     })
                     .size(Auto)
-                    .top(Pixels(6.0));
-                });
+                    .top(Pixels(4.0));
+                })
+                .width(COLUMN_WIDTH)
+                .height(Auto);
+
+                VStack::new(cx, |cx| {
+                    group(cx, "Onset Protection", 7, |cx| params_with_help(cx, Data::params.map(|p| p.protect.clone())));
+                    group(cx, "Resolution", 4, |cx| params_with_help(cx, Data::params.map(|p| p.resolution.clone())));
+                    group(cx, "Output", 4, |cx| params_with_help(cx, Data::params.map(|p| p.global.clone())));
+                })
+                .width(COLUMN_WIDTH)
+                .height(Auto);
             })
             .size(Auto);
         })
         .row_between(Pixels(6.0))
-        .child_top(Pixels(6.0))
+        .child_top(Pixels(4.0))
         .child_left(Stretch(1.0))
         .child_right(Stretch(1.0));
 
@@ -192,14 +288,14 @@ fn set_param(cx: &mut EventContext, ptr: ParamPtr, normalized: f32) {
 }
 
 fn meter(cx: &mut Context, title: &str, value_db: impl Lens<Target = f32>, help_text: &'static str) {
-    VStack::new(cx, |cx| {
+    HelpArea::new(cx, help_text, |cx| {
         Label::new(cx, title).font_size(11.0);
         PeakMeter::new(cx, value_db, Some(Duration::from_millis(600))).top(Pixels(2.0));
     })
+    .layout_type(LayoutType::Column)
     .width(Pixels(300.0))
     .height(Auto)
-    .left(Pixels(15.0))
-    .on_hover(move |cx| cx.emit(HelpEvent::Show(help_text)));
+    .left(Pixels(15.0));
 }
 
 /// A generic parameter list where hovering a row shows its explanation in the help panel.
@@ -216,30 +312,31 @@ where
         .map(|(id, ptr, _)| (ptr, id))
         .collect();
     GenericUi::new_custom(cx, params, move |cx, param_ptr| {
-        let help_text = ids.get(&param_ptr).and_then(|id| help::for_param(id));
-        let row = HStack::new(cx, |cx| {
+        let help_text = ids.get(&param_ptr).and_then(|id| help::for_param(id)).unwrap_or("");
+        HelpArea::new(cx, help_text, |cx| {
             Label::new(cx, unsafe { param_ptr.name() }).class("label");
             GenericUi::draw_widget(cx, params, param_ptr);
         })
-        .class("row");
-        if let Some(text) = help_text {
-            row.on_hover(move |cx| cx.emit(HelpEvent::Show(text)));
-        }
+        .class("row")
+        .layout_type(LayoutType::Row)
+        .col_between(Pixels(6.0))
+        .height(Auto);
     });
 }
 
-fn make_column(cx: &mut Context, title: &str, contents: impl FnOnce(&mut Context)) {
+/// A titled parameter group with a fixed height (title + `rows` rows) so columns line up.
+fn group(cx: &mut Context, title: &str, rows: usize, contents: impl FnOnce(&mut Context)) {
     VStack::new(cx, |cx| {
         Label::new(cx, title)
             .font_family(vec![FamilyOwned::Name(String::from(assets::NOTO_SANS))])
             .font_weight(FontWeightKeyword::Thin)
-            .font_size(18.0)
+            .font_size(16.0)
             .left(Stretch(1.0))
             .right(Pixels(7.0))
-            .bottom(Pixels(-8.0));
+            .bottom(Pixels(-6.0));
 
         contents(cx);
     })
     .width(COLUMN_WIDTH)
-    .height(Auto);
+    .height(Pixels(22.0 + ROW_PX * rows as f32 + 6.0));
 }

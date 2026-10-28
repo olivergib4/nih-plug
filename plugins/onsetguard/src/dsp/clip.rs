@@ -1,17 +1,29 @@
 //! Oversampled soft clipper (zero-stuff + linear-phase FIR, clip, FIR + decimate).
-//! Latency is a constant 16 samples for every oversampling factor.
+//!
+//! Latency is a constant `LATENCY` (= 2 * HALF) samples for every oversampling factor: the
+//! upsample and the downsample FIR each delay by HALF input samples, and the decimated output
+//! is taken on the input grid (phase 0), so the delay is an exact integer and the clipped
+//! signal stays sample-aligned with everything that bypasses it. At 1x a plain delay line
+//! matches it.
+//!
+//! The upsampler is polyphase (only the non-zero stuffed samples are multiplied), so a long
+//! FIR is affordable: HALF = 64 gives a transition band of about 2 kHz at 48 kHz, i.e. flat
+//! to ~22 kHz instead of rolling off from 17 kHz as a 16-tap half did. At 1x the clipper is
+//! bit-identical to a plain sample-level hard clip of the same signal.
 
-const HALF: usize = 16; // FIR half-length in input samples → delay = HALF samples
-pub const LATENCY: usize = HALF;
+const HALF: usize = 64; // FIR half-length in input samples
+pub const LATENCY: usize = 2 * HALF;
+const HIST: usize = 2 * HALF + 1; // input-rate history for the polyphase upsampler
 
 pub struct Oversampler {
     num_channels: usize,
     os: usize,
     taps: usize,
     coeffs: Vec<f32>,
-    /// Per-channel upsample FIR history (length taps), at the oversampled rate.
-    up_hist: Vec<Vec<f32>>,
-    up_pos: Vec<usize>,
+    /// Per-channel input-rate history for the polyphase upsample FIR (length HIST).
+    in_hist: Vec<Vec<f32>>,
+    in_pos: Vec<usize>,
+    /// Per-channel downsample FIR history (length taps), at the oversampled rate.
     down_hist: Vec<Vec<f32>>,
     down_pos: Vec<usize>,
     /// Plain delay for os == 1 so latency stays constant.
@@ -52,11 +64,11 @@ impl Oversampler {
             os: 1,
             taps: 1,
             coeffs: vec![0.0; max_taps],
-            up_hist: vec![vec![0.0; max_taps]; num_channels],
-            up_pos: vec![0; num_channels],
+            in_hist: vec![vec![0.0; HIST]; num_channels],
+            in_pos: vec![0; num_channels],
             down_hist: vec![vec![0.0; max_taps]; num_channels],
             down_pos: vec![0; num_channels],
-            delay: vec![vec![0.0; HALF]; num_channels],
+            delay: vec![vec![0.0; LATENCY]; num_channels],
             delay_pos: 0,
             stage: vec![0.0; num_channels],
         };
@@ -76,14 +88,17 @@ impl Oversampler {
         self.os = os;
         self.taps = 2 * HALF * os + 1;
         if os > 1 {
-            let h = blackman_sinc(self.taps, 0.5 / os as f32 * 0.9);
+            // cutoff at 0.96 x the input Nyquist: with HALF = 64 the Blackman transition is
+            // ~2 kHz wide at 48 kHz, so the passband is flat to ~22 kHz and the stopband
+            // starts at the input Nyquist
+            let h = blackman_sinc(self.taps, 0.5 / os as f32 * 0.96);
             self.coeffs[..self.taps].copy_from_slice(&h);
         }
         self.reset();
     }
 
     pub fn reset(&mut self) {
-        for h in &mut self.up_hist {
+        for h in &mut self.in_hist {
             h.fill(0.0);
         }
         for h in &mut self.down_hist {
@@ -92,7 +107,7 @@ impl Oversampler {
         for d in &mut self.delay {
             d.fill(0.0);
         }
-        self.up_pos.fill(0);
+        self.in_pos.fill(0);
         self.down_pos.fill(0);
         self.delay_pos = 0;
     }
@@ -129,30 +144,36 @@ impl Oversampler {
                     let g = clip_gain(y.abs(), ceil, hard);
                     channels[ch][i] = y * (g + (g_link - g) * link);
                 }
-                self.delay_pos = (self.delay_pos + 1) % HALF;
+                self.delay_pos = (self.delay_pos + 1) % LATENCY;
             }
             return;
         }
         let os = self.os;
         let taps = self.taps;
+        let gain = os as f32;
         for i in 0..len {
             let ceil = ceil_t.map_or(ceil_fixed, |c| c[i].max(1e-4));
+            // push the new input sample into every channel's input-rate history
+            for ch in 0..nc {
+                let ip = self.in_pos[ch];
+                self.in_hist[ch][ip] = channels[ch][i];
+            }
             for p in 0..os {
-                // upsample every channel for this phase
+                // polyphase upsample: y[i*os + p] = sum_m h[p + m*os] * x[i - m]
                 let mut peak = 0.0f32;
                 for ch in 0..nc {
-                    let uh = &mut self.up_hist[ch];
-                    let up = self.up_pos[ch];
-                    uh[up] = if p == 0 { channels[ch][i] * os as f32 } else { 0.0 };
+                    let ih = &self.in_hist[ch];
+                    let mut idx = self.in_pos[ch];
                     let mut acc = 0.0f32;
-                    let mut idx = up;
-                    for t in 0..taps {
-                        acc += uh[idx] * self.coeffs[t];
-                        idx = if idx == 0 { taps - 1 } else { idx - 1 };
+                    let mut t = p;
+                    while t < taps {
+                        acc += ih[idx] * self.coeffs[t];
+                        idx = if idx == 0 { HIST - 1 } else { idx - 1 };
+                        t += os;
                     }
-                    self.up_pos[ch] = (up + 1) % taps;
-                    self.stage[ch] = acc;
-                    peak = peak.max(acc.abs());
+                    let a = acc * gain;
+                    self.stage[ch] = a;
+                    peak = peak.max(a.abs());
                 }
                 let g_link = clip_gain(peak, ceil, hard);
                 // clip at the oversampled rate, then push into the downsample FIR
@@ -163,7 +184,9 @@ impl Oversampler {
                     let dh = &mut self.down_hist[ch];
                     let dp = self.down_pos[ch];
                     dh[dp] = c;
-                    if p == os - 1 {
+                    // decimate at phase 0: the output grid then coincides with the input grid
+                    // and the two FIR delays add to an exact 2 * HALF input samples
+                    if p == 0 {
                         let mut acc2 = 0.0f32;
                         let mut idx2 = dp;
                         for t in 0..taps {
@@ -175,6 +198,9 @@ impl Oversampler {
                     }
                     self.down_pos[ch] = (dp + 1) % taps;
                 }
+            }
+            for ch in 0..nc {
+                self.in_pos[ch] = (self.in_pos[ch] + 1) % HIST;
             }
         }
     }

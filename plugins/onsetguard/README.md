@@ -56,8 +56,8 @@ input ─┬─ long STFT  (mono-below + low-band dynamics)  ─ short STFT (hig
 
 ## Latency
 
-`long + short + short + 16` samples, plus a small lookahead when the windows are too short
-for the protection pre-window. At defaults and 48 kHz: 10256 samples (214 ms). Hosts
+`long + short + short + 128` samples, plus a small lookahead when the windows are too short
+for the protection pre-window. At defaults and 48 kHz: 10368 samples (216 ms). Hosts
 compensate automatically; this is a bounce / mix tool, not a live one.
 
 ## Ringing, measured

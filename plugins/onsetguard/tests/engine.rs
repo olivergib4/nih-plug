@@ -228,7 +228,7 @@ fn latency_is_reported_and_stable() {
     e.set_windows(s.long_order, s.short_order, s.oversample);
     let lat = e.latency();
     println!("latency at defaults: {lat} samples = {:.1} ms", lat as f32 / SR * 1000.0);
-    assert_eq!(lat, (1 << 13) + (1 << 10) + (1 << 10) + 16 + e_extra(lat));
+    assert_eq!(lat, (1 << 13) + (1 << 10) + (1 << 10) + 128 + e_extra(lat));
 }
 
 fn e_extra(lat: usize) -> usize {
@@ -479,6 +479,22 @@ fn hf_preserve_keeps_highs_through_a_hard_clip() {
     let in_tone = 0.02 * 10f32.powf(12.0 / 20.0); // 12 kHz after drive
     assert!((db(res[1].1) - db(in_tone)).abs() < 1.5, "with HF preserve the 12 kHz tone should come through at its driven level");
     assert!(res[1].1 > res[0].1 * 1.5, "HF preserve should keep more of the 12 kHz tone than plain hard clipping");
+
+    // Highs Amount: the 12 kHz tone must rise monotonically from the clipped level (0%) to
+    // the driven level (100%)
+    let mut prev = 0.0f32;
+    for amt in [0.0, 0.25, 0.5, 0.75, 1.0] {
+        let mut s = base;
+        s.hf_preserve = true;
+        s.hf_amount = amt;
+        let out = run(&[x.clone()], &s);
+        let seg = &out[0][len / 2..];
+        let a12k = goertzel(seg, SR, 12000.0);
+        println!("highs amount {:.0}%: 12 kHz tone {:.1} dB", amt * 100.0, db(a12k));
+        assert!(a12k >= prev * 0.98, "highs amount should not reduce the tone as it rises");
+        prev = a12k;
+    }
+    assert!((db(prev) - db(in_tone)).abs() < 1.5);
 }
 
 /// Sub Protect Amount: 0% leaves the body at full level and lets the final clip touch the sub
@@ -522,4 +538,36 @@ fn sub_protect_amount_trades_body_level_for_sub_purity() {
         assert!(w[1].2 <= w[0].2 * 1.15, "sub harmonics should fall monotonically with the amount");
     }
     assert!(rows[0].1 > rows[n - 1].1 && rows[n - 1].2 < rows[0].2);
+}
+
+/// Preserve Highs on, Protect Amount 100%, clip on, a zap (HF-dominant hit) that stays under
+/// the ceiling: the clip stage has nothing to do, so the output must null against the input.
+/// Catches the two 0.9.0 regressions: the highs reserving their full level (body clipped to
+/// -20 dB) and the highs being delayed before the clip-everything path summed them.
+#[test]
+fn hf_preserve_is_transparent_below_the_ceiling() {
+    let zap: Vec<f32> = synth_zap().iter().map(|v| v * 0.5).collect();
+    let mut s = Settings::default();
+    s.dyn_.down_ratio = 1.0;
+    s.dyn_.up_ratio = 1.0;
+    s.dyn_.mono_below_hz = 0.0;
+    s.protect_on = false;
+    s.clip_on = true;
+    s.drive_db = 0.0;
+    s.ceil_db = 0.0;
+    s.bin_ceil_db = 0.0;
+    s.hardness = 1.0;
+    s.trans_clip = 1.0;
+    s.hf_preserve = true;
+    s.hf_hz = 4000.0;
+    for (hf, amt) in [(false, 0.0), (true, 0.0), (true, 0.5), (true, 1.0)] {
+        s.hf_preserve = hf;
+        s.band_protect = amt;
+        let out = run(&[zap.clone()], &s);
+        println!("hf {hf} amt {amt}: best lag {} samples", best_lag(&zap, &out[0]));
+        let pk = zap.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let err = zap.iter().zip(&out[0]).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        println!("hf preserve transparency at {:.0}%: max error {:.1} dB re peak", amt * 100.0, db(err / pk));
+        assert!(db(err / pk) < -35.0, "hf {hf} at {amt}: error {} dB", db(err / pk));
+    }
 }

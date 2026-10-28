@@ -229,6 +229,8 @@ pub struct ClipParams {
     pub hf_preserve: BoolParam,
     #[id = "hf_hz"]
     pub hf_hz: FloatParam,
+    #[id = "hf_amount"]
+    pub hf_amount: FloatParam,
     #[id = "sub_split"]
     pub sub_split: EnumParam<SubSplit>,
     #[id = "sub_hz"]
@@ -430,6 +432,7 @@ impl Default for OnsetGuardParams {
             )
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(1))
             .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
+            hf_amount: pct_param("Highs Amount", d.hf_amount),
             sub_split: EnumParam::new("Sub Split", SubSplit::Off),
             sub_hz: FloatParam::new(
                 "Sub Split Freq",
@@ -494,6 +497,7 @@ impl OnsetGuardParams {
         s.sub_hz = self.clip.sub_hz.value();
         s.hf_preserve = self.clip.hf_preserve.value();
         s.hf_hz = self.clip.hf_hz.value();
+        s.hf_amount = self.clip.hf_amount.value();
         s.sub_ceil_db = self.clip.sub_ceil_db.value();
         s.band_protect = self.clip.band_protect.value();
         s.oversample = match self.clip.oversample.value() {

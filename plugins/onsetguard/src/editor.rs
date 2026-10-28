@@ -225,7 +225,7 @@ pub(crate) fn create(
             // --- controls: three columns, groups stacked to balance height ---
             HStack::new(cx, |cx| {
                 VStack::new(cx, |cx| {
-                    group(cx, "Clip", 13, |cx| params_with_help(cx, Data::params.map(|p| p.clip.clone())));
+                    group(cx, "Clip", 15, |cx| params_with_help(cx, Data::params.map(|p| p.clip.clone())));
                     HStack::new(cx, |cx| {
                         meter(cx, "Spectral clip GR", Data::meters.map(|m| m.gr_spec_db.load(Ordering::Relaxed)), help::GR_SPEC_HELP);
                     })

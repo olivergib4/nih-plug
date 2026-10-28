@@ -316,6 +316,7 @@ fn sub_split_modes_do_what_they_say() {
     base.dyn_.up_ratio = 1.0;
     base.dyn_.mono_below_hz = 0.0;
     base.sub_hz = 100.0;
+    base.band_protect = 1.0;
     base.bin_ceil_db = 0.0; // keep the per-bin ceiling out of the way; this tests the soft clip paths
     let mut results = Vec::new();
     for mode in [SubMode::Off, SubMode::Separate, SubMode::Protect] {
@@ -458,6 +459,7 @@ fn hf_preserve_keeps_highs_through_a_hard_clip() {
     base.bin_ceil_db = 0.0;
     base.hardness = 1.0;
     base.trans_clip = 1.0;
+    base.band_protect = 1.0;
     let mut res = Vec::new();
     for hf in [false, true] {
         let mut s = base;
@@ -477,4 +479,47 @@ fn hf_preserve_keeps_highs_through_a_hard_clip() {
     let in_tone = 0.02 * 10f32.powf(12.0 / 20.0); // 12 kHz after drive
     assert!((db(res[1].1) - db(in_tone)).abs() < 1.5, "with HF preserve the 12 kHz tone should come through at its driven level");
     assert!(res[1].1 > res[0].1 * 1.5, "HF preserve should keep more of the 12 kHz tone than plain hard clipping");
+}
+
+/// Sub Protect Amount: 0% leaves the body at full level and lets the final clip touch the sub
+/// where the sum exceeds the ceiling; 100% keeps the sub perfectly clean and ducks the body.
+#[test]
+fn sub_protect_amount_trades_body_level_for_sub_purity() {
+    use onsetguard::dsp::SubMode;
+    let len = (1.0 * SR) as usize;
+    let x: Vec<f32> = (0..len)
+        .map(|i| {
+            let t = i as f32 / SR;
+            0.35 * (2.0 * std::f32::consts::PI * 50.0 * t).sin() + 0.5 * (2.0 * std::f32::consts::PI * 2000.0 * t).sin()
+        })
+        .collect();
+    let mut base = Settings::default();
+    base.drive_db = 6.0;
+    base.trans_clip = 1.0;
+    base.protect_on = false;
+    base.dyn_.down_ratio = 1.0;
+    base.dyn_.up_ratio = 1.0;
+    base.dyn_.mono_below_hz = 0.0;
+    base.sub_hz = 100.0;
+    base.bin_ceil_db = 0.0;
+    base.sub_mode = SubMode::Protect;
+    let mut rows = Vec::new();
+    for amt in [0.0f32, 0.2, 0.4, 0.6, 0.8, 1.0] {
+        let mut s = base;
+        s.band_protect = amt;
+        let out = run(&[x.clone()], &s);
+        let seg = &out[0][len / 2..];
+        let peak = seg.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let body = goertzel(seg, SR, 2000.0);
+        let harm = goertzel(seg, SR, 150.0).max(goertzel(seg, SR, 250.0));
+        println!("protect amount {:.0}%: peak {:.2} dBFS, body (2 kHz) {:.1} dB, sub harmonics {:.1} dB", amt * 100.0, db(peak), db(body), db(harm));
+        rows.push((peak, body, harm));
+        assert!(peak <= 1.0 + 1e-3, "ceiling must hold");
+    }
+    let n = rows.len();
+    for w in rows.windows(2) {
+        assert!(w[1].1 <= w[0].1 + 0.02, "body level should fall monotonically with the amount");
+        assert!(w[1].2 <= w[0].2 * 1.15, "sub harmonics should fall monotonically with the amount");
+    }
+    assert!(rows[0].1 > rows[n - 1].1 && rows[n - 1].2 < rows[0].2);
 }

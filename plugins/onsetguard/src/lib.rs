@@ -235,6 +235,8 @@ pub struct ClipParams {
     pub sub_hz: FloatParam,
     #[id = "sub_ceil"]
     pub sub_ceil_db: FloatParam,
+    #[id = "band_protect"]
+    pub band_protect: FloatParam,
 }
 
 fn db_param(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
@@ -441,6 +443,7 @@ impl Default for OnsetGuardParams {
             .with_unit(" Hz")
             .with_step_size(1.0),
             sub_ceil_db: db_param("Sub Ceiling", d.sub_ceil_db, -24.0, 0.0),
+            band_protect: pct_param("Protect Amount", d.band_protect),
             }),
         }
     }
@@ -492,6 +495,7 @@ impl OnsetGuardParams {
         s.hf_preserve = self.clip.hf_preserve.value();
         s.hf_hz = self.clip.hf_hz.value();
         s.sub_ceil_db = self.clip.sub_ceil_db.value();
+        s.band_protect = self.clip.band_protect.value();
         s.oversample = match self.clip.oversample.value() {
             Oversample::X1 => 1,
             Oversample::X2 => 2,

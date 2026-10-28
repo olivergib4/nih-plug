@@ -34,9 +34,9 @@ const TIMING_FADE_S: f32 = 0.15;
 pub enum SubMode {
     /// Everything goes through one clipper.
     Off,
-    /// The sub bypasses the spectral and soft clippers and is summed back clean. Its peak
-    /// envelope reserves headroom, so the rest is clipped into whatever is left: a clean sub
-    /// costs loudness above it.
+    /// The sub bypasses the spectral and soft clippers and is summed back clean; its peak
+    /// envelope reserves headroom so the rest is clipped into what is left (blended with the
+    /// plain clip by `band_protect`).
     Protect,
     /// The sub gets its own clipper at its own ceiling (`sub_ceil_db` below the output
     /// ceiling) and the rest is clipped into the remaining headroom; no intermodulation
@@ -73,6 +73,10 @@ pub struct Settings {
     pub hf_hz: f32,
     pub sub_mode: SubMode,
     pub sub_hz: f32,
+    /// Blend between "clip everything" (0) and "protected bands" (1): with Sub Split or
+    /// Preserve Highs on, how much of that protection is applied. Proportional trade between
+    /// band purity and body level; the ceiling holds at every setting.
+    pub band_protect: f32,
     /// Separate mode: the sub's own ceiling, dB relative to the output ceiling (<= 0).
     pub sub_ceil_db: f32,
 
@@ -119,10 +123,11 @@ impl Default for Settings {
             trans_clip: 1.0,
             clip_link: 1.0,
             oversample: 4,
-            hf_preserve: true,
+            hf_preserve: false,
             hf_hz: 8000.0,
             sub_mode: SubMode::Off,
             sub_hz: 100.0,
+            band_protect: 0.6,
             sub_ceil_db: -6.0,
             mix: 1.0,
             output_gain: 1.0,
@@ -215,6 +220,7 @@ pub struct Engine {
     /// Spectral clip on the rest band.
     clip_stft: stft::StftStage,
     sub_oversampler: clip::Oversampler,
+    final_oversampler: clip::Oversampler,
     low_dyn: Dynamics,
     high_dyn: Dynamics,
     oversampler: clip::Oversampler,
@@ -262,8 +268,6 @@ pub struct Engine {
     /// 3*num_channels scratch for the clip stage: [rest.., sub.., highs..]
     clw: Vec<Vec<f32>>,
     hf_delay: Delay, // highs: + oversampler latency
-    hf_env: f32,
-    hf_hold: usize,
     /// Sub band (processed, reference) after the long stage, then the blended driven sub.
     sub_a: Vec<Vec<f32>>,
     sub_r: Vec<Vec<f32>>,
@@ -284,7 +288,7 @@ impl Engine {
         let max_short = 1 << MAX_SHORT_ORDER;
         let pre_max = (MAX_PRE_MS / 1000.0 * sample_rate).ceil() as usize;
         let extra_max = pre_max + onset::MAX_LATENCY;
-        let ring_len = max_long + 2 * max_short + extra_max + 2 * pre_max + sample_rate as usize + max_block + clip::LATENCY;
+        let ring_len = max_long + 2 * max_short + extra_max + 2 * pre_max + sample_rate as usize + max_block + 2 * clip::LATENCY;
         let mut e = Engine {
             num_channels,
             sample_rate,
@@ -293,6 +297,7 @@ impl Engine {
             short_stft: stft::StftStage::new(num_channels, MIN_SHORT_ORDER, MAX_SHORT_ORDER),
             clip_stft: stft::StftStage::new(2 * num_channels, MIN_SHORT_ORDER, MAX_SHORT_ORDER),
             sub_oversampler: clip::Oversampler::new(num_channels, MAX_OVERSAMPLE),
+            final_oversampler: clip::Oversampler::new(num_channels, MAX_OVERSAMPLE),
             low_dyn: Dynamics::new(Band::Low, num_channels, max_long),
             high_dyn: Dynamics::new(Band::High, num_channels, max_short),
             oversampler: clip::Oversampler::new(num_channels, MAX_OVERSAMPLE),
@@ -302,8 +307,8 @@ impl Engine {
             sub_r_delay: Delay::new(num_channels, max_short + extra_max),
             sub_clip_delay: Delay::new(num_channels, max_short),
             proc_delay: Delay::new(num_channels, extra_max),
-            driven_delay: Delay::new(num_channels, max_short + clip::LATENCY),
-            dry_delay: Delay::new(num_channels, max_long + 2 * max_short + extra_max + clip::LATENCY),
+            driven_delay: Delay::new(num_channels, max_short + 2 * clip::LATENCY),
+            dry_delay: Delay::new(num_channels, max_long + 2 * max_short + extra_max + 2 * clip::LATENCY),
             p_ring: EnvRing::new(ring_len, 1.0),
             t_ring: EnvRing::new(ring_len, 0.0),
             pc_ring: EnvRing::new(ring_len, 0.0),
@@ -328,8 +333,6 @@ impl Engine {
             cl: vec![vec![0.0; max_block]; num_channels],
             clw: vec![vec![0.0; max_block]; 3 * num_channels],
             hf_delay: Delay::new(num_channels, clip::LATENCY),
-            hf_env: 0.0,
-            hf_hold: 0,
             sub_a: vec![vec![0.0; max_block]; num_channels],
             sub_r: vec![vec![0.0; max_block]; num_channels],
             clsub: vec![vec![0.0; max_block]; num_channels],
@@ -361,6 +364,7 @@ impl Engine {
         self.high_dyn.configure(self.sample_rate, n_s);
         self.oversampler.set_os(oversample.clamp(1, MAX_OVERSAMPLE));
         self.sub_oversampler.set_os(oversample.clamp(1, MAX_OVERSAMPLE));
+        self.final_oversampler.set_os(oversample.clamp(1, MAX_OVERSAMPLE));
         let pre_max = (MAX_PRE_MS / 1000.0 * self.sample_rate).ceil() as usize;
         let l_spec = n_l + n_s;
         self.extra_delay = (pre_max + onset::MAX_LATENCY).saturating_sub(l_spec);
@@ -387,10 +391,9 @@ impl Engine {
         self.high_dyn.reset();
         self.oversampler.reset();
         self.sub_oversampler.reset();
+        self.final_oversampler.reset();
         self.sub_env = 0.0;
         self.sub_hold = 0;
-        self.hf_env = 0.0;
-        self.hf_hold = 0;
         self.hf_delay.reset();
         self.detector.reset();
         self.ref_delay.reset();
@@ -629,14 +632,23 @@ impl Engine {
             self.protect_vis = if frac > self.protect_vis { frac } else { self.protect_vis * 0.9 };
         }
 
-        // --- spectral clip + oversampled clip; driven delayed to match ---
-        // The clip STFT runs on [rest.., sub..]. With Sub Split off the sub channels are zeroed
-        // in the frequency domain and the rest keeps the full band.
+        // --- clip stage ---
+        // Three zero-phase, sample-aligned bands: rest, sub, highs. Two outputs are built:
+        //   A = clip(rest + sub + highs)                      "clip everything"
+        //   B = clip(rest, ceiling - reserved) + sub' + highs  "protected bands"
+        // where sub' is the sub untouched (Protect) or clipped at its own ceiling (Separate),
+        // and `reserved` is the peak envelope of what is summed back in. B stays under the
+        // ceiling by construction. The output is a linear blend A -> B by Protect Amount, so
+        // the trade (band purity vs body level) is proportional and the ceiling always holds.
         let ceil = 10f32.powf(s.ceil_db / 20.0);
         let bin_ceil = 10f32.powf(s.bin_ceil_db / 20.0);
         {
             let clip_on = s.clip_on;
             let sub_mode = s.sub_mode;
+            let hf_on = clip_on && s.hf_preserve;
+            let bands_on = clip_on && (sub_mode != SubMode::Off || hf_on);
+            let blend = if bands_on { s.band_protect.clamp(0.0, 1.0) } else { 0.0 };
+
             // rest = full - sub (exact, both zero-phase and aligned); sub only needs a delay
             for ch in 0..nc {
                 for i in 0..len {
@@ -664,7 +676,6 @@ impl Engine {
                 let (rest_sub, hf) = self.clw.split_at_mut(2 * nc);
                 let (rest, _) = rest_sub.split_at_mut(nc);
                 let mut refs = rest.iter_mut().chain(hf.iter_mut()).map(|v| &mut v[..]).collect::<SmallRefs>();
-                let hf_on = clip_on && s.hf_preserve;
                 let hf_hz = s.hf_hz.max(1000.0);
                 let n_clip = self.clip_stft.window_size() as f32;
                 self.clip_stft.process(refs.as_mut(), len, |spectra, nb, mag| {
@@ -693,56 +704,51 @@ impl Engine {
                     }
                 });
             }
-            // highs: plain delay to match the oversampler, and a peak envelope to reserve headroom
-            {
-                let rel = (-1.0 / (0.08 * sr)).exp();
-                let hold_n = (0.010 * sr) as usize;
-                for i in 0..len {
-                    for ch in 0..nc {
-                        self.tmp_in[ch] = self.clw[2 * nc + ch][i];
-                    }
-                    self.hf_delay.tick(&self.tmp_in[..nc], &mut self.tmp_out[..nc]);
-                    let mut a = 0.0f32;
-                    for ch in 0..nc {
-                        self.clw[2 * nc + ch][i] = self.tmp_out[ch];
-                        a = a.max(self.tmp_in[ch].abs());
-                    }
-                    if a >= self.hf_env {
-                        self.hf_env = a;
-                        self.hf_hold = hold_n;
-                    } else if self.hf_hold > 0 {
-                        self.hf_hold -= 1;
-                    } else {
-                        self.hf_env = a + (self.hf_env - a) * rel;
-                    }
-                    // the highs never reserve more than 3 dB; beyond that the final clamp trims
-                    self.rest_ceil[i] = ceil - self.hf_env.min(ceil * 0.29);
+            // highs: plain delay to match the oversamplers
+            for i in 0..len {
+                for ch in 0..nc {
+                    self.tmp_in[ch] = self.clw[2 * nc + ch][i];
+                }
+                self.hf_delay.tick(&self.tmp_in[..nc], &mut self.tmp_out[..nc]);
+                for ch in 0..nc {
+                    self.clw[2 * nc + ch][i] = self.tmp_out[ch];
                 }
             }
-            // Separate: the sub gets the per-bin ceiling too, at the clip resolution, via its
-            // own pass. Cheap enough and keeps the two paths symmetric in latency (the sub path
-            // already carries the clip window delay, so this pass must not add more): we apply
-            // it as a plain magnitude cap in the time domain instead (soft clipper below).
-            // peak after the spectral stage, on the recombined signal
+            // peak after the spectral stage, on the recombined signal (for the GR meter)
             let mut pk_spec = 0.0f32;
             for ch in 0..nc {
                 for i in 0..len {
                     pk_spec = pk_spec.max((self.clw[ch][i] + self.clw[nc + ch][i] + self.clw[2 * nc + ch][i]).abs());
                 }
             }
-            // Protect / Separate: the sub's peak envelope (instant attack, 25 ms hold,
-            // ~80 ms release) reserves headroom; the rest is clipped into what is left. In
-            // Separate the sub is first clipped to its own ceiling, so the reservation is capped.
-            let sub_cap = if sub_mode == SubMode::Separate { ceil * 10f32.powf(s.sub_ceil_db.min(0.0) / 20.0) } else { f32::MAX };
-            if clip_on && sub_mode != SubMode::Off {
+
+            // --- A: clip everything (full = rest + sub + highs) ---
+            for ch in 0..nc {
+                for i in 0..len {
+                    self.cl[ch][i] = self.clw[ch][i] + self.clw[nc + ch][i] + self.clw[2 * nc + ch][i];
+                }
+            }
+            {
+                let mut refs = self.cl.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
+                if clip_on {
+                    self.final_oversampler.process(refs.as_mut(), len, ceil, s.hardness, s.clip_link);
+                } else {
+                    self.final_oversampler.process(refs.as_mut(), len, 1e6, 0.999, 0.0);
+                }
+            }
+
+            // --- B: protected bands (only computed when it matters) ---
+            if blend > 0.0 {
+                // reserved headroom = peak envelope (instant attack, 25 ms hold, 80 ms release)
+                // of sub' + highs, the parts that are summed back unclipped
+                let sub_cap = if sub_mode == SubMode::Separate { ceil * 10f32.powf(s.sub_ceil_db.min(0.0) / 20.0) } else { f32::MAX };
                 let rel = (-1.0 / (0.08 * sr)).exp();
-                // hold longer than a full period of the lowest sub so the reserved headroom
-                // does not ripple at the sub's rate (that would modulate the rest)
                 let hold_n = (0.025 * sr) as usize;
                 for i in 0..len {
                     let mut a = 0.0f32;
                     for ch in 0..nc {
-                        a = a.max(self.clw[nc + ch][i].abs());
+                        let sub_v = if sub_mode == SubMode::Off { 0.0 } else { self.clw[nc + ch][i].abs().min(sub_cap) };
+                        a = a.max(sub_v + self.clw[2 * nc + ch][i].abs());
                     }
                     if a >= self.sub_env {
                         self.sub_env = a;
@@ -752,37 +758,40 @@ impl Engine {
                     } else {
                         self.sub_env = a + (self.sub_env - a) * rel;
                     }
-                    self.rest_ceil[i] = (self.rest_ceil[i] - self.sub_env.min(sub_cap)).max(ceil * 0.1);
+                    self.rest_ceil[i] = (ceil - self.sub_env).max(ceil * 0.1);
                 }
-            }
-            {
                 let (rest, tail) = self.clw.split_at_mut(nc);
                 let (sub, _hf) = tail.split_at_mut(nc);
                 let mut rrefs = rest.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
                 let mut srefs = sub.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
-                if clip_on && (sub_mode != SubMode::Off || s.hf_preserve) {
-                    self.oversampler.process_dyn(rrefs.as_mut(), len, ceil, Some(&self.rest_ceil[..len]), s.hardness, s.clip_link);
-                } else if clip_on {
-                    self.oversampler.process(rrefs.as_mut(), len, ceil, s.hardness, s.clip_link);
-                } else {
-                    self.oversampler.process(rrefs.as_mut(), len, 1e6, 0.999, 0.0);
-                }
-                if clip_on && sub_mode == SubMode::Separate {
+                self.oversampler.process_dyn(rrefs.as_mut(), len, ceil, Some(&self.rest_ceil[..len]), s.hardness, s.clip_link);
+                if sub_mode == SubMode::Separate {
                     self.sub_oversampler.process(srefs.as_mut(), len, sub_cap, s.hardness, s.clip_link);
                 } else {
-                    // Off / Protect: plain delay so the two paths stay aligned
                     self.sub_oversampler.process(srefs.as_mut(), len, 1e6, 0.999, 0.0);
                 }
-            }
-            for ch in 0..nc {
-                for i in 0..len {
-                    let y = self.clw[ch][i] + self.clw[nc + ch][i] + self.clw[2 * nc + ch][i];
-                    // the summed bands can exceed the ceiling slightly; hold it with a hard clamp
-                    self.cl[ch][i] = if clip_on { y.clamp(-ceil, ceil) } else { y };
+                // blend: out = (1 - blend) * A + blend * B; B is clamped as FIR-overshoot safety
+                let sub_in = sub_mode != SubMode::Off;
+                for ch in 0..nc {
+                    for i in 0..len {
+                        let b = self.clw[ch][i]
+                            + if sub_in { self.clw[nc + ch][i] } else { 0.0 }
+                            + self.clw[2 * nc + ch][i];
+                        let b = b.clamp(-ceil, ceil);
+                        self.cl[ch][i] += (b - self.cl[ch][i]) * blend;
+                    }
                 }
+            } else {
+                // keep the oversamplers' state warm so switching modes does not click
+                let (rest, tail) = self.clw.split_at_mut(nc);
+                let (sub, _hf) = tail.split_at_mut(nc);
+                let mut rrefs = rest.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
+                let mut srefs = sub.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
+                self.oversampler.process(rrefs.as_mut(), len, 1e6, 0.999, 0.0);
+                self.sub_oversampler.process(srefs.as_mut(), len, 1e6, 0.999, 0.0);
             }
+
             let pk_post = block_peak(&self.cl, nc, len);
-            // The post-clip signal is 16 samples later than pk_spec's; negligible for a block meter.
             let gr_post = if clip_on && pk_spec > 1e-6 { (20.0 * (pk_post / pk_spec).log10()).min(0.0) } else { 0.0 };
             self.gr_post_db = if gr_post < self.gr_post_db { gr_post } else { self.gr_post_db + (gr_post - self.gr_post_db) * (len as f32 / (0.3 * sr)).min(1.0) };
             self.pending_pk_spec = pk_spec;

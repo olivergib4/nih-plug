@@ -31,8 +31,9 @@ input ─┬─ long STFT  (mono-below + low-band dynamics)  ─ short STFT (hig
 * **Sub Split.** The band below Sub Split Freq is separated at the long resolution (sharp,
   zero-phase) and carried through the same onset protection as the full signal, so
   `full - sub` is an exact remainder. *Protect*: the sub bypasses both clippers and its peak
-  envelope reserves headroom; the rest is clipped into what is left (a clean sub costs loudness
-  above it). *Clip separately*: the sub is clipped on its own at Sub Ceiling, the rest into the
+  envelope reserves headroom; the rest is clipped into what is left. Protect Amount blends this
+  with the plain clip-everything output, so body level and sub purity trade proportionally and
+  the ceiling holds at every setting. *Clip separately*: the sub is clipped on its own at Sub Ceiling, the rest into the
   remaining headroom; no intermodulation between sub and the rest (measured: intermod products
   drop from -24 dB to below -90 dB on a 50 Hz + 2 kHz test).
 * **Perceived loudness in sones.** A Zwicker-style model (outer/middle-ear transfer, 24 Bark

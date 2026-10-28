@@ -338,3 +338,97 @@ fn sub_split_modes_do_what_they_say() {
     assert!((db(prot.1) - db(0.7)).abs() < 0.5, "Protect should pass the sub at its driven level (0.7)");
     assert!(sep.2 > prot.2 * 10.0, "Separate still clips the sub on its own");
 }
+
+/// Matched bypass should settle on a gain that makes the dry signal as loud (in sones) as the
+/// processed one. Process a loop with +9 dB of drive, let the servo settle, then check the
+/// two sone readings agree within ~5%.
+#[test]
+fn matched_bypass_settles_in_sones() {
+    let sr = SR;
+    let len = (6.0 * sr) as usize;
+    let clap = synth_clap(4);
+    let kick: Vec<f32> = (0..(0.4 * sr) as usize).map(|i| { let t = i as f32 / sr; (2.0 * std::f32::consts::PI * (50.0 * t + 60.0 * (1.0 - (-t / 0.03).exp()))).sin() * (-t / 0.2).exp() * 0.8 }).collect();
+    let mut x = vec![0.0f32; len];
+    let beat = (0.4 * sr) as usize;
+    for b in 0..(len / beat) {
+        let at = b * beat;
+        let src = if b % 2 == 0 { &kick } else { &clap };
+        for i in 0..src.len() { if at + i < len { x[at + i] += src[i]; } }
+    }
+    let mut e = Engine::new(1, sr, BLOCK);
+    let mut s = Settings::default();
+    s.drive_db = 9.0;
+    s.matched_bypass = true;
+    e.set_windows(s.long_order, s.short_order, s.oversample);
+    let mut pos = 0;
+    let (mut acc_d, mut acc_w, mut cnt) = (0.0f32, 0.0f32, 0usize);
+    while pos < len {
+        let n = BLOCK.min(len - pos);
+        let mut c: Vec<f32> = x[pos..pos + n].to_vec();
+        { let mut r: Vec<&mut [f32]> = vec![&mut c[..]]; e.process(&mut r, n, &s); }
+        pos += n;
+        if pos > (4.0 * sr) as usize {
+            // average both readings over the last 2 s (hits make the instantaneous values swing)
+            let (d, w) = e.sones();
+            let (g, _, _) = e.meters();
+            acc_d += d * g.powf(0.6);
+            acc_w += w;
+            cnt += 1;
+        }
+    }
+    let (g, _, _) = e.meters();
+    let (dry_scaled, wet) = (acc_d / cnt as f32, acc_w / cnt as f32);
+    println!("last 2 s: processed {wet:.1} sone, matched dry {dry_scaled:.1} sone, match gain {:+.1} dB", 20.0 * g.log10());
+    assert!((dry_scaled / wet - 1.0).abs() < 0.1, "servo should match sones: {dry_scaled} vs {wet}");
+}
+
+/// Post-ringing proper: a 2 ms noise burst followed by silence. Anything in the output
+/// 30-170 ms after the burst is ringing from the spectral stage (there is no dry tail to
+/// confuse it with). Reported relative to the burst's own energy, dynamics stage only.
+#[test]
+fn post_ring_after_hits_is_measured() {
+    let len = (0.6 * SR) as usize;
+    let mut burst = vec![0.0f32; len];
+    let onset = (0.05 * SR) as usize;
+    let mut seed = 21u32;
+    for i in 0..(0.002 * SR) as usize {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        burst[onset + i] = 0.7 * ((seed as f32 / 4294967296.0) * 2.0 - 1.0);
+    }
+    let a = onset + (0.030 * SR) as usize;
+    let b = onset + (0.170 * SR) as usize;
+    let e_burst: f32 = burst.iter().map(|v| v * v).sum();
+    let mut base = Settings::default();
+    base.dyn_.threshold_db = -30.0;
+    base.dyn_.down_ratio = 6.0;
+    base.dyn_.up_ratio = 3.0;
+    base.dyn_.up_range_db = 18.0;
+    base.dyn_.attack_ms = 2.0;
+    base.dyn_.release_ms = 80.0;
+    base.dyn_.mono_below_hz = 0.0;
+    base.clip_on = false;
+    let mut rows = Vec::new();
+    for (name, protect, smooth, post) in [
+        ("protection off, no smoothing", false, 0.0f32, 30.0f32),
+        ("protection on, no smoothing", true, 0.0, 30.0),
+        ("protection on, 1/6 oct smoothing", true, 0.17, 30.0),
+        ("protection on, 1/3 oct smoothing", true, 0.33, 30.0),
+        ("protection on, 1/6 oct, post 120 ms", true, 0.17, 120.0),
+    ] {
+        let mut s = base;
+        s.protect_on = protect;
+        s.dyn_.smooth_oct = smooth;
+        s.post_ms = post;
+        let out = run(&[burst.clone()], &s);
+        let e_tail: f32 = out[0][a..b].iter().map(|v| v * v).sum();
+        let pre_a = onset.saturating_sub((0.040 * SR) as usize);
+        let e_pre: f32 = out[0][pre_a..onset.saturating_sub(48)].iter().map(|v| v * v).sum();
+        let rel = db((e_tail / e_burst).sqrt());
+        let rel_pre = db((e_pre / e_burst).sqrt());
+        println!("{name}: post-ring (30-170 ms) {rel:.1} dB, pre-ring (-40..-1 ms) {rel_pre:.1} dB, both relative to the hit");
+        rows.push(rel);
+    }
+    assert!(rows[0] < -30.0, "post-ring should be well below the hit even unprotected");
+    assert!(rows[3] <= rows[1] + 0.5, "smoothing should not increase ringing");
+    assert!(rows[4] < rows[2] - 3.0, "a longer Post should reduce ringing");
+}

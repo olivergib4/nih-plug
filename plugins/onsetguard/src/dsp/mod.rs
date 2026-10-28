@@ -14,6 +14,7 @@ pub mod clip;
 pub mod dynamics;
 pub mod loudness;
 pub mod onset;
+pub mod sone;
 pub mod stft;
 
 use dynamics::{Band, Dynamics, DynamicsSettings, Weighting};
@@ -74,6 +75,8 @@ pub struct Settings {
     pub mix: f32,
     pub output_gain: f32,
     pub matched_bypass: bool,
+    /// Playback calibration for the sone model: a full-scale sine plays at this dB SPL.
+    pub ref_spl: f32,
 }
 
 impl Default for Settings {
@@ -118,6 +121,7 @@ impl Default for Settings {
             mix: 1.0,
             output_gain: 1.0,
             matched_bypass: false,
+            ref_spl: 100.0,
         }
     }
 }
@@ -230,6 +234,10 @@ pub struct Engine {
     timing_scale: f32,
     k_dry: loudness::KMeter,
     k_wet: loudness::KMeter,
+    /// Sone meters: processed output, and dry scaled by `match_gain` (so the bypass servo
+    /// matches in sones, not in a proxy).
+    sone_wet: sone::SoneMeter,
+    sone_dry: sone::SoneMeter,
     match_gain: f32,
     /// Gain reduction meters (dB, <= 0): spectral (per-bin ceiling) stage and post soft clip.
     gr_spec_db: f32,
@@ -296,6 +304,8 @@ impl Engine {
             timing_scale: 0.0,
             k_dry: loudness::KMeter::new(sample_rate, num_channels, 3.0),
             k_wet: loudness::KMeter::new(sample_rate, num_channels, 3.0),
+            sone_wet: sone::SoneMeter::new(sample_rate, num_channels, 100.0),
+            sone_dry: sone::SoneMeter::new(sample_rate, num_channels, 100.0),
             match_gain: 1.0,
             gr_spec_db: 0.0,
             gr_post_db: 0.0,
@@ -381,6 +391,8 @@ impl Engine {
         self.timing_scale = 0.0;
         self.k_dry.reset();
         self.k_wet.reset();
+        self.sone_wet.reset();
+        self.sone_dry.reset();
         self.match_gain = 1.0;
         self.gr_spec_db = 0.0;
         self.gr_post_db = 0.0;
@@ -389,6 +401,14 @@ impl Engine {
     /// Current loudness-match gain (wet/dry, linear) and K-weighted levels, for meters.
     pub fn meters(&self) -> (f32, f32, f32) {
         (self.match_gain, self.k_dry.lufs(), self.k_wet.lufs())
+    }
+
+    /// Perceived loudness in sones: (dry at its own level, processed). The dry meter runs on
+    /// the match-gained dry signal, so the dry figure is converted back to unity gain using the
+    /// model's ~0.6 power law; it is an estimate when the match gain is far from 1.
+    pub fn sones(&self) -> (f32, f32) {
+        let g = self.match_gain.max(1e-3);
+        (self.sone_dry.sone / g.powf(0.6), self.sone_wet.sone)
     }
 
     /// Fill analyzer arrays on a log-frequency grid from `f_lo` to `f_hi` Hz: envelope dB, gain dB
@@ -730,8 +750,19 @@ impl Engine {
                 self.tmp_in[ch] = self.cl[ch][i];
             }
             self.k_wet.push_frame(&self.tmp_in[..nc]);
-            let target = (self.k_wet.mean_square / self.k_dry.mean_square.max(1e-10)).sqrt().clamp(0.05, 20.0);
-            self.match_gain += (target - self.match_gain) * 0.0005;
+            self.sone_wet.push(&self.tmp_in[..nc]);
+            for ch in 0..nc {
+                self.tmp_in[ch] = self.dry[ch][i] * self.match_gain;
+            }
+            self.sone_dry.push(&self.tmp_in[..nc]);
+            // Servo the match gain so the scaled dry reads the same sones as the processed
+            // signal. Loudness grows roughly with gain^0.6, so step in the log domain.
+            if self.sone_wet.sone > 0.05 && self.sone_dry.sone > 0.05 {
+                let ratio = (self.sone_wet.sone / self.sone_dry.sone).clamp(0.25, 4.0);
+                // ~1.5 s time constant: much slower than the meters' 60/300 ms so it cannot hunt
+                let step = ratio.ln() / 0.6 / (1.5 * sr);
+                self.match_gain = (self.match_gain * step.exp()).clamp(0.05, 20.0);
+            }
             for ch in 0..nc {
                 let out = if s.matched_bypass {
                     self.dry[ch][i] * self.match_gain
@@ -745,6 +776,10 @@ impl Engine {
             // spectral-stage GR: block peak after the per-bin ceiling vs the aligned driven input
             let gr_spec = if self.pending_clip_on && pk_in > 1e-6 { (20.0 * (self.pending_pk_spec / pk_in).log10()).min(0.0) } else { 0.0 };
             self.gr_spec_db = if gr_spec < self.gr_spec_db { gr_spec } else { self.gr_spec_db + (gr_spec - self.gr_spec_db) * (len as f32 / (0.3 * sr)).min(1.0) };
+        }
+        if s.ref_spl != self.sone_wet.ref_spl {
+            self.sone_wet.ref_spl = s.ref_spl;
+            self.sone_dry.ref_spl = s.ref_spl;
         }
         self.pos += len;
         self.cur = *s;

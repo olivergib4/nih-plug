@@ -25,6 +25,7 @@ use triple_buffer::TripleBuffer;
 pub mod analyzer;
 pub mod dsp;
 mod editor;
+pub mod presets;
 
 use dsp::dynamics::Weighting;
 use dsp::{Engine, Settings, SubMode};
@@ -49,6 +50,11 @@ pub struct Meters {
     /// K-weighted level of the dry and processed signals (LUFS-style, 3 s window).
     pub dry_lufs: AtomicF32,
     pub wet_lufs: AtomicF32,
+    /// Perceived loudness (sones) of the dry signal at unity and of the processed signal.
+    pub dry_sone: AtomicF32,
+    pub wet_sone: AtomicF32,
+    /// Current matched-bypass gain, dB.
+    pub match_db: AtomicF32,
 }
 
 impl Default for Meters {
@@ -58,6 +64,9 @@ impl Default for Meters {
             gr_post_db: AtomicF32::new(0.0),
             dry_lufs: AtomicF32::new(-100.0),
             wet_lufs: AtomicF32::new(-100.0),
+            dry_sone: AtomicF32::new(0.0),
+            wet_sone: AtomicF32::new(0.0),
+            match_db: AtomicF32::new(0.0),
         }
     }
 }
@@ -131,6 +140,8 @@ pub struct GlobalParams {
     pub mix: FloatParam,
     #[id = "matched_bypass"]
     pub matched_bypass: BoolParam,
+    #[id = "ref_level"]
+    pub ref_spl: FloatParam,
 }
 
 #[derive(Params)]
@@ -268,6 +279,13 @@ impl Default for OnsetGuardParams {
             .with_string_to_value(formatters::s2v_f32_gain_to_db()),
             mix: pct_param("Mix", 1.0),
             matched_bypass: BoolParam::new("Matched Bypass", false),
+            ref_spl: FloatParam::new(
+                "Reference Level (0 dBFS =)",
+                d.ref_spl,
+                FloatRange::Linear { min: 70.0, max: 115.0 },
+            )
+            .with_unit(" dB SPL")
+            .with_step_size(1.0),
             }),
             resolution: Arc::new(ResolutionParams {
             long_order: IntParam::new(
@@ -464,6 +482,7 @@ impl OnsetGuardParams {
         s.mix = self.global.mix.value();
         s.output_gain = self.global.output_gain.value();
         s.matched_bypass = self.global.matched_bypass.value();
+        s.ref_spl = self.global.ref_spl.value();
         s
     }
 }
@@ -569,7 +588,11 @@ impl Plugin for OnsetGuard {
         }
         if self.params.editor_state.is_open() {
             let (gr_spec, gr_post) = engine.gain_reduction();
-            let (_, dry, wet) = engine.meters();
+            let (match_gain, dry, wet) = engine.meters();
+            let (dry_sone, wet_sone) = engine.sones();
+            self.meters.dry_sone.store(dry_sone, Ordering::Relaxed);
+            self.meters.wet_sone.store(wet_sone, Ordering::Relaxed);
+            self.meters.match_db.store(20.0 * match_gain.max(1e-4).log10(), Ordering::Relaxed);
             self.meters.gr_spec_db.store(gr_spec, Ordering::Relaxed);
             self.meters.gr_post_db.store(gr_post, Ordering::Relaxed);
             self.meters.dry_lufs.store(dry, Ordering::Relaxed);

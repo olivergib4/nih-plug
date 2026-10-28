@@ -35,8 +35,16 @@ input ─┬─ long STFT  (mono-below + low-band dynamics)  ─ short STFT (hig
   above it). *Clip separately*: the sub is clipped on its own at Sub Ceiling, the rest into the
   remaining headroom; no intermodulation between sub and the rest (measured: intermod products
   drop from -24 dB to below -90 dB on a 50 Hz + 2 kHz test).
-* **Matched Bypass** plays the dry signal at the processed signal's K-weighted level so you
-  compare shape, not volume.
+* **Perceived loudness in sones.** A Zwicker-style model (outer/middle-ear transfer, 24 Bark
+  bands, level-dependent masking spread, threshold in quiet, Zwicker specific loudness) runs
+  on the processed output and on the dry signal. It needs Reference Level: what 0 dBFS plays
+  at on your system, in dB SPL. Validated against the textbook anchors (1 kHz at 40 dB SPL ≈
+  1 sone, doubling per 10 dB, 60 Hz a third as loud as 1 kHz at equal SPL, broadband louder
+  than a tone of equal power).
+* **Matched Bypass** plays the dry signal at the processed signal's perceived loudness (a slow
+  servo in sones), so you compare shape, not volume.
+* **Presets** (Clap, Drum bus, Bass, Master) as starting points; they set every control except
+  Output Gain, Mix, Matched Bypass and Reference Level.
 * **Clip Stereo Link** (default 100%) gives both channels the same clip gain, driven by the
   louder one, so the clipper cannot move the stereo image.
 * **Detector Weighting** (Flat / K-weighted / Equal loudness) shapes what the compressor hears:
@@ -50,6 +58,20 @@ input ─┬─ long STFT  (mono-below + low-band dynamics)  ─ short STFT (hig
 `long + short + short + 16` samples, plus a small lookahead when the windows are too short
 for the protection pre-window. At defaults and 48 kHz: 10256 samples (214 ms). Hosts
 compensate automatically; this is a bounce / mix tool, not a live one.
+
+## Ringing, measured
+
+2 ms noise burst into silence, dynamics only, hard settings (threshold -30, 6:1 / 3:1):
+
+| | pre-ring (-40..-1 ms) | post-ring (30-170 ms) |
+|---|---|---|
+| protection off, no smoothing | -21.7 dB | -37.6 dB |
+| protection on (25 ms pre), no smoothing | -34.6 dB | -37.6 dB |
+| protection on, 1/6 oct smoothing | -36.7 dB | -43.3 dB |
+| protection on, 1/6 oct, Post 120 ms | -36.7 dB | -55.5 dB |
+
+Relative to the hit's own energy. Post-ringing sits 15-20 dB below pre-ringing to begin with
+and is masked by the hit; Post and Frequency Smoothing push it further down.
 
 ## Verification
 

@@ -6,12 +6,14 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::analyzer::{Analyzer, AnalyzerData};
+use crate::analyzer::{Analyzer, AnalyzerData, SoneBars};
+use crate::presets::PRESETS;
+use nih_plug::prelude::{ParamPtr, Params};
 use crate::{Meters, OnsetGuardParams};
 
 const COLUMN_WIDTH: Units = Pixels(340.0);
 const GUI_WIDTH: u32 = 1040;
-const GUI_HEIGHT: u32 = 900;
+const GUI_HEIGHT: u32 = 960;
 
 #[derive(Clone, Lens)]
 pub struct Data {
@@ -57,6 +59,27 @@ pub(crate) fn create(
             })
             .height(Pixels(40.0))
             .top(Pixels(6.0));
+
+            // --- presets ---
+            HStack::new(cx, |cx| {
+                Label::new(cx, "Presets").font_size(12.0).top(Pixels(6.0)).right(Pixels(8.0));
+                for preset in PRESETS {
+                    let params = params.clone();
+                    Button::new(
+                        cx,
+                        move |cx| apply_preset(cx, params.as_ref(), preset.values),
+                        |cx| Label::new(cx, preset.name),
+                    )
+                    .right(Pixels(6.0));
+                }
+                Label::new(cx, "(sets every control; the host sees it as parameter changes)")
+                    .font_size(11.0)
+                    .top(Pixels(6.0))
+                    .left(Pixels(8.0));
+            })
+            .height(Pixels(30.0))
+            .child_left(Stretch(1.0))
+            .child_right(Stretch(1.0));
 
             // --- analyzer: detector spectrum, threshold curve, applied gain ---
             Analyzer::new(cx, Data::analyzer)
@@ -106,7 +129,7 @@ pub(crate) fn create(
                     Label::new(
                         cx,
                         "Matched Bypass plays the dry signal at the processed signal's \
-                         K-weighted level, so you compare shape, not volume.",
+                         perceived loudness (sones), so you compare shape, not volume.",
                     )
                     .text_wrap(true)
                     .font_size(11.0)
@@ -117,12 +140,23 @@ pub(crate) fn create(
             })
             .size(Auto);
 
+            // --- perceived loudness ---
+            SoneBars::new(cx, Data::meters).width(Pixels(1010.0)).height(Pixels(56.0));
+            Label::new(
+                cx,
+                "Zwicker-style loudness in sones (needs Reference Level: what 0 dBFS plays at on \
+                 your system). Matched Bypass now matches in sones.",
+            )
+            .font_size(11.0)
+            .left(Stretch(1.0))
+            .right(Stretch(1.0));
+
             // --- meters: how much each clip stage is doing ---
             HStack::new(cx, |cx| {
                 meter(cx, "Spectral clip GR", Data::meters.map(|m| m.gr_spec_db.load(Ordering::Relaxed)));
                 meter(cx, "Post clip GR", Data::meters.map(|m| m.gr_post_db.load(Ordering::Relaxed)));
-                meter(cx, "Dry K-level", Data::meters.map(|m| m.dry_lufs.load(Ordering::Relaxed)));
-                meter(cx, "Processed K-level", Data::meters.map(|m| m.wet_lufs.load(Ordering::Relaxed)));
+                meter(cx, "Dry K-level (LUFS-ish)", Data::meters.map(|m| m.dry_lufs.load(Ordering::Relaxed)));
+                meter(cx, "Processed K-level (LUFS-ish)", Data::meters.map(|m| m.wet_lufs.load(Ordering::Relaxed)));
             })
             .col_between(Pixels(16.0))
             .child_left(Stretch(1.0))
@@ -144,6 +178,27 @@ pub(crate) fn create(
 
         ResizeHandle::new(cx);
     })
+}
+
+/// Set every parameter: listed ones to the preset value, the rest to their defaults.
+fn apply_preset(cx: &mut EventContext, params: &OnsetGuardParams, values: &[(&str, f32)]) {
+    for (id, ptr, _) in params.param_map() {
+        // skip the editor-only / global output controls so a preset never changes level or bypass
+        if matches!(id.as_str(), "output" | "mix" | "matched_bypass" | "ref_level") {
+            continue;
+        }
+        let normalized = match values.iter().find(|(pid, _)| *pid == id.as_str()) {
+            Some((_, plain)) => unsafe { ptr.preview_normalized(*plain) },
+            None => unsafe { ptr.default_normalized_value() },
+        };
+        set_param(cx, ptr, normalized);
+    }
+}
+
+fn set_param(cx: &mut EventContext, ptr: ParamPtr, normalized: f32) {
+    cx.emit(RawParamEvent::BeginSetParameter(ptr));
+    cx.emit(RawParamEvent::SetParameterNormalized(ptr, normalized));
+    cx.emit(RawParamEvent::EndSetParameter(ptr));
 }
 
 fn meter(cx: &mut Context, title: &str, value_db: impl Lens<Target = f32>) {

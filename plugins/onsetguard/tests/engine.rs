@@ -265,8 +265,12 @@ fn gain_reduction_meters_split_spectral_and_post() {
             let mut c: Vec<f32> = (0..n).map(|i| clap.get(pos + i).copied().unwrap_or(0.0)).collect();
             { let mut r: Vec<&mut [f32]> = vec![&mut c[..]]; e.process(&mut r, n, &s); }
             let (gs, gp) = e.gain_reduction();
-            min_spec = min_spec.min(gs);
-            min_post = min_post.min(gp);
+            // only while the source is still playing: the end of the file is silence arriving
+            // in one meter before the other, which is not gain reduction
+            if pos + n < clap.len() + e.latency() / 2 {
+                min_spec = min_spec.min(gs);
+                min_post = min_post.min(gp);
+            }
             pos += n;
         }
         println!("{name}, bin ceil {bin_ceil} dB: spectral GR {min_spec:.1} dB, post GR {min_post:.1} dB");
@@ -431,4 +435,46 @@ fn post_ring_after_hits_is_measured() {
     assert!(rows[0] < -30.0, "post-ring should be well below the hit even unprotected");
     assert!(rows[3] <= rows[1] + 0.5, "smoothing should not increase ringing");
     assert!(rows[4] < rows[2] - 3.0, "a longer Post should reduce ringing");
+}
+
+/// HF preserve: a loud 100 Hz tone (which the clipper flattens) plus a quiet 12 kHz tone.
+/// Hard clipping the sum buries the 12 kHz detail under the clipped tops; with HF preserve the
+/// highs bypass the clipper and survive, while the ceiling still holds.
+#[test]
+fn hf_preserve_keeps_highs_through_a_hard_clip() {
+    let len = (1.0 * SR) as usize;
+    let x: Vec<f32> = (0..len)
+        .map(|i| {
+            let t = i as f32 / SR;
+            0.5 * (2.0 * std::f32::consts::PI * 100.0 * t).sin() + 0.02 * (2.0 * std::f32::consts::PI * 12000.0 * t).sin()
+        })
+        .collect();
+    let mut base = Settings::default();
+    base.drive_db = 12.0; // 100 Hz → 2.0, hard clipped to 1.0
+    base.protect_on = false;
+    base.dyn_.down_ratio = 1.0;
+    base.dyn_.up_ratio = 1.0;
+    base.dyn_.mono_below_hz = 0.0;
+    base.bin_ceil_db = 0.0;
+    base.hardness = 1.0;
+    base.trans_clip = 1.0;
+    let mut res = Vec::new();
+    for hf in [false, true] {
+        let mut s = base;
+        s.hf_preserve = hf;
+        let out = run(&[x.clone()], &s);
+        let seg = &out[0][len / 2..];
+        let peak = seg.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let a12k = goertzel(seg, SR, 12000.0);
+        // clipping a 100 Hz square-ish wave puts odd harmonics everywhere; measure the 12 kHz
+        // tone against the clip harmonics right next to it (11.9 / 12.1 kHz are not harmonics
+        // of 100 Hz... 11900 = 119*100 is; use 12050 instead)
+        let floor = goertzel(seg, SR, 12050.0).max(goertzel(seg, SR, 11950.0));
+        println!("hf preserve {hf}: peak {:.2} dBFS, 12 kHz tone {:.1} dB, clip-harmonic floor nearby {:.1} dB", db(peak), db(a12k), db(floor));
+        res.push((peak, a12k, floor));
+    }
+    assert!(res[0].0 <= 1.0 + 1e-3 && res[1].0 <= 1.0 + 1e-3, "ceiling must hold");
+    let in_tone = 0.02 * 10f32.powf(12.0 / 20.0); // 12 kHz after drive
+    assert!((db(res[1].1) - db(in_tone)).abs() < 1.5, "with HF preserve the 12 kHz tone should come through at its driven level");
+    assert!(res[1].1 > res[0].1 * 1.5, "HF preserve should keep more of the 12 kHz tone than plain hard clipping");
 }

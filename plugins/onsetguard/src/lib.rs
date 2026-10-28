@@ -225,6 +225,10 @@ pub struct ClipParams {
     pub clip_link: FloatParam,
     #[id = "oversample"]
     pub oversample: EnumParam<Oversample>,
+    #[id = "hf_preserve"]
+    pub hf_preserve: BoolParam,
+    #[id = "hf_hz"]
+    pub hf_hz: FloatParam,
     #[id = "sub_split"]
     pub sub_split: EnumParam<SubSplit>,
     #[id = "sub_hz"]
@@ -412,6 +416,18 @@ impl Default for OnsetGuardParams {
             trans_clip: pct_param("Transient Clip Amount", d.trans_clip),
             clip_link: pct_param("Clip Stereo Link", d.clip_link),
             oversample: EnumParam::new("Oversample", Oversample::X4),
+            hf_preserve: BoolParam::new("Preserve Highs", d.hf_preserve),
+            hf_hz: FloatParam::new(
+                "Preserve Above",
+                d.hf_hz,
+                FloatRange::Skewed {
+                    min: 2000.0,
+                    max: 16000.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(1))
+            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
             sub_split: EnumParam::new("Sub Split", SubSplit::Off),
             sub_hz: FloatParam::new(
                 "Sub Split Freq",
@@ -473,6 +489,8 @@ impl OnsetGuardParams {
             SubSplit::Separate => SubMode::Separate,
         };
         s.sub_hz = self.clip.sub_hz.value();
+        s.hf_preserve = self.clip.hf_preserve.value();
+        s.hf_hz = self.clip.hf_hz.value();
         s.sub_ceil_db = self.clip.sub_ceil_db.value();
         s.oversample = match self.clip.oversample.value() {
             Oversample::X1 => 1,

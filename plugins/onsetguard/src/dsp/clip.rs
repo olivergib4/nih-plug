@@ -31,6 +31,10 @@ pub struct Oversampler {
     delay_pos: usize,
     /// Per-channel upsampled sample for the current phase.
     stage: Vec<f32>,
+    /// Ring for the per-sample ceiling track, so `ceil_t[i]` (at input time i) is applied when
+    /// input sample i reaches the clipper: HALF later at os > 1, LATENCY later at os == 1.
+    ceil_hist: Vec<f32>,
+    ceil_pos: usize,
 }
 
 fn blackman_sinc(taps: usize, fc_norm: f32) -> Vec<f32> {
@@ -71,6 +75,8 @@ impl Oversampler {
             delay: vec![vec![0.0; LATENCY]; num_channels],
             delay_pos: 0,
             stage: vec![0.0; num_channels],
+            ceil_hist: vec![f32::MAX; LATENCY],
+            ceil_pos: 0,
         };
         o.set_os(max_os);
         o
@@ -110,6 +116,18 @@ impl Oversampler {
         self.in_pos.fill(0);
         self.down_pos.fill(0);
         self.delay_pos = 0;
+        self.ceil_hist.fill(f32::MAX);
+        self.ceil_pos = 0;
+    }
+
+    /// Push the ceiling for input time `now` and return the one for input time `now - lag`.
+    #[inline]
+    fn delayed_ceil(&mut self, now: f32, lag: usize) -> f32 {
+        let read = (self.ceil_pos + LATENCY - lag) % LATENCY;
+        let out = self.ceil_hist[read];
+        self.ceil_hist[self.ceil_pos] = now;
+        self.ceil_pos = (self.ceil_pos + 1) % LATENCY;
+        out
     }
 
     /// Clip in place. `ceil` linear, `hard` 0..1 (knee start as a fraction of the ceiling),
@@ -120,15 +138,20 @@ impl Oversampler {
     }
 
     /// Like [`process`](Self::process) but with an optional per-sample ceiling (`ceil_t[i]`,
-    /// linear, at the input rate) that overrides `ceil`. Used to reserve headroom for a band that
-    /// is summed back in later.
+    /// linear, at the input rate, aligned with the INPUT sample i) that overrides `ceil`. Used
+    /// to reserve headroom for a band that is summed back in later. The track is delayed
+    /// internally to meet the sample it belongs to inside the clipper. A ceiling of zero or
+    /// less mutes the sample (nothing fits).
     pub fn process_dyn(&mut self, channels: &mut [&mut [f32]], len: usize, ceil: f32, ceil_t: Option<&[f32]>, hard: f32, link: f32) {
         let ceil_fixed = ceil.max(1e-4);
         let nc = self.num_channels;
         let link = if nc > 1 { link.clamp(0.0, 1.0) } else { 0.0 };
         if self.os == 1 {
             for i in 0..len {
-                let ceil = ceil_t.map_or(ceil_fixed, |c| c[i].max(1e-4));
+                let ceil = match ceil_t {
+                    Some(c) => self.delayed_ceil(c[i], LATENCY).min(ceil_fixed).max(1e-6),
+                    None => ceil_fixed,
+                };
                 let mut peak = 0.0f32;
                 for ch in 0..nc {
                     let x = channels[ch][i];
@@ -152,7 +175,10 @@ impl Oversampler {
         let taps = self.taps;
         let gain = os as f32;
         for i in 0..len {
-            let ceil = ceil_t.map_or(ceil_fixed, |c| c[i].max(1e-4));
+            let ceil = match ceil_t {
+                Some(c) => self.delayed_ceil(c[i], HALF).min(ceil_fixed).max(1e-6),
+                None => ceil_fixed,
+            };
             // push the new input sample into every channel's input-rate history
             for ch in 0..nc {
                 let ip = self.in_pos[ch];

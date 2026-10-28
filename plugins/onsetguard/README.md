@@ -25,17 +25,22 @@ input ─┬─ long STFT  (mono-below + low-band dynamics)  ─ short STFT (hig
 * **Transient boost.** Optional upward expansion on detected hits only.
 * **Frequency smoothing** of the gain curve removes the watery per-bin swirl.
 * **Spectral clip.** A per-bin ceiling (detail-preserving style) feeds an oversampled soft
-  clipper with a hard output ceiling. Transient Clip Amount decides how much of each hit the
-  clipper is allowed to touch.
+  clipper with a hard output ceiling. Transient Clip decides how much of each hit goes through
+  the oversampled clipper; the ceiling holds at every setting. At 1x the clip stage is
+  bit-identical to a plain sample-level hard clip; at 2-8x it matches one within 0.1 dB in
+  every band except the alias energy it removes.
 * **Mono below** a set frequency, done in the long STFT (zero-phase).
 * **Sub Split.** The band below Sub Split Freq is separated at the long resolution (sharp,
   zero-phase) and carried through the same onset protection as the full signal, so
-  `full - sub` is an exact remainder. *Protect*: the sub bypasses both clippers and its peak
-  envelope reserves headroom; the rest is clipped into what is left. Protect Amount blends this
-  with the plain clip-everything output, so body level and sub purity trade proportionally and
-  the ceiling holds at every setting. *Clip separately*: the sub is clipped on its own at Sub Ceiling, the rest into the
-  remaining headroom; no intermodulation between sub and the rest (measured: intermod products
-  drop from -24 dB to below -90 dB on a 50 Hz + 2 kHz test).
+  `full - sub` is an exact remainder. *Protect*: the sub passes clean (clipped only if it alone
+  exceeds the ceiling); *Clip separately*: the sub is clipped on its own at Sub Ceiling first.
+  Either way the rest is clipped, sample by sample, into the room the sub leaves at that
+  instant, so the sum never exceeds the ceiling and the sub keeps its shape (harmonics -62 dB
+  vs -34 dB for a plain clip on a 50 Hz + 2 kHz test, same overall rms within 0.2 dB). Protect
+  Amount blends this with the plain clip-everything output.
+* **Preserve Highs.** The band above Preserve Above bypasses the clipper and is summed back;
+  Highs Amount sets how much of it. Off by default: on sounds whose highs are the hit (zaps)
+  there is nothing to protect.
 * **Perceived loudness in sones.** A Zwicker-style model (outer/middle-ear transfer, 24 Bark
   bands, level-dependent masking spread, threshold in quiet, Zwicker specific loudness) runs
   on the processed output and on the dry signal. It needs Reference Level: what 0 dBFS plays

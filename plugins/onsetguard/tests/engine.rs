@@ -338,10 +338,14 @@ fn sub_split_modes_do_what_they_say() {
     for r in &results {
         assert!(r.0 <= 1.0 + 1e-3, "ceiling exceeded: {}", r.0);
     }
-    assert!(db(sep.3) < db(off.3) - 12.0, "Separate should remove intermod products");
+    // the rest is clipped into the room the sub leaves at each instant, so it carries
+    // sub-rate sidebands at about the level a plain clip's intermod has; never worse
+    assert!(db(sep.3) < db(off.3) + 1.0 && db(prot.3) < db(off.3) + 5.0, "band modes must not add more intermod than the plain clip");
     assert!(db(prot.2) < db(off.2) - 20.0, "Protect should remove sub harmonics");
     assert!((db(prot.1) - db(0.7)).abs() < 0.5, "Protect should pass the sub at its driven level (0.7)");
     assert!(sep.2 > prot.2 * 10.0, "Separate still clips the sub on its own");
+    // (a clipped sine's fundamental sits above the clip level, so compare modes, not the cap)
+    assert!(sep.1 < prot.1, "Separate clips the sub lower than Protect passes it");
 }
 
 /// Matched bypass should settle on a gain that makes the dry signal as loud (in sones) as the
@@ -570,4 +574,56 @@ fn hf_preserve_is_transparent_below_the_ceiling() {
         println!("hf preserve transparency at {:.0}%: max error {:.1} dB re peak", amt * 100.0, db(err / pk));
         assert!(db(err / pk) < -35.0, "hf {hf} at {amt}: error {} dB", db(err / pk));
     }
+}
+
+/// Routing audit: with Sub Protect at 100%, onset protection ON, hits + sub. The sub must stay
+/// as clean as with protection off (the sub channels get the same protection blend as the full
+/// signal, so `full - sub` must stay an exact remainder), the body must keep most of its level
+/// against the plain clip, and the ceiling must hold.
+#[test]
+fn sub_protect_routing_under_onset_protection() {
+    use onsetguard::dsp::SubMode;
+    let len = (2.0 * SR) as usize;
+    let clap = synth_clap(3);
+    let x: Vec<f32> = (0..len)
+        .map(|i| {
+            let t = i as f32 / SR;
+            let hit = clap.get(i % (SR as usize / 2)).copied().unwrap_or(0.0) * 0.8;
+            0.35 * (2.0 * std::f32::consts::PI * 50.0 * t).sin() + 0.4 * (2.0 * std::f32::consts::PI * 2000.0 * t).sin() + hit
+        })
+        .collect();
+    let mut base = Settings::default();
+    base.drive_db = 8.0;
+    base.trans_clip = 1.0;
+    base.dyn_.down_ratio = 1.0;
+    base.dyn_.up_ratio = 1.0;
+    base.dyn_.mono_below_hz = 0.0;
+    base.sub_hz = 100.0;
+    base.bin_ceil_db = 0.0;
+    let mut rows = Vec::new();
+    for (protect, mode, amt) in [(false, SubMode::Off, 0.0), (false, SubMode::Protect, 1.0), (true, SubMode::Off, 0.0), (true, SubMode::Protect, 1.0)] {
+        let mut s = base;
+        s.protect_on = protect;
+        s.sub_mode = mode;
+        s.band_protect = amt;
+        let out = run(&[x.clone()], &s);
+        let seg = &out[0][len / 4..];
+        let peak = seg.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let a50 = goertzel(seg, SR, 50.0);
+        let harm = goertzel(seg, SR, 150.0).max(goertzel(seg, SR, 250.0)).max(goertzel(seg, SR, 350.0));
+        let body = goertzel(seg, SR, 2000.0);
+        let rms = (seg.iter().map(|v| v * v).sum::<f32>() / seg.len() as f32).sqrt();
+        println!("onset protect {protect} sub {mode:?} amt {amt}: peak {:.2} dBFS, rms {:.1} dB, 50 Hz {:.1} dB, sub harmonics {:.1} dB, body 2 kHz {:.1} dB", db(peak), db(rms), db(a50), db(harm), db(body));
+        rows.push((peak, rms, a50, harm, body));
+    }
+    for r in &rows {
+        assert!(r.0 <= 1.0 + 1e-3, "ceiling exceeded: {}", r.0);
+    }
+    // protect-on vs protect-off: the sub purity must not degrade with onset protection on
+    assert!(db(rows[3].3) < db(rows[1].3) + 3.0, "sub harmonics should not degrade with onset protection on");
+    assert!(db(rows[3].3) < db(rows[2].3) - 15.0, "Sub Protect should still remove sub harmonics with onset protection on");
+    // the sub keeps its driven level (it is the loud part here) and the overall rms stays
+    // within 1 dB of the plain clip: level is redistributed from body to sub, not lost
+    assert!(db(rows[3].2) > db(rows[2].2) + 1.0, "Protect should give the sub back the level the plain clip takes");
+    assert!(db(rows[3].1) > db(rows[2].1) - 1.0, "rms should keep within 1 dB of the plain clip");
 }

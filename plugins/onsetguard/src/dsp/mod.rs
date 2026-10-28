@@ -277,8 +277,6 @@ pub struct Engine {
     clsub: Vec<Vec<f32>>,
     /// Protect mode: per-sample ceiling left for the rest after the sub's peak envelope.
     rest_ceil: Vec<f32>,
-    sub_env: f32,
-    sub_hold: usize,
     dry: Vec<Vec<f32>>,
     tmp_in: Vec<f32>,
     tmp_out: Vec<f32>,
@@ -340,8 +338,6 @@ impl Engine {
             sub_r: vec![vec![0.0; max_block]; num_channels],
             clsub: vec![vec![0.0; max_block]; num_channels],
             rest_ceil: vec![1.0; max_block],
-            sub_env: 0.0,
-            sub_hold: 0,
             dry: vec![vec![0.0; max_block]; num_channels],
             tmp_in: vec![0.0; 2 * num_channels],
             tmp_out: vec![0.0; 2 * num_channels],
@@ -395,8 +391,6 @@ impl Engine {
         self.oversampler.reset();
         self.sub_oversampler.reset();
         self.final_oversampler.reset();
-        self.sub_env = 0.0;
-        self.sub_hold = 0;
         self.hf_delay.reset();
         self.detector.reset();
         self.ref_delay.reset();
@@ -732,30 +726,23 @@ impl Engine {
             }
 
             // --- B: protected bands ---
-            // reserved headroom = peak envelope (instant attack, 25 ms hold, 80 ms release) of
-            // the parts summed back unclipped: the sub in full, the highs up to 3 dB (on
-            // HF-dominant material the highs ARE the hit; reserving their full level would
-            // clip the body into nothing, so beyond 3 dB the safety clamp trims instead)
-            let sub_cap = if sub_mode == SubMode::Separate { ceil * 10f32.powf(s.sub_ceil_db.min(0.0) / 20.0) } else { f32::MAX };
+            // Sample-by-sample headroom: the rest is clipped into (ceiling - |sub| - |highs|)
+            // at every instant, so rest + sub + highs never exceeds the ceiling and the rest
+            // keeps all the level there is room for (at the sub's zero crossings, all of it).
+            // The sub is first clipped on its own (at the ceiling in Protect, at Sub Ceiling in
+            // Separate), so it can never take more than the whole ceiling. The highs reserve at
+            // most 3 dB: on HF-dominant material the highs ARE the hit, and reserving their
+            // full level would clip the body into nothing; beyond that the safety clamp trims.
+            let sub_cap = if sub_mode == SubMode::Separate { ceil * 10f32.powf(s.sub_ceil_db.min(0.0) / 20.0) } else { ceil };
             if blend > 0.0 {
-                let rel = (-1.0 / (0.08 * sr)).exp();
-                let hold_n = (0.025 * sr) as usize;
                 for i in 0..len {
-                    let mut a = 0.0f32;
+                    let mut reserve = 0.0f32;
                     for ch in 0..nc {
                         let sub_v = if sub_mode == SubMode::Off { 0.0 } else { self.clw[nc + ch][i].abs().min(sub_cap) };
                         let hf_v = self.clw[2 * nc + ch][i].abs().min(ceil * 0.29);
-                        a = a.max(sub_v + hf_v);
+                        reserve = reserve.max(sub_v + hf_v);
                     }
-                    if a >= self.sub_env {
-                        self.sub_env = a;
-                        self.sub_hold = hold_n;
-                    } else if self.sub_hold > 0 {
-                        self.sub_hold -= 1;
-                    } else {
-                        self.sub_env = a + (self.sub_env - a) * rel;
-                    }
-                    self.rest_ceil[i] = (ceil - self.sub_env).max(ceil * 0.1);
+                    self.rest_ceil[i] = ceil - reserve;
                 }
             }
             // highs: plain delay to match the oversamplers (after A, which used them aligned)
@@ -774,10 +761,10 @@ impl Engine {
                 let mut rrefs = rest.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
                 let mut srefs = sub.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
                 self.oversampler.process_dyn(rrefs.as_mut(), len, ceil, Some(&self.rest_ceil[..len]), s.hardness, s.clip_link);
-                if sub_mode == SubMode::Separate {
-                    self.sub_oversampler.process(srefs.as_mut(), len, sub_cap, s.hardness, s.clip_link);
-                } else {
+                if sub_mode == SubMode::Off {
                     self.sub_oversampler.process(srefs.as_mut(), len, 1e6, 0.999, 0.0);
+                } else {
+                    self.sub_oversampler.process(srefs.as_mut(), len, sub_cap, s.hardness, s.clip_link);
                 }
                 // blend: out = (1 - blend) * A + blend * B; B is clamped as FIR-overshoot safety
                 let sub_in = sub_mode != SubMode::Off;
@@ -799,6 +786,7 @@ impl Engine {
             self.pending_clip_on = clip_on;
         }
         let l_clip = self.clip_stft.window_size() + clip::LATENCY;
+        let out_ceil = 10f32.powf(s.ceil_db / 20.0);
         let gain = s.output_gain;
         let mix = s.mix.clamp(0.0, 1.0);
         let mut pk_in = 0.0f32;
@@ -819,6 +807,9 @@ impl Engine {
                 let d = self.tmp_out[ch];
                 let c = self.cl[ch][i];
                 let wet = d + (c - d) * amt;
+                // the ceiling holds whatever Transient Clip lets through: a hit that bypasses
+                // the oversampled clipper is still hard-clamped at the ceiling
+                let wet = if s.clip_on { wet.clamp(-out_ceil, out_ceil) } else { wet };
                 self.cl[ch][i] = wet;
                 self.tmp_in[ch] = self.dry[ch][i];
             }

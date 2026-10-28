@@ -1,4 +1,5 @@
 use nih_plug::prelude::Editor;
+use nih_plug::prelude::{ParamPtr, Params};
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
@@ -9,12 +10,13 @@ use std::time::Duration;
 use crate::analyzer::{Analyzer, AnalyzerData, SoneBars};
 use crate::help;
 use crate::presets::PRESETS;
-use nih_plug::prelude::{ParamPtr, Params};
 use crate::{Meters, OnsetGuardParams};
 
-const COLUMN_WIDTH: Units = Pixels(340.0);
+const COLUMN_WIDTH: Units = Pixels(336.0);
+const CONTENT_WIDTH: f32 = 1008.0;
+/// Fits a 13" MacBook (900 px tall minus menu bar and the host's window chrome).
 const GUI_WIDTH: u32 = 1040;
-const GUI_HEIGHT: u32 = 960;
+const GUI_HEIGHT: u32 = 790;
 
 #[derive(Clone, Lens)]
 pub struct Data {
@@ -24,6 +26,24 @@ pub struct Data {
 }
 
 impl Model for Data {}
+
+/// The help panel's text, updated by hovering any control.
+#[derive(Lens)]
+pub struct HelpModel {
+    pub text: String,
+}
+
+pub enum HelpEvent {
+    Show(&'static str),
+}
+
+impl Model for HelpModel {
+    fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
+        event.map(|e, _| match e {
+            HelpEvent::Show(t) => self.text = (*t).to_string(),
+        });
+    }
+}
 
 pub(crate) fn default_state() -> Arc<ViziaState> {
     ViziaState::new(|| (GUI_WIDTH, GUI_HEIGHT))
@@ -48,25 +68,23 @@ pub(crate) fn create(
             analyzer: analyzer.clone(),
         }
         .build(cx);
+        HelpModel {
+            text: String::from(
+                "Hover any control, preset or meter and its explanation appears here. \
+                 Threshold, Downward Ratio, Clip Drive and Sub Split do most of the work.",
+            ),
+        }
+        .build(cx);
 
         VStack::new(cx, |cx| {
+            // --- title + presets on one line ---
             HStack::new(cx, |cx| {
                 Label::new(cx, "OnsetGuard")
                     .font_family(vec![FamilyOwned::Name(String::from(assets::NOTO_SANS))])
                     .font_weight(FontWeightKeyword::Thin)
-                    .font_size(30.0)
-                    .left(Pixels(10.0));
-                Label::new(cx, "zero-phase spectral dynamics · onset protection · spectral clip")
-                    .font_size(12.0)
-                    .left(Pixels(14.0))
-                    .top(Pixels(14.0));
-            })
-            .height(Pixels(40.0))
-            .top(Pixels(6.0));
-
-            // --- presets ---
-            HStack::new(cx, |cx| {
-                Label::new(cx, "Presets").font_size(12.0).top(Pixels(6.0)).right(Pixels(8.0));
+                    .font_size(26.0)
+                    .right(Pixels(18.0));
+                Label::new(cx, "presets").font_size(12.0).top(Pixels(8.0)).right(Pixels(6.0));
                 for preset in PRESETS {
                     let params = params.clone();
                     Button::new(
@@ -74,33 +92,39 @@ pub(crate) fn create(
                         move |cx| apply_preset(cx, params.as_ref(), preset.values),
                         |cx| Label::new(cx, preset.name),
                     )
-                    .tooltip(|cx| {
-                        Label::new(cx, help::PRESET_HELP).text_wrap(true).class("help");
-                    })
+                    .on_hover(|cx| cx.emit(HelpEvent::Show(help::PRESET_HELP)))
+                    .top(Pixels(4.0))
                     .right(Pixels(6.0));
                 }
-                Label::new(cx, "(sets every control; the host sees it as parameter changes)")
-                    .font_size(11.0)
-                    .top(Pixels(6.0))
-                    .left(Pixels(8.0));
             })
-            .height(Pixels(30.0))
-            .child_left(Stretch(1.0))
-            .child_right(Stretch(1.0));
+            .height(Pixels(34.0))
+            .width(Pixels(CONTENT_WIDTH))
+            .child_left(Pixels(0.0));
 
-            // --- analyzer: detector spectrum, threshold curve, applied gain ---
+            // --- analyzer ---
             Analyzer::new(cx, Data::analyzer)
-                .width(Pixels(1010.0))
-                .height(Pixels(190.0));
-            Label::new(
-                cx,
-                "grey: what the detector hears · orange: threshold curve · blue/green bars: \
-                 cut/boost per frequency · yellow strip: a hit is being protected",
-            )
-            .font_size(11.0)
-            .left(Stretch(1.0))
-            .right(Stretch(1.0));
+                .width(Pixels(CONTENT_WIDTH))
+                .height(Pixels(140.0))
+                .on_hover(|cx| cx.emit(HelpEvent::Show(help::ANALYZER_HELP)));
 
+            // --- loudness + help panel side by side ---
+            HStack::new(cx, |cx| {
+                SoneBars::new(cx, Data::meters)
+                    .width(Pixels(500.0))
+                    .height(Pixels(60.0))
+                    .on_hover(|cx| cx.emit(HelpEvent::Show(help::SONE_HELP)));
+                Label::new(cx, HelpModel::text)
+                    .text_wrap(true)
+                    .font_size(12.0)
+                    .width(Pixels(CONTENT_WIDTH - 512.0))
+                    .height(Pixels(60.0))
+                    .left(Pixels(12.0))
+                    .class("helppanel");
+            })
+            .height(Pixels(60.0))
+            .width(Pixels(CONTENT_WIDTH));
+
+            // --- controls, two rows of three columns ---
             HStack::new(cx, |cx| {
                 make_column(cx, "Threshold", |cx| {
                     params_with_help(cx, Data::params.map(|p| p.threshold.clone()));
@@ -120,71 +144,25 @@ pub(crate) fn create(
                 });
                 make_column(cx, "Resolution", |cx| {
                     params_with_help(cx, Data::params.map(|p| p.resolution.clone()));
-                    Label::new(
-                        cx,
-                        "Latency = long + 2×short windows + lookahead. Ableton compensates; \
-                         bounce for live use.",
-                    )
-                    .text_wrap(true)
-                    .font_size(11.0)
-                    .left(Pixels(15.0))
-                    .right(Pixels(8.0))
-                    .width(Stretch(1.0));
+                    HStack::new(cx, |cx| {
+                        meter(cx, "Spectral clip GR", Data::meters.map(|m| m.gr_spec_db.load(Ordering::Relaxed)), help::GR_SPEC_HELP);
+                    })
+                    .size(Auto)
+                    .top(Pixels(6.0));
                 });
                 make_column(cx, "Output", |cx| {
                     params_with_help(cx, Data::params.map(|p| p.global.clone()));
-                    Label::new(
-                        cx,
-                        "Matched Bypass plays the dry signal at the processed signal's \
-                         perceived loudness (sones), so you compare shape, not volume.",
-                    )
-                    .text_wrap(true)
-                    .font_size(11.0)
-                    .left(Pixels(15.0))
-                    .right(Pixels(8.0))
-                    .width(Stretch(1.0));
+                    HStack::new(cx, |cx| {
+                        meter(cx, "Post clip GR", Data::meters.map(|m| m.gr_post_db.load(Ordering::Relaxed)), help::GR_POST_HELP);
+                    })
+                    .size(Auto)
+                    .top(Pixels(6.0));
                 });
             })
             .size(Auto);
-
-            // --- perceived loudness ---
-            SoneBars::new(cx, Data::meters)
-                .width(Pixels(1010.0))
-                .height(Pixels(56.0))
-                .tooltip(|cx| {
-                    Label::new(cx, help::SONE_HELP).text_wrap(true).class("help");
-                });
-            Label::new(
-                cx,
-                "Zwicker-style loudness in sones (needs Reference Level: what 0 dBFS plays at on \
-                 your system). Matched Bypass now matches in sones.",
-            )
-            .font_size(11.0)
-            .left(Stretch(1.0))
-            .right(Stretch(1.0));
-
-            // --- meters: how much each clip stage is doing ---
-            HStack::new(cx, |cx| {
-                meter(cx, "Spectral clip GR", Data::meters.map(|m| m.gr_spec_db.load(Ordering::Relaxed)), help::GR_SPEC_HELP);
-                meter(cx, "Post clip GR", Data::meters.map(|m| m.gr_post_db.load(Ordering::Relaxed)), help::GR_POST_HELP);
-                meter(cx, "Dry K-level (LUFS-ish)", Data::meters.map(|m| m.dry_lufs.load(Ordering::Relaxed)), help::K_HELP);
-                meter(cx, "Processed K-level (LUFS-ish)", Data::meters.map(|m| m.wet_lufs.load(Ordering::Relaxed)), help::K_HELP);
-            })
-            .col_between(Pixels(16.0))
-            .child_left(Stretch(1.0))
-            .child_right(Stretch(1.0))
-            .size(Auto);
-
-            Label::new(
-                cx,
-                "If Post clip GR is doing most of the work, lower Spectral Ceiling or Drive: \
-                 the spectral stage should take the bulk of the reduction.",
-            )
-            .font_size(11.0)
-            .left(Stretch(1.0))
-            .right(Stretch(1.0));
         })
-        .row_between(Pixels(10.0))
+        .row_between(Pixels(6.0))
+        .child_top(Pixels(6.0))
         .child_left(Stretch(1.0))
         .child_right(Stretch(1.0));
 
@@ -195,7 +173,7 @@ pub(crate) fn create(
 /// Set every parameter: listed ones to the preset value, the rest to their defaults.
 fn apply_preset(cx: &mut EventContext, params: &OnsetGuardParams, values: &[(&str, f32)]) {
     for (id, ptr, _) in params.param_map() {
-        // skip the editor-only / global output controls so a preset never changes level or bypass
+        // never let a preset change level, bypass or the meter calibration
         if matches!(id.as_str(), "output" | "mix" | "matched_bypass" | "ref_level") {
             continue;
         }
@@ -215,17 +193,16 @@ fn set_param(cx: &mut EventContext, ptr: ParamPtr, normalized: f32) {
 
 fn meter(cx: &mut Context, title: &str, value_db: impl Lens<Target = f32>, help_text: &'static str) {
     VStack::new(cx, |cx| {
-        Label::new(cx, title).font_size(12.0);
-        PeakMeter::new(cx, value_db, Some(Duration::from_millis(600))).top(Pixels(4.0));
+        Label::new(cx, title).font_size(11.0);
+        PeakMeter::new(cx, value_db, Some(Duration::from_millis(600))).top(Pixels(2.0));
     })
-    .width(Pixels(230.0))
+    .width(Pixels(300.0))
     .height(Auto)
-    .tooltip(move |cx| {
-        Label::new(cx, help_text).text_wrap(true).class("help");
-    });
+    .left(Pixels(15.0))
+    .on_hover(move |cx| cx.emit(HelpEvent::Show(help_text)));
 }
 
-/// A generic parameter list where every row carries a hover tooltip explaining the control.
+/// A generic parameter list where hovering a row shows its explanation in the help panel.
 fn params_with_help<L, PsRef, Ps>(cx: &mut Context, params: L)
 where
     L: Lens<Target = PsRef> + Copy,
@@ -246,9 +223,7 @@ where
         })
         .class("row");
         if let Some(text) = help_text {
-            row.tooltip(move |cx| {
-                Label::new(cx, text).text_wrap(true).class("help");
-            });
+            row.on_hover(move |cx| cx.emit(HelpEvent::Show(text)));
         }
     });
 }
@@ -258,10 +233,10 @@ fn make_column(cx: &mut Context, title: &str, contents: impl FnOnce(&mut Context
         Label::new(cx, title)
             .font_family(vec![FamilyOwned::Name(String::from(assets::NOTO_SANS))])
             .font_weight(FontWeightKeyword::Thin)
-            .font_size(21.0)
+            .font_size(18.0)
             .left(Stretch(1.0))
             .right(Pixels(7.0))
-            .bottom(Pixels(-10.0));
+            .bottom(Pixels(-8.0));
 
         contents(cx);
     })

@@ -59,4 +59,5 @@ pub const PRESET_HELP: &str = "Starting points. Sets every control except Output
 pub const SONE_HELP: &str = "Perceived loudness (Zwicker-style sone model). Dry at unity vs processed. Bars are in phon (40 = 1 sone, +10 = twice as loud). Needs Reference Level to be roughly right.";
 pub const GR_SPEC_HELP: &str = "How much the per-bin Spectral Ceiling is reducing. Strong on tonal material, weak on broadband hits.";
 pub const GR_POST_HELP: &str = "How much the final soft clipper is reducing. If this is doing most of the work on tonal material, lower Spectral Ceiling.";
+pub const ANALYZER_HELP: &str = "Analyzer. Grey: what the detector hears (weighted). Orange: the threshold curve. Blue bars: cut, green bars: boost, per frequency, from both resolution stages. Yellow strip along the top: a hit is being protected right now.";
 pub const K_HELP: &str = "K-weighted level (LUFS-style, 3 s window). Kept for comparison with other meters; the sone readout is the better loudness number.";

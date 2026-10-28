@@ -25,6 +25,7 @@ use triple_buffer::TripleBuffer;
 pub mod analyzer;
 pub mod dsp;
 mod editor;
+pub mod help;
 pub mod presets;
 
 use dsp::dynamics::Weighting;

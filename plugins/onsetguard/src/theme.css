@@ -1,0 +1,20 @@
+tooltip {
+  child-space: 8px;
+  background-color: #f4f1ea;
+  color: #15171a;
+  border-radius: 4px;
+  border-width: 1px;
+  border-color: #8a8a8a;
+  opacity: 0;
+  transition: opacity 120ms 450ms;
+}
+
+tooltip.vis {
+  opacity: 1;
+  transition: opacity 120ms 450ms;
+}
+
+.help {
+  width: 340px;
+  font-size: 12;
+}

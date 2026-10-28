@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::analyzer::{Analyzer, AnalyzerData, SoneBars};
+use crate::help;
 use crate::presets::PRESETS;
 use nih_plug::prelude::{ParamPtr, Params};
 use crate::{Meters, OnsetGuardParams};
@@ -37,6 +38,9 @@ pub(crate) fn create(
     create_vizia_editor(editor_state, ViziaTheming::Custom, move |cx, _| {
         assets::register_noto_sans_light(cx);
         assets::register_noto_sans_thin(cx);
+        if let Err(err) = cx.add_stylesheet(include_style!("src/theme.css")) {
+            nih_plug::nih_error!("Failed to load stylesheet: {err:?}")
+        }
 
         Data {
             params: params.clone(),
@@ -70,6 +74,9 @@ pub(crate) fn create(
                         move |cx| apply_preset(cx, params.as_ref(), preset.values),
                         |cx| Label::new(cx, preset.name),
                     )
+                    .tooltip(|cx| {
+                        Label::new(cx, help::PRESET_HELP).text_wrap(true).class("help");
+                    })
                     .right(Pixels(6.0));
                 }
                 Label::new(cx, "(sets every control; the host sees it as parameter changes)")
@@ -96,23 +103,23 @@ pub(crate) fn create(
 
             HStack::new(cx, |cx| {
                 make_column(cx, "Threshold", |cx| {
-                    GenericUi::new(cx, Data::params.map(|p| p.threshold.clone()));
+                    params_with_help(cx, Data::params.map(|p| p.threshold.clone()));
                 });
                 make_column(cx, "Dynamics", |cx| {
-                    GenericUi::new(cx, Data::params.map(|p| p.dynamics.clone()));
+                    params_with_help(cx, Data::params.map(|p| p.dynamics.clone()));
                 });
                 make_column(cx, "Onset Protection", |cx| {
-                    GenericUi::new(cx, Data::params.map(|p| p.protect.clone()));
+                    params_with_help(cx, Data::params.map(|p| p.protect.clone()));
                 });
             })
             .size(Auto);
 
             HStack::new(cx, |cx| {
                 make_column(cx, "Clip", |cx| {
-                    GenericUi::new(cx, Data::params.map(|p| p.clip.clone()));
+                    params_with_help(cx, Data::params.map(|p| p.clip.clone()));
                 });
                 make_column(cx, "Resolution", |cx| {
-                    GenericUi::new(cx, Data::params.map(|p| p.resolution.clone()));
+                    params_with_help(cx, Data::params.map(|p| p.resolution.clone()));
                     Label::new(
                         cx,
                         "Latency = long + 2×short windows + lookahead. Ableton compensates; \
@@ -125,7 +132,7 @@ pub(crate) fn create(
                     .width(Stretch(1.0));
                 });
                 make_column(cx, "Output", |cx| {
-                    GenericUi::new(cx, Data::params.map(|p| p.global.clone()));
+                    params_with_help(cx, Data::params.map(|p| p.global.clone()));
                     Label::new(
                         cx,
                         "Matched Bypass plays the dry signal at the processed signal's \
@@ -141,7 +148,12 @@ pub(crate) fn create(
             .size(Auto);
 
             // --- perceived loudness ---
-            SoneBars::new(cx, Data::meters).width(Pixels(1010.0)).height(Pixels(56.0));
+            SoneBars::new(cx, Data::meters)
+                .width(Pixels(1010.0))
+                .height(Pixels(56.0))
+                .tooltip(|cx| {
+                    Label::new(cx, help::SONE_HELP).text_wrap(true).class("help");
+                });
             Label::new(
                 cx,
                 "Zwicker-style loudness in sones (needs Reference Level: what 0 dBFS plays at on \
@@ -153,10 +165,10 @@ pub(crate) fn create(
 
             // --- meters: how much each clip stage is doing ---
             HStack::new(cx, |cx| {
-                meter(cx, "Spectral clip GR", Data::meters.map(|m| m.gr_spec_db.load(Ordering::Relaxed)));
-                meter(cx, "Post clip GR", Data::meters.map(|m| m.gr_post_db.load(Ordering::Relaxed)));
-                meter(cx, "Dry K-level (LUFS-ish)", Data::meters.map(|m| m.dry_lufs.load(Ordering::Relaxed)));
-                meter(cx, "Processed K-level (LUFS-ish)", Data::meters.map(|m| m.wet_lufs.load(Ordering::Relaxed)));
+                meter(cx, "Spectral clip GR", Data::meters.map(|m| m.gr_spec_db.load(Ordering::Relaxed)), help::GR_SPEC_HELP);
+                meter(cx, "Post clip GR", Data::meters.map(|m| m.gr_post_db.load(Ordering::Relaxed)), help::GR_POST_HELP);
+                meter(cx, "Dry K-level (LUFS-ish)", Data::meters.map(|m| m.dry_lufs.load(Ordering::Relaxed)), help::K_HELP);
+                meter(cx, "Processed K-level (LUFS-ish)", Data::meters.map(|m| m.wet_lufs.load(Ordering::Relaxed)), help::K_HELP);
             })
             .col_between(Pixels(16.0))
             .child_left(Stretch(1.0))
@@ -201,13 +213,44 @@ fn set_param(cx: &mut EventContext, ptr: ParamPtr, normalized: f32) {
     cx.emit(RawParamEvent::EndSetParameter(ptr));
 }
 
-fn meter(cx: &mut Context, title: &str, value_db: impl Lens<Target = f32>) {
+fn meter(cx: &mut Context, title: &str, value_db: impl Lens<Target = f32>, help_text: &'static str) {
     VStack::new(cx, |cx| {
         Label::new(cx, title).font_size(12.0);
         PeakMeter::new(cx, value_db, Some(Duration::from_millis(600))).top(Pixels(4.0));
     })
     .width(Pixels(230.0))
-    .height(Auto);
+    .height(Auto)
+    .tooltip(move |cx| {
+        Label::new(cx, help_text).text_wrap(true).class("help");
+    });
+}
+
+/// A generic parameter list where every row carries a hover tooltip explaining the control.
+fn params_with_help<L, PsRef, Ps>(cx: &mut Context, params: L)
+where
+    L: Lens<Target = PsRef> + Copy,
+    PsRef: AsRef<Ps> + 'static,
+    Ps: Params + 'static,
+{
+    let ids: std::collections::HashMap<ParamPtr, String> = params
+        .map(|p| p.as_ref().param_map())
+        .get(cx)
+        .into_iter()
+        .map(|(id, ptr, _)| (ptr, id))
+        .collect();
+    GenericUi::new_custom(cx, params, move |cx, param_ptr| {
+        let help_text = ids.get(&param_ptr).and_then(|id| help::for_param(id));
+        let row = HStack::new(cx, |cx| {
+            Label::new(cx, unsafe { param_ptr.name() }).class("label");
+            GenericUi::draw_widget(cx, params, param_ptr);
+        })
+        .class("row");
+        if let Some(text) = help_text {
+            row.tooltip(move |cx| {
+                Label::new(cx, text).text_wrap(true).class("help");
+            });
+        }
+    });
 }
 
 fn make_column(cx: &mut Context, title: &str, contents: impl FnOnce(&mut Context)) {

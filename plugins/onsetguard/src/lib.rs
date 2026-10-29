@@ -45,7 +45,6 @@ pub struct OnsetGuard {
 /// Values shared with the editor for metering.
 pub struct Meters {
     /// Gain reduction of the spectral (per-bin ceiling) stage, dB <= 0.
-    pub gr_spec_db: AtomicF32,
     /// Gain reduction of the post soft clipper, dB <= 0.
     pub gr_post_db: AtomicF32,
     /// K-weighted level of the dry and processed signals (LUFS-style, 3 s window).
@@ -61,7 +60,6 @@ pub struct Meters {
 impl Default for Meters {
     fn default() -> Self {
         Meters {
-            gr_spec_db: AtomicF32::new(0.0),
             gr_post_db: AtomicF32::new(0.0),
             dry_lufs: AtomicF32::new(-100.0),
             wet_lufs: AtomicF32::new(-100.0),
@@ -213,8 +211,6 @@ pub struct ClipParams {
     pub clip_on: BoolParam,
     #[id = "drive"]
     pub drive_db: FloatParam,
-    #[id = "bin_ceil"]
-    pub bin_ceil_db: FloatParam,
     #[id = "ceiling"]
     pub ceil_db: FloatParam,
     #[id = "hardness"]
@@ -414,7 +410,6 @@ impl Default for OnsetGuardParams {
             clip: Arc::new(ClipParams {
             clip_on: BoolParam::new("Clip", d.clip_on),
             drive_db: db_param("Clip Drive", d.drive_db, 0.0, 24.0),
-            bin_ceil_db: db_param("Spectral Ceiling", d.bin_ceil_db, -40.0, 0.0),
             ceil_db: db_param("Output Ceiling", d.ceil_db, -12.0, 0.0),
             hardness: pct_param("Clip Hardness", d.hardness),
             trans_clip: pct_param("Transient Clip", d.trans_clip),
@@ -484,7 +479,6 @@ impl OnsetGuardParams {
         s.trans_boost_ms = self.protect.trans_boost_ms.value();
         s.clip_on = self.clip.clip_on.value();
         s.drive_db = self.clip.drive_db.value();
-        s.bin_ceil_db = self.clip.bin_ceil_db.value();
         s.ceil_db = self.clip.ceil_db.value();
         s.hardness = self.clip.hardness.value();
         s.trans_clip = self.clip.trans_clip.value();
@@ -614,13 +608,12 @@ impl Plugin for OnsetGuard {
             context.set_latency_samples(engine.latency() as u32);
         }
         if self.params.editor_state.is_open() {
-            let (gr_spec, gr_post) = engine.gain_reduction();
+            let gr_post = engine.gain_reduction();
             let (match_gain, dry, wet) = engine.meters();
             let (dry_sone, wet_sone) = engine.sones();
             self.meters.dry_sone.store(dry_sone, Ordering::Relaxed);
             self.meters.wet_sone.store(wet_sone, Ordering::Relaxed);
             self.meters.match_db.store(20.0 * match_gain.max(1e-4).log10(), Ordering::Relaxed);
-            self.meters.gr_spec_db.store(gr_spec, Ordering::Relaxed);
             self.meters.gr_post_db.store(gr_post, Ordering::Relaxed);
             self.meters.dry_lufs.store(dry, Ordering::Relaxed);
             self.meters.wet_lufs.store(wet, Ordering::Relaxed);

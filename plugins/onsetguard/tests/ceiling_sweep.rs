@@ -59,7 +59,6 @@ fn clip_on_never_exceeds_ceiling_and_reaches_it() {
         s.clip_on = true; s.drive_db = 10.0; s.ceil_db = ceil_db; s.oversample = os;
         s.protect_on = protect; s.trans_clip = trans_clip; s.sub_mode = sub;
         s.hf_preserve = hf; s.band_protect = amt; s.hardness = hard;
-        s.bin_ceil_db = 0.0;
         let out = run(&[l.clone(), r.clone()], &s);
         let ceil = 10f32.powf(ceil_db / 20.0);
         let pk = out.iter().flatten().fold(0.0f32, |m, v| m.max(v.abs()));

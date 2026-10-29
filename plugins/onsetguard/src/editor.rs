@@ -225,9 +225,9 @@ pub(crate) fn create(
             // --- controls: three columns, groups stacked to balance height ---
             HStack::new(cx, |cx| {
                 VStack::new(cx, |cx| {
-                    group(cx, "Clip", 15, |cx| params_with_help(cx, Data::params.map(|p| p.clip.clone())));
+                    group(cx, "Clip", 14, |cx| params_with_help(cx, Data::params.map(|p| p.clip.clone())));
                     HStack::new(cx, |cx| {
-                        meter(cx, "Spectral clip GR", Data::meters.map(|m| m.gr_spec_db.load(Ordering::Relaxed)), help::GR_SPEC_HELP);
+                        meter(cx, "Clip GR", Data::meters.map(|m| m.gr_post_db.load(Ordering::Relaxed)), help::GR_POST_HELP);
                     })
                     .size(Auto)
                     .top(Pixels(4.0));
@@ -238,11 +238,6 @@ pub(crate) fn create(
                 VStack::new(cx, |cx| {
                     group(cx, "Threshold", 5, |cx| params_with_help(cx, Data::params.map(|p| p.threshold.clone())));
                     group(cx, "Dynamics", 7, |cx| params_with_help(cx, Data::params.map(|p| p.dynamics.clone())));
-                    HStack::new(cx, |cx| {
-                        meter(cx, "Post clip GR", Data::meters.map(|m| m.gr_post_db.load(Ordering::Relaxed)), help::GR_POST_HELP);
-                    })
-                    .size(Auto)
-                    .top(Pixels(4.0));
                 })
                 .width(COLUMN_WIDTH)
                 .height(Auto);

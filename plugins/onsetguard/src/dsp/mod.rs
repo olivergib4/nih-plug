@@ -60,7 +60,6 @@ pub struct Settings {
 
     pub clip_on: bool,
     pub drive_db: f32,
-    pub bin_ceil_db: f32,
     pub ceil_db: f32,
     pub hardness: f32,
     pub trans_clip: f32,
@@ -119,7 +118,6 @@ impl Default for Settings {
             trans_boost_ms: 15.0,
             clip_on: true,
             drive_db: 0.0,
-            bin_ceil_db: 0.0,
             ceil_db: 0.0,
             hardness: 1.0,
             trans_clip: 1.0,
@@ -233,6 +231,7 @@ pub struct Engine {
     sub_a_delay: Delay, // sub (processed) after long stage: + short + extra
     sub_r_delay: Delay, // sub (reference): + short + extra
     sub_clip_delay: Delay, // sub in the clip path: + clip stft window
+    rest_clip_delay: Delay, // rest when Preserve Highs is off: replaces the clip STFT
     proc_delay: Delay,  // processed after short stage: + extra
     driven_delay: Delay, // driven signal: + clip stft + oversampler
     dry_delay: Delay,   // total latency
@@ -255,9 +254,7 @@ pub struct Engine {
     sone_dry: sone::SoneMeter,
     match_gain: f32,
     /// Gain reduction meters (dB, <= 0): spectral (per-bin ceiling) stage and post soft clip.
-    gr_spec_db: f32,
     gr_post_db: f32,
-    pending_pk_spec: f32,
     pending_clip_on: bool,
     /// Fraction of the last block where the protection envelope was active (for display).
     protect_vis: f32,
@@ -307,6 +304,7 @@ impl Engine {
             sub_a_delay: Delay::new(num_channels, max_short + extra_max),
             sub_r_delay: Delay::new(num_channels, max_short + extra_max),
             sub_clip_delay: Delay::new(num_channels, max_short),
+            rest_clip_delay: Delay::new(num_channels, max_short),
             proc_delay: Delay::new(num_channels, extra_max),
             driven_delay: Delay::new(num_channels, max_short + 2 * clip::LATENCY),
             dry_delay: Delay::new(num_channels, max_long + 2 * max_short + extra_max + 2 * clip::LATENCY),
@@ -322,9 +320,7 @@ impl Engine {
             sone_wet: sone::SoneMeter::new(sample_rate, num_channels, 100.0),
             sone_dry: sone::SoneMeter::new(sample_rate, num_channels, 100.0),
             match_gain: 1.0,
-            gr_spec_db: 0.0,
             gr_post_db: 0.0,
-            pending_pk_spec: 0.0,
             pending_clip_on: false,
             protect_vis: 0.0,
             wide: vec![vec![0.0; max_block]; 4 * num_channels],
@@ -371,6 +367,7 @@ impl Engine {
         self.sub_a_delay.set(n_s + self.extra_delay);
         self.sub_r_delay.set(n_s + self.extra_delay);
         self.sub_clip_delay.set(n_s);
+        self.rest_clip_delay.set(n_s);
         self.hf_delay.set(clip::LATENCY);
         self.proc_delay.set(self.extra_delay);
         self.driven_delay.set(n_s + clip::LATENCY);
@@ -397,6 +394,7 @@ impl Engine {
         self.sub_a_delay.reset();
         self.sub_r_delay.reset();
         self.sub_clip_delay.reset();
+        self.rest_clip_delay.reset();
         self.proc_delay.reset();
         self.driven_delay.reset();
         self.dry_delay.reset();
@@ -410,7 +408,6 @@ impl Engine {
         self.sone_wet.reset();
         self.sone_dry.reset();
         self.match_gain = 1.0;
-        self.gr_spec_db = 0.0;
         self.gr_post_db = 0.0;
     }
 
@@ -450,8 +447,8 @@ impl Engine {
 
     /// Gain reduction in dB (<= 0) of the spectral (per-bin ceiling) stage and the post soft
     /// clipper, measured on block peaks with a slow release.
-    pub fn gain_reduction(&self) -> (f32, f32) {
-        (self.gr_spec_db, self.gr_post_db)
+    pub fn gain_reduction(&self) -> f32 {
+        self.gr_post_db
     }
 
     /// Process `len` samples in place. `channels.len()` must equal `num_channels`.
@@ -638,7 +635,6 @@ impl Engine {
         // ceiling by construction. The output is a linear blend A -> B by Protect Amount, so
         // the trade (band purity vs body level) is proportional and the ceiling always holds.
         let ceil = 10f32.powf(s.ceil_db / 20.0);
-        let bin_ceil = 10f32.powf(s.bin_ceil_db / 20.0);
         {
             let clip_on = s.clip_on;
             let sub_mode = s.sub_mode;
@@ -661,7 +657,7 @@ impl Engine {
                     self.clw[nc + ch][i] = self.tmp_out[ch];
                 }
             }
-            {
+            if hf_on {
                 // the clip STFT runs on [rest.., highs..]; highs start as a copy of rest and are
                 // separated in the frequency domain (one-octave crossfade at hf_hz)
                 {
@@ -676,12 +672,12 @@ impl Engine {
                 let hf_hz = s.hf_hz.max(1000.0);
                 let hf_amt = s.hf_amount.clamp(0.0, 1.0);
                 let n_clip = self.clip_stft.window_size() as f32;
-                self.clip_stft.process(refs.as_mut(), len, |spectra, nb, mag| {
+                self.clip_stft.process(refs.as_mut(), len, |spectra, nb, _mag| {
                     let (rest, hf) = spectra.split_at_mut(nc);
                     for k in 0..nb {
                         let f = (k as f32 * sr / n_clip).max(1.0);
                         let o = (f / hf_hz).log2();
-                        let w_hf = if !hf_on || o <= -0.5 {
+                        let w_hf = if o <= -0.5 {
                             0.0
                         } else if o >= 0.5 {
                             1.0
@@ -692,21 +688,28 @@ impl Engine {
                             let r = &mut rest[ch][k];
                             hf[ch][k] = *r * w_hf;
                             *r *= 1.0 - w_hf;
-                            if clip_on && bin_ceil < 0.999 {
-                                let m = r.norm() * mag;
-                                if m > bin_ceil {
-                                    *r *= bin_ceil / m;
-                                }
-                            }
                         }
                     }
                 });
+            } else {
+                // Preserve Highs off: nothing to split, so the rest is just delayed to match
+                // (drive -> clipper, nothing in between) and the highs channel is silent
+                for i in 0..len {
+                    for ch in 0..nc {
+                        self.tmp_in[ch] = self.clw[ch][i];
+                    }
+                    self.rest_clip_delay.tick(&self.tmp_in[..nc], &mut self.tmp_out[..nc]);
+                    for ch in 0..nc {
+                        self.clw[ch][i] = self.tmp_out[ch];
+                        self.clw[2 * nc + ch][i] = 0.0;
+                    }
+                }
             }
-            // peak after the spectral stage, on the recombined signal (for the GR meter)
-            let mut pk_spec = 0.0f32;
+            // peak of the recombined signal before the clippers (for the GR meter)
+            let mut pk_pre = 0.0f32;
             for ch in 0..nc {
                 for i in 0..len {
-                    pk_spec = pk_spec.max((self.clw[ch][i] + self.clw[nc + ch][i] + self.clw[2 * nc + ch][i]).abs());
+                    pk_pre = pk_pre.max((self.clw[ch][i] + self.clw[nc + ch][i] + self.clw[2 * nc + ch][i]).abs());
                 }
             }
 
@@ -780,9 +783,8 @@ impl Engine {
             }
 
             let pk_post = block_peak(&self.cl, nc, len);
-            let gr_post = if clip_on && pk_spec > 1e-6 { (20.0 * (pk_post / pk_spec).log10()).min(0.0) } else { 0.0 };
+            let gr_post = if clip_on && pk_pre > 1e-6 { (20.0 * (pk_post / pk_pre).log10()).min(0.0) } else { 0.0 };
             self.gr_post_db = if gr_post < self.gr_post_db { gr_post } else { self.gr_post_db + (gr_post - self.gr_post_db) * (len as f32 / (0.3 * sr)).min(1.0) };
-            self.pending_pk_spec = pk_spec;
             self.pending_clip_on = clip_on;
         }
         let l_clip = self.clip_stft.window_size() + clip::LATENCY;
@@ -839,11 +841,6 @@ impl Engine {
                 };
                 channels[ch][i] = out;
             }
-        }
-        {
-            // spectral-stage GR: block peak after the per-bin ceiling vs the aligned driven input
-            let gr_spec = if self.pending_clip_on && pk_in > 1e-6 { (20.0 * (self.pending_pk_spec / pk_in).log10()).min(0.0) } else { 0.0 };
-            self.gr_spec_db = if gr_spec < self.gr_spec_db { gr_spec } else { self.gr_spec_db + (gr_spec - self.gr_spec_db) * (len as f32 / (0.3 * sr)).min(1.0) };
         }
         if s.ref_spl != self.sone_wet.ref_spl {
             self.sone_wet.ref_spl = s.ref_spl;

@@ -238,47 +238,31 @@ fn e_extra(lat: usize) -> usize {
 }
 
 #[test]
-fn gain_reduction_meters_split_spectral_and_post() {
-    // Drive hard: spectral stage must take most of the reduction with a low spectral ceiling,
-    // and the post clipper most of it when the spectral ceiling is at 0 dB.
-    let clap = synth_clap(5);
+fn gain_reduction_meter_tracks_the_clipper() {
     let zap = synth_zap();
     let mut e = Engine::new(1, SR, BLOCK);
     let mut s = Settings::default();
-    s.drive_db = 12.0;
     s.trans_clip = 1.0;
     s.protect_on = false;
-    for (name, src, bin_ceil, expect_spec_dominant) in [
-        ("zap", &zap, -12.0f32, Some(true)),
-        ("zap", &zap, 0.0, Some(false)),
-        ("clap", &clap, -12.0, None),
-        ("clap", &clap, -30.0, None),
-    ] {
-        let clap = src;
-        s.bin_ceil_db = bin_ceil;
+    s.dyn_.down_ratio = 1.0;
+    s.dyn_.up_ratio = 1.0;
+    for (drive, expect_gr) in [(0.0f32, false), (12.0, true)] {
+        s.drive_db = drive;
         e.set_windows(s.long_order, s.short_order, s.oversample);
         let mut pos = 0;
-        let total = clap.len() + e.latency();
-        let (mut min_spec, mut min_post) = (0.0f32, 0.0f32);
+        let total = zap.len() + e.latency();
+        let mut min_post = 0.0f32;
         while pos < total {
             let n = BLOCK.min(total - pos);
-            let mut c: Vec<f32> = (0..n).map(|i| clap.get(pos + i).copied().unwrap_or(0.0)).collect();
+            let mut c: Vec<f32> = (0..n).map(|i| zap.get(pos + i).copied().unwrap_or(0.0)).collect();
             { let mut r: Vec<&mut [f32]> = vec![&mut c[..]]; e.process(&mut r, n, &s); }
-            let (gs, gp) = e.gain_reduction();
-            // only while the source is still playing: the end of the file is silence arriving
-            // in one meter before the other, which is not gain reduction
-            if pos + n < clap.len() + e.latency() / 2 {
-                min_spec = min_spec.min(gs);
-                min_post = min_post.min(gp);
+            if pos + n < zap.len() + e.latency() / 2 {
+                min_post = min_post.min(e.gain_reduction());
             }
             pos += n;
         }
-        println!("{name}, bin ceil {bin_ceil} dB: spectral GR {min_spec:.1} dB, post GR {min_post:.1} dB");
-        match expect_spec_dominant {
-            Some(true) => assert!(min_spec < min_post, "spectral stage should dominate"),
-            Some(false) => assert!(min_post < min_spec, "post clipper should dominate"),
-            None => {}
-        }
+        println!("zap, drive {drive} dB: post GR {min_post:.1} dB");
+        if expect_gr { assert!(min_post < -6.0, "12 dB of drive into a zap must show clipper GR"); } else { assert!(min_post > -0.5, "no drive, no GR"); }
     }
 }
 
@@ -317,7 +301,6 @@ fn sub_split_modes_do_what_they_say() {
     base.dyn_.mono_below_hz = 0.0;
     base.sub_hz = 100.0;
     base.band_protect = 1.0;
-    base.bin_ceil_db = 0.0; // keep the per-bin ceiling out of the way; this tests the soft clip paths
     let mut results = Vec::new();
     for mode in [SubMode::Off, SubMode::Separate, SubMode::Protect] {
         let mut s = base;
@@ -460,7 +443,6 @@ fn hf_preserve_keeps_highs_through_a_hard_clip() {
     base.dyn_.down_ratio = 1.0;
     base.dyn_.up_ratio = 1.0;
     base.dyn_.mono_below_hz = 0.0;
-    base.bin_ceil_db = 0.0;
     base.hardness = 1.0;
     base.trans_clip = 1.0;
     base.band_protect = 1.0;
@@ -521,7 +503,6 @@ fn sub_protect_amount_trades_body_level_for_sub_purity() {
     base.dyn_.up_ratio = 1.0;
     base.dyn_.mono_below_hz = 0.0;
     base.sub_hz = 100.0;
-    base.bin_ceil_db = 0.0;
     base.sub_mode = SubMode::Protect;
     let mut rows = Vec::new();
     for amt in [0.0f32, 0.2, 0.4, 0.6, 0.8, 1.0] {
@@ -559,7 +540,6 @@ fn hf_preserve_is_transparent_below_the_ceiling() {
     s.clip_on = true;
     s.drive_db = 0.0;
     s.ceil_db = 0.0;
-    s.bin_ceil_db = 0.0;
     s.hardness = 1.0;
     s.trans_clip = 1.0;
     s.hf_preserve = true;
@@ -599,7 +579,6 @@ fn sub_protect_routing_under_onset_protection() {
     base.dyn_.up_ratio = 1.0;
     base.dyn_.mono_below_hz = 0.0;
     base.sub_hz = 100.0;
-    base.bin_ceil_db = 0.0;
     let mut rows = Vec::new();
     for (protect, mode, amt) in [(false, SubMode::Off, 0.0), (false, SubMode::Protect, 1.0), (true, SubMode::Off, 0.0), (true, SubMode::Protect, 1.0)] {
         let mut s = base;

@@ -40,9 +40,8 @@ pub fn for_param(id: &str) -> Option<&'static str> {
         "trans_len" => "Transient Boost Length. Decay time of the boost. Short = click, longer = whole attack.",
 
         // --- Clip ---
-        "clip" => "Clip. Turns the clip stage on: per-bin spectral ceiling, then an oversampled soft clipper with a hard output ceiling. Off, the stage is a plain delay so latency stays constant.",
-        "drive" => "Clip Drive. Gain into the clippers: the loudness knob. More drive = more clipping = louder. Watch the two GR meters to see which stage is doing the work.",
-        "bin_ceil" => "Spectral Ceiling. Per-bin magnitude limit before the clipper; 0 dB = off (default). Bites on tonal, concentrated energy (sines, bass, zaps), barely on broadband hits. Lower it to tame resonant tones before the clipper; it dulls tonal material fast.",
+        "clip" => "Clip. Turns the clip stage on: Clip Drive into an oversampled clipper with a hard output ceiling (at 1x, identical to a plain hard clipper). Off, the stage is a plain delay so latency stays constant.",
+        "drive" => "Clip Drive. Gain into the clipper: the loudness knob. More drive = more clipping = louder. The GR meter shows how much is being shaved.",
         "ceiling" => "Output Ceiling. Hard maximum of the clipped signal. 0 dBFS for maximum level; leave a few tenths if your encoder complains.",
         "hardness" => "Clip Hardness. 100% = hard clip (default: loudest, most harmonics). Lower starts a soft knee earlier for a rounder, quieter clip.",
         "trans_clip" => "Transient Clip. How much of each detected hit goes through the oversampled clipper. 0% = hits bypass it and are only hard-clamped at the ceiling (max punch), 100% = hits clipped like everything else (max density). The ceiling holds at every setting.",
@@ -61,7 +60,6 @@ pub fn for_param(id: &str) -> Option<&'static str> {
 
 pub const PRESET_HELP: &str = "Starting points. Sets every control except Output Gain, Mix, Matched Bypass and Reference Level. The host sees ordinary parameter changes, so undo works.";
 pub const SONE_HELP: &str = "Perceived loudness (Zwicker-style sone model). Dry at unity vs processed. Bars are in phon (40 = 1 sone, +10 = twice as loud). Needs Reference Level to be roughly right.";
-pub const GR_SPEC_HELP: &str = "How much the per-bin Spectral Ceiling is reducing. Strong on tonal material, weak on broadband hits.";
-pub const GR_POST_HELP: &str = "How much the final soft clipper is reducing. If this is doing most of the work on tonal material, lower Spectral Ceiling.";
+pub const GR_POST_HELP: &str = "How much the clipper is reducing (peak after vs before, with Clip Drive applied).";
 pub const ANALYZER_HELP: &str = "Analyzer. Grey: what the detector hears (weighted). Orange: the threshold curve. Blue bars: cut, green bars: boost, per frequency, from both resolution stages. Yellow strip along the top: a hit is being protected right now.";
 pub const K_HELP: &str = "K-weighted level (LUFS-style, 3 s window). Kept for comparison with other meters; the sone readout is the better loudness number.";

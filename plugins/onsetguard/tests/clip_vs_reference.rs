@@ -87,7 +87,6 @@ fn internal_clip_vs_sample_hard_clip() {
     base.dyn_.down_ratio = 1.0;
     base.dyn_.up_ratio = 1.0;
     base.dyn_.mono_below_hz = 0.0;
-    base.bin_ceil_db = 0.0;
     base.drive_db = 8.0;
     base.ceil_db = 0.0;
     base.hardness = 1.0;

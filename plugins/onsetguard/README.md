@@ -6,12 +6,12 @@ NIH-plug framework and derived from Robbert van der Helm's Spectral Compressor (
 ## What it does
 
 ```
-input ─┬─ long STFT  (mono-below + low-band dynamics)  ─ short STFT (high-band dynamics) ─┐
-       ├─ long STFT  (mono-below only, reference)      ─ delay ────────────────────────────┤
-       ├─ onset detector ─ protection / transient-boost envelopes ─────────────────────── blend
-       │                                                                                   │
-       │   drive ─ short STFT (per-bin ceiling) ─ oversampled soft clip ─ transient blend ──┤
-       └─ dry delay ─────────────────────────────────────────── mix / loudness-matched bypass
+input ─ pre-EQ (min-phase) ─┬─ long STFT (stereo, balance, mono-below, low dynamics) ─ short STFT (high dynamics) ─┐
+                            ├─ long STFT (stereo, balance, mono-below; reference)      ─ delay ───────────────────┤
+                            ├─ onset detector ─ protection / transient-boost envelopes ───────────────────────── blend
+                            │                                                                                      │
+                            │   drive ─ [sub / highs split] ─ oversampled clip ─ transient blend ──────────────────┤
+                            └─ dry delay ──────────────────────────────────────────────── mix / loudness-matched bypass
 ```
 
 * **Zero-phase everywhere.** Every stage is sample-aligned with the dry signal, so parallel
@@ -24,11 +24,25 @@ input ─┬─ long STFT  (mono-below + low-band dynamics)  ─ short STFT (hig
   (Post). This is what removes pre-ring smear while keeping the transient's exact phase.
 * **Transient boost.** Optional upward expansion on detected hits only.
 * **Frequency smoothing** of the gain curve removes the watery per-bin swirl.
-* **Spectral clip.** A per-bin ceiling (detail-preserving style) feeds an oversampled soft
-  clipper with a hard output ceiling. Transient Clip decides how much of each hit goes through
-  the oversampled clipper; the ceiling holds at every setting. At 1x the clip stage is
-  bit-identical to a plain sample-level hard clip; at 2-8x it matches one within 0.1 dB in
-  every band except the alias energy it removes.
+* **Clip.** Clip Drive into an oversampled clipper with a hard output ceiling. Transient Clip
+  decides how much of each hit goes through the oversampled clipper; the ceiling holds at every
+  setting. At 1x the clip stage is bit-identical to a plain sample-level hard clip; at 2-8x it
+  matches one within 0.1 dB in every band except the alias energy it removes. (A per-bin
+  "spectral ceiling" was measured and removed: it gave no loudness.)
+* **Pre-EQ.** Four minimum-phase nodes drawn on the analyzer (low shelf, two one-octave bells,
+  high shelf), applied at the input before every path. No pre-ringing by construction; the
+  compressor sees the shaped signal.
+* **Stereo.** Zero-phase, in the long STFT: Width scales the Side above a frequency (the mono
+  sum is the Mid, untouched, so it is mono-compatible by construction); the Anti-phase Guard
+  pulls down Side where left and right are in anti-phase per bin, which vanishes on a mono sum
+  and wastes clipper headroom. Measured: mono-sum error below -119 dB with Width at +6 dB; an
+  anti-phase tone's Side removed by 77 dB while panned in-phase material is untouched.
+* **Loudness Balance.** A slow, zero-phase per-band gain toward equal specific loudness across
+  the Bark bands (Zwicker). For a fixed energy, that balance reads loudest (the loudness sum is
+  concave). Energy-preserving, limited to Balance Range per band, measured before the pre-EQ.
+  Measured on a dull noise at equal energy: 35.8 -> 40.0 sones.
+* **Translation readouts.** Sones of dry vs processed through full range, laptop (120 Hz-15 kHz)
+  and phone (300 Hz-8 kHz) bands.
 * **Mono below** a set frequency, done in the long STFT (zero-phase).
 * **Sub Split.** The band below Sub Split Freq is separated at the long resolution (sharp,
   zero-phase) and carried through the same onset protection as the full signal, so

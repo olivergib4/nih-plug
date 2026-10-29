@@ -12,7 +12,22 @@ pub fn for_param(id: &str) -> Option<&'static str> {
         "long_window" => "Long Window. FFT size for the lows (below Crossover). Bigger = more bands and finer control in the lows, but longer smear and latency (8192 = 171 ms at 48k). Bass-heavy material 8192-16384; on a master 4096 keeps tails short.",
         "short_window" => "Short Window. FFT size for the highs (above Crossover). Smaller = tighter timing on transients at the cost of resolution. 1024 is a good default; 512 for very snappy material.",
         "crossover" => "Crossover. Where the long and short windows hand over (one-octave crossfade). Lower it if the mids feel smeared; raise it if the low-mids need finer bands.",
+
+        // --- Stereo ---
         "mono_below" => "Mono Below. Sums the sides to mono below this frequency, inside the long FFT (zero-phase). Stops out-of-phase sub from cancelling on club systems and phones. 0 turns it off.",
+        "width_hz" => "Width Above. Where Width starts to apply (one-octave crossfade). Keep it above the bass so the low end stays centred.",
+        "width" => "Width. Side gain above Width Above, in dB. The mono sum is the Mid, which this never touches, so any setting is mono-compatible. It can only widen stereo that already exists.",
+        "guard" => "Anti-phase Guard. Per bin, where left and right are in anti-phase, the Side is pulled down by this amount. Anti-phase content vanishes on a mono sum and eats clipper headroom for nothing; removing it is free level on club and phone systems. 100% on a bus, lower on deliberately wide FX.",
+
+        // --- Loudness Balance ---
+        "balance" => "Balance Strength. A slow, zero-phase per-band gain that nudges the long-term spectrum toward equal specific loudness across the hearing bands (Zwicker). For a fixed energy that balance reads loudest. Measured on the input before the pre-EQ, so your EQ moves add to it rather than being fought. 0% = off.",
+        "balance_speed" => "Balance Speed. Averaging time of the spectrum the balance follows. Seconds, not milliseconds: this is a tonal correction, not a compressor.",
+        "balance_range" => "Balance Range. Maximum correction per band. 6 dB corrects a tilt without re-EQing the sound; the overall level is kept constant.",
+
+        // --- Pre EQ (nodes on the analyzer) ---
+        "eq1_hz" | "eq1_db" => "Low shelf node. Drag on the analyzer: left-right sets frequency, up-down gain. Double-click resets. Minimum-phase, applied at the input before everything (no pre-ringing), so the compressor sees the shaped signal.",
+        "eq2_hz" | "eq2_db" | "eq3_hz" | "eq3_db" => "Bell node, one octave wide. Drag on the analyzer: left-right sets frequency, up-down gain. Double-click resets. Minimum-phase, at the input.",
+        "eq4_hz" | "eq4_db" => "High shelf node. Drag on the analyzer: left-right sets frequency, up-down gain. Double-click resets. Minimum-phase, at the input.",
 
         // --- Threshold ---
         "weighting" => "Detector Weighting. Shapes what the compressor HEARS, not the audio. Flat = raw magnitudes; K = broadcast weighting; Equal loudness = the ear's curve. Weighted, lows are controlled harder (they eat headroom but add little loudness) and presence is left alone. Try Equal loudness on a bus.",
@@ -58,8 +73,9 @@ pub fn for_param(id: &str) -> Option<&'static str> {
     })
 }
 
-pub const PRESET_HELP: &str = "Starting points. Sets every control except Output Gain, Mix, Matched Bypass and Reference Level. The host sees ordinary parameter changes, so undo works.";
+pub const PRESET_HELP: &str = "Starting points. Sets every control except Output Gain, Mix, Matched Bypass, Reference Level, and the mix decisions (Stereo width/guard, Loudness Balance, pre-EQ). The host sees ordinary parameter changes, so undo works.";
 pub const SONE_HELP: &str = "Perceived loudness (Zwicker-style sone model). Dry at unity vs processed. Bars are in phon (40 = 1 sone, +10 = twice as loud). Needs Reference Level to be roughly right.";
 pub const GR_POST_HELP: &str = "How much the clipper is reducing (peak after vs before, with Clip Drive applied).";
-pub const ANALYZER_HELP: &str = "Analyzer. Grey: what the detector hears (weighted). Orange: the threshold curve. Blue bars: cut, green bars: boost, per frequency, from both resolution stages. Yellow strip along the top: a hit is being protected right now.";
+pub const ANALYZER_HELP: &str = "Analyzer. Grey: what the detector hears (weighted). Orange: the threshold curve. Purple: the pre-EQ, drag its four nodes (low shelf, two bells, high shelf; double-click resets; +-15 dB spans the height). Blue bars: cut, green bars: boost, per frequency. Yellow strip along the top: a hit is being protected right now.";
+pub const TRANSLATION_HELP: &str = "Translation. Perceived loudness (sones) of the dry and the processed signal through three playback bands: full range, laptop (120 Hz-15 kHz) and phone (300 Hz-8 kHz). If a change only made the sub louder, the phone row will not move. Needs Reference Level to be roughly right.";
 pub const K_HELP: &str = "K-weighted level (LUFS-style, 3 s window). Kept for comparison with other meters; the sone readout is the better loudness number.";

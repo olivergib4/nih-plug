@@ -53,6 +53,8 @@ pub struct Meters {
     /// Perceived loudness (sones) of the dry signal at unity and of the processed signal.
     pub dry_sone: AtomicF32,
     pub wet_sone: AtomicF32,
+    /// Translation readouts: phone dry/processed, laptop dry/processed.
+    pub tr_sone: [AtomicF32; 4],
     /// Current matched-bypass gain, dB.
     pub match_db: AtomicF32,
 }
@@ -65,6 +67,7 @@ impl Default for Meters {
             wet_lufs: AtomicF32::new(-100.0),
             dry_sone: AtomicF32::new(0.0),
             wet_sone: AtomicF32::new(0.0),
+            tr_sone: [AtomicF32::new(0.0), AtomicF32::new(0.0), AtomicF32::new(0.0), AtomicF32::new(0.0)],
             match_db: AtomicF32::new(0.0),
         }
     }
@@ -129,6 +132,70 @@ pub struct OnsetGuardParams {
     pub protect: Arc<ProtectParams>,
     #[nested(group = "Clip")]
     pub clip: Arc<ClipParams>,
+    #[nested(group = "Stereo")]
+    pub stereo: Arc<StereoParams>,
+    #[nested(group = "Loudness Balance")]
+    pub balance: Arc<BalanceParams>,
+    #[nested(group = "Pre EQ")]
+    pub eq: Arc<EqParams>,
+}
+
+/// Four nodes drawn on the analyzer: low shelf, two bells (one octave wide), high shelf.
+#[derive(Params)]
+pub struct EqParams {
+    #[id = "eq1_hz"]
+    pub f1: FloatParam,
+    #[id = "eq1_db"]
+    pub g1: FloatParam,
+    #[id = "eq2_hz"]
+    pub f2: FloatParam,
+    #[id = "eq2_db"]
+    pub g2: FloatParam,
+    #[id = "eq3_hz"]
+    pub f3: FloatParam,
+    #[id = "eq3_db"]
+    pub g3: FloatParam,
+    #[id = "eq4_hz"]
+    pub f4: FloatParam,
+    #[id = "eq4_db"]
+    pub g4: FloatParam,
+}
+
+impl EqParams {
+    pub fn freq(&self, n: usize) -> &FloatParam {
+        [&self.f1, &self.f2, &self.f3, &self.f4][n]
+    }
+    pub fn gain(&self, n: usize) -> &FloatParam {
+        [&self.g1, &self.g2, &self.g3, &self.g4][n]
+    }
+}
+
+fn eq_hz_param(name: &str, default: f32) -> FloatParam {
+    FloatParam::new(name, default, FloatRange::Skewed { min: 20.0, max: 20000.0, factor: FloatRange::skew_factor(-2.0) })
+        .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
+        .with_string_to_value(formatters::s2v_f32_hz_then_khz())
+}
+
+#[derive(Params)]
+pub struct StereoParams {
+    #[id = "mono_below"]
+    pub mono_below_hz: FloatParam,
+    #[id = "width_hz"]
+    pub width_hz: FloatParam,
+    #[id = "width"]
+    pub width_db: FloatParam,
+    #[id = "guard"]
+    pub guard: FloatParam,
+}
+
+#[derive(Params)]
+pub struct BalanceParams {
+    #[id = "balance"]
+    pub strength: FloatParam,
+    #[id = "balance_speed"]
+    pub speed_s: FloatParam,
+    #[id = "balance_range"]
+    pub range_db: FloatParam,
 }
 
 #[derive(Params)]
@@ -151,8 +218,6 @@ pub struct ResolutionParams {
     pub short_order: IntParam,
     #[id = "crossover"]
     pub crossover_hz: FloatParam,
-    #[id = "mono_below"]
-    pub mono_below_hz: FloatParam,
 }
 
 #[derive(Params)]
@@ -324,6 +389,8 @@ impl Default for OnsetGuardParams {
             )
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
             .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
+            }),
+            stereo: Arc::new(StereoParams {
             mono_below_hz: FloatParam::new(
                 "Mono Below",
                 d.dyn_.mono_below_hz,
@@ -331,6 +398,36 @@ impl Default for OnsetGuardParams {
             )
             .with_unit(" Hz")
             .with_step_size(1.0),
+            width_hz: FloatParam::new(
+                "Width Above",
+                d.stereo.width_hz,
+                FloatRange::Skewed { min: 100.0, max: 8000.0, factor: FloatRange::skew_factor(-1.5) },
+            )
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
+            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
+            width_db: db_param("Width", d.stereo.width_db, -12.0, 12.0),
+            guard: pct_param("Anti-phase Guard", d.stereo.guard),
+            }),
+            balance: Arc::new(BalanceParams {
+            strength: pct_param("Balance Strength", d.balance.strength),
+            speed_s: FloatParam::new(
+                "Balance Speed",
+                d.balance.speed_s,
+                FloatRange::Skewed { min: 0.5, max: 10.0, factor: FloatRange::skew_factor(-1.0) },
+            )
+            .with_unit(" s")
+            .with_step_size(0.1),
+            range_db: db_param("Balance Range", d.balance.range_db, 0.0, 6.0),
+            }),
+            eq: Arc::new(EqParams {
+            f1: eq_hz_param("EQ Low Shelf Freq", d.eq.freq_hz[0]),
+            g1: db_param("EQ Low Shelf Gain", d.eq.gain_db[0], -12.0, 12.0),
+            f2: eq_hz_param("EQ Bell 1 Freq", d.eq.freq_hz[1]),
+            g2: db_param("EQ Bell 1 Gain", d.eq.gain_db[1], -12.0, 12.0),
+            f3: eq_hz_param("EQ Bell 2 Freq", d.eq.freq_hz[2]),
+            g3: db_param("EQ Bell 2 Gain", d.eq.gain_db[2], -12.0, 12.0),
+            f4: eq_hz_param("EQ High Shelf Freq", d.eq.freq_hz[3]),
+            g4: db_param("EQ High Shelf Gain", d.eq.gain_db[3], -12.0, 12.0),
             }),
             threshold: Arc::new(ThresholdParams {
             weighting: EnumParam::new("Detector Weighting", DetectorWeighting::Off),
@@ -467,7 +564,17 @@ impl OnsetGuardParams {
         s.dyn_.smooth_oct = self.dynamics.smooth_oct.value();
         s.dyn_.stereo_link = self.dynamics.stereo_link.value();
         s.dyn_.crossover_hz = self.resolution.crossover_hz.value();
-        s.dyn_.mono_below_hz = self.resolution.mono_below_hz.value();
+        s.dyn_.mono_below_hz = self.stereo.mono_below_hz.value();
+        s.stereo.width_hz = self.stereo.width_hz.value();
+        s.stereo.width_db = self.stereo.width_db.value();
+        s.stereo.guard = self.stereo.guard.value();
+        s.balance.strength = self.balance.strength.value();
+        s.balance.speed_s = self.balance.speed_s.value();
+        s.balance.range_db = self.balance.range_db.value();
+        for n in 0..dsp::eq::NODES {
+            s.eq.freq_hz[n] = self.eq.freq(n).value();
+            s.eq.gain_db[n] = self.eq.gain(n).value();
+        }
         s.long_order = self.resolution.long_order.value() as usize;
         s.short_order = self.resolution.short_order.value() as usize;
         s.protect_on = self.protect.protect_on.value();
@@ -613,6 +720,9 @@ impl Plugin for OnsetGuard {
             let (dry_sone, wet_sone) = engine.sones();
             self.meters.dry_sone.store(dry_sone, Ordering::Relaxed);
             self.meters.wet_sone.store(wet_sone, Ordering::Relaxed);
+            for (m, v) in self.meters.tr_sone.iter().zip(engine.translation_sones()) {
+                m.store(v, Ordering::Relaxed);
+            }
             self.meters.match_db.store(20.0 * match_gain.max(1e-4).log10(), Ordering::Relaxed);
             self.meters.gr_post_db.store(gr_post, Ordering::Relaxed);
             self.meters.dry_lufs.store(dry, Ordering::Relaxed);

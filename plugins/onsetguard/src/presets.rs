@@ -10,6 +10,8 @@ pub struct Preset {
 // Enum parameters take their variant index as the plain value.
 // weighting: 0 Flat, 1 K, 2 Equal loudness · sub_split: 0 Off, 1 Protect, 2 Separate
 // oversample: 0 1x, 1 2x, 2 4x, 3 8x
+// Stereo, Loudness Balance and Pre EQ are deliberately left at their defaults by every
+// preset (off): they are mix decisions, not starting points.
 
 pub const PRESETS: &[Preset] = &[
     Preset {

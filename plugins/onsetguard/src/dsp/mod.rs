@@ -10,11 +10,14 @@
 
 #![allow(clippy::needless_range_loop)]
 
+pub mod balance;
 pub mod clip;
 pub mod dynamics;
+pub mod eq;
 pub mod loudness;
 pub mod onset;
 pub mod sone;
+pub mod stereo;
 pub mod stft;
 
 use dynamics::{Band, Dynamics, DynamicsSettings, Weighting};
@@ -22,6 +25,11 @@ use realfft::num_complex::Complex32;
 
 pub const MIN_LONG_ORDER: usize = 9;
 pub const MAX_LONG_ORDER: usize = 15;
+/// Crude playback-system bands for the translation readouts.
+pub const PHONE_LO: f32 = 300.0;
+pub const PHONE_HI: f32 = 8000.0;
+pub const LAPTOP_LO: f32 = 120.0;
+pub const LAPTOP_HI: f32 = 15000.0;
 pub const MIN_SHORT_ORDER: usize = 6;
 pub const MAX_SHORT_ORDER: usize = 12;
 pub const MAX_OVERSAMPLE: usize = 8;
@@ -47,6 +55,9 @@ pub enum SubMode {
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
     pub dyn_: DynamicsSettings,
+    pub stereo: stereo::StereoSettings,
+    pub balance: balance::BalanceSettings,
+    pub eq: eq::EqSettings,
     pub long_order: usize,
     pub short_order: usize,
 
@@ -91,6 +102,9 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            stereo: stereo::StereoSettings::default(),
+            balance: balance::BalanceSettings::default(),
+            eq: eq::EqSettings::default(),
             dyn_: DynamicsSettings {
                 weighting: Weighting::Off,
                 threshold_db: -24.0,
@@ -223,6 +237,9 @@ pub struct Engine {
     sub_oversampler: clip::Oversampler,
     final_oversampler: clip::Oversampler,
     low_dyn: Dynamics,
+    stereo_stage: stereo::StereoStage,
+    balance: balance::Balance,
+    pre_eq: eq::PreEq,
     high_dyn: Dynamics,
     oversampler: clip::Oversampler,
     detector: onset::OnsetDetector,
@@ -252,6 +269,8 @@ pub struct Engine {
     /// matches in sones, not in a proxy).
     sone_wet: sone::SoneMeter,
     sone_dry: sone::SoneMeter,
+    /// Translation readouts: band-limited loudness (phone, laptop), dry at unity and processed.
+    sone_tr: [sone::SoneMeter; 4],
     match_gain: f32,
     /// Gain reduction meters (dB, <= 0): spectral (per-bin ceiling) stage and post soft clip.
     gr_post_db: f32,
@@ -297,6 +316,9 @@ impl Engine {
             sub_oversampler: clip::Oversampler::new(num_channels, MAX_OVERSAMPLE),
             final_oversampler: clip::Oversampler::new(num_channels, MAX_OVERSAMPLE),
             low_dyn: Dynamics::new(Band::Low, num_channels, max_long),
+            stereo_stage: stereo::StereoStage::new(max_long / 2 + 1),
+            balance: balance::Balance::new(max_long / 2 + 1),
+            pre_eq: eq::PreEq::new(sample_rate, num_channels),
             high_dyn: Dynamics::new(Band::High, num_channels, max_short),
             oversampler: clip::Oversampler::new(num_channels, MAX_OVERSAMPLE),
             detector: onset::OnsetDetector::new(sample_rate),
@@ -319,6 +341,14 @@ impl Engine {
             k_wet: loudness::KMeter::new(sample_rate, num_channels, 3.0),
             sone_wet: sone::SoneMeter::new(sample_rate, num_channels, 100.0),
             sone_dry: sone::SoneMeter::new(sample_rate, num_channels, 100.0),
+            sone_tr: {
+                let mk = |lo: f32, hi: f32| {
+                    let mut m = sone::SoneMeter::new(sample_rate, num_channels, 100.0);
+                    m.set_band(lo, hi);
+                    m
+                };
+                [mk(PHONE_LO, PHONE_HI), mk(PHONE_LO, PHONE_HI), mk(LAPTOP_LO, LAPTOP_HI), mk(LAPTOP_LO, LAPTOP_HI)]
+            },
             match_gain: 1.0,
             gr_post_db: 0.0,
             pending_clip_on: false,
@@ -381,6 +411,9 @@ impl Engine {
 
     pub fn reset(&mut self) {
         self.long_stft.reset();
+        self.stereo_stage.reset();
+        self.balance.reset();
+        self.pre_eq.reset();
         self.short_stft.reset();
         self.clip_stft.reset();
         self.low_dyn.reset();
@@ -407,6 +440,9 @@ impl Engine {
         self.k_wet.reset();
         self.sone_wet.reset();
         self.sone_dry.reset();
+        for m in &mut self.sone_tr {
+            m.reset();
+        }
         self.match_gain = 1.0;
         self.gr_post_db = 0.0;
     }
@@ -422,6 +458,11 @@ impl Engine {
     pub fn sones(&self) -> (f32, f32) {
         let g = self.match_gain.max(1e-3);
         (self.sone_dry.sone / g.powf(0.6), self.sone_wet.sone)
+    }
+
+    /// Translation readouts in sones: [phone dry, phone processed, laptop dry, laptop processed].
+    pub fn translation_sones(&self) -> [f32; 4] {
+        [self.sone_tr[0].sone, self.sone_tr[1].sone, self.sone_tr[2].sone, self.sone_tr[3].sone]
     }
 
     /// Fill analyzer arrays on a log-frequency grid from `f_lo` to `f_hi` Hz: envelope dB, gain dB
@@ -459,6 +500,10 @@ impl Engine {
         if s.long_order != self.cur.long_order || s.short_order != self.cur.short_order || s.oversample != self.cur.oversample {
             self.set_windows(s.long_order, s.short_order, s.oversample);
         }
+
+        // --- pre-EQ: minimum-phase, on the input, before every path ---
+        self.pre_eq.update(&s.eq);
+        self.pre_eq.process(channels, len);
 
         // --- dry delay, onset detection, protection ring writes (input timeline) ---
         let pre = (s.pre_ms.clamp(0.0, MAX_PRE_MS) / 1000.0 * sr).round() as usize;
@@ -531,10 +576,33 @@ impl Engine {
             let frame_dt = n_l / 4.0 / sr;
             let sub_on = s.sub_mode != SubMode::Off;
             let sub_hz = s.sub_hz.max(20.0);
+            let st_s = s.stereo;
+            let st = &mut self.stereo_stage;
+            let bal_s = s.balance;
+            let bal = &mut self.balance;
+            let eq_ref = &self.pre_eq;
+            let ref_spl = s.ref_spl;
             let mut refs = self.wide.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
             self.long_stft.process(refs.as_mut(), len, |spectra, nb, mag| {
                 let (proc_ref, subs) = spectra.split_at_mut(2 * nc);
                 let (first, second) = proc_ref.split_at_mut(nc);
+                // stereo stage (width, anti-phase guard) on both pairs, before anything else
+                if nc == 2 && stereo::StereoStage::active(&st_s) {
+                    st.process_frame(first, second, nb, sr, frame_dt, &st_s);
+                }
+                // loudness balance: measured on the input, applied to both pairs
+                {
+                    let (measure, _) = subs.split_at_mut(nc);
+                    for ch in 0..nc {
+                        measure[ch][..nb].copy_from_slice(&first[ch][..nb]);
+                    }
+                    let mut targets = [&mut *first, &mut *second];
+                    bal.process_frame(measure, &mut targets, nb, sr, mag, frame_dt, ref_spl, &bal_s, eq_ref);
+                    // the sub channels are scratch here; they must go back to silence
+                    for ch in 0..nc {
+                        measure[ch][..nb].fill(Complex32::default());
+                    }
+                }
                 // mono-below on the reference pair when stereo
                 if dyn_s.mono_below_hz > 0.0 && nc == 2 {
                     mono_below(second, nb, sr, dyn_s.mono_below_hz);
@@ -821,6 +889,13 @@ impl Engine {
             }
             self.k_wet.push_frame(&self.tmp_in[..nc]);
             self.sone_wet.push(&self.tmp_in[..nc]);
+            self.sone_tr[1].push(&self.tmp_in[..nc]);
+            self.sone_tr[3].push(&self.tmp_in[..nc]);
+            for ch in 0..nc {
+                self.tmp_in[ch] = self.dry[ch][i];
+            }
+            self.sone_tr[0].push(&self.tmp_in[..nc]);
+            self.sone_tr[2].push(&self.tmp_in[..nc]);
             for ch in 0..nc {
                 self.tmp_in[ch] = self.dry[ch][i] * self.match_gain;
             }
@@ -845,6 +920,9 @@ impl Engine {
         if s.ref_spl != self.sone_wet.ref_spl {
             self.sone_wet.ref_spl = s.ref_spl;
             self.sone_dry.ref_spl = s.ref_spl;
+            for m in &mut self.sone_tr {
+                m.ref_spl = s.ref_spl;
+            }
         }
         self.pos += len;
         self.cur = *s;

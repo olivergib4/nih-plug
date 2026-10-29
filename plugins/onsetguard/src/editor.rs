@@ -13,9 +13,9 @@ use crate::presets::PRESETS;
 use crate::{Meters, OnsetGuardParams};
 
 const COLUMN_WIDTH: Units = Pixels(340.0);
-const CONTENT_WIDTH: f32 = 1020.0;
+const CONTENT_WIDTH: f32 = 1360.0;
 /// Fits a 13" MacBook (900 px tall minus the menu bar and the host's window chrome).
-const GUI_WIDTH: u32 = 1040;
+const GUI_WIDTH: u32 = 1380;
 const GUI_HEIGHT: u32 = 780;
 /// Measured: one generic-UI row is 26 px tall at our stylesheet.
 const ROW_PX: f32 = 26.0;
@@ -58,6 +58,9 @@ pub struct MeterModel {
     pub dry: String,
     pub wet: String,
     pub matched: String,
+    pub tr_full: String,
+    pub tr_laptop: String,
+    pub tr_phone: String,
     meters: Arc<Meters>,
 }
 
@@ -83,6 +86,14 @@ impl Model for MeterModel {
                 self.dry = format!("dry  {d:.1} sone · {:.0} phon", phon(d));
                 self.wet = format!("processed  {w:.1} sone · {:.0} phon", phon(w));
                 self.matched = format!("match {m:+.1} dB");
+                let t: Vec<f32> = self.meters.tr_sone.iter().map(|v| v.load(Ordering::Relaxed)).collect();
+                let row = |name: &str, dry: f32, wet: f32| {
+                    let delta = phon(wet) - phon(dry);
+                    format!("{name}: {dry:.1} → {wet:.1} sone ({delta:+.1} phon)")
+                };
+                self.tr_full = row("full", d, w);
+                self.tr_laptop = row("laptop", t[2], t[3]);
+                self.tr_phone = row("phone", t[0], t[1]);
             }
         });
     }
@@ -148,6 +159,9 @@ pub(crate) fn create(
             dry: String::from("dry"),
             wet: String::from("processed"),
             matched: String::new(),
+            tr_full: String::new(),
+            tr_laptop: String::new(),
+            tr_phone: String::new(),
             meters: meters.clone(),
         }
         .build(cx);
@@ -192,7 +206,7 @@ pub(crate) fn create(
 
             // --- analyzer ---
             HelpArea::new(cx, help::ANALYZER_HELP, |cx| {
-                Analyzer::new(cx, Data::analyzer).width(Pixels(CONTENT_WIDTH)).height(Pixels(140.0));
+                Analyzer::new(cx, Data::analyzer, Data::params).width(Pixels(CONTENT_WIDTH)).height(Pixels(140.0));
             })
             .width(Pixels(CONTENT_WIDTH))
             .height(Pixels(140.0));
@@ -244,8 +258,26 @@ pub(crate) fn create(
 
                 VStack::new(cx, |cx| {
                     group(cx, "Onset Protection", 7, |cx| params_with_help(cx, Data::params.map(|p| p.protect.clone())));
-                    group(cx, "Resolution", 4, |cx| params_with_help(cx, Data::params.map(|p| p.resolution.clone())));
+                    group(cx, "Resolution", 3, |cx| params_with_help(cx, Data::params.map(|p| p.resolution.clone())));
                     group(cx, "Output", 4, |cx| params_with_help(cx, Data::params.map(|p| p.global.clone())));
+                })
+                .width(COLUMN_WIDTH)
+                .height(Auto);
+
+                VStack::new(cx, |cx| {
+                    group(cx, "Stereo", 4, |cx| params_with_help(cx, Data::params.map(|p| p.stereo.clone())));
+                    group(cx, "Loudness Balance", 3, |cx| params_with_help(cx, Data::params.map(|p| p.balance.clone())));
+                    HelpArea::new(cx, help::TRANSLATION_HELP, |cx| {
+                        Label::new(cx, "Translation (sone, dry → processed)").font_size(12.0).height(Pixels(18.0));
+                        Label::new(cx, MeterModel::tr_full).font_size(11.0).height(Pixels(16.0));
+                        Label::new(cx, MeterModel::tr_laptop).font_size(11.0).height(Pixels(16.0));
+                        Label::new(cx, MeterModel::tr_phone).font_size(11.0).height(Pixels(16.0));
+                    })
+                    .layout_type(LayoutType::Column)
+                    .width(COLUMN_WIDTH)
+                    .height(Pixels(74.0))
+                    .top(Pixels(4.0))
+                    .left(Pixels(15.0));
                 })
                 .width(COLUMN_WIDTH)
                 .height(Auto);
@@ -264,8 +296,12 @@ pub(crate) fn create(
 /// Set every parameter: listed ones to the preset value, the rest to their defaults.
 fn apply_preset(cx: &mut EventContext, params: &OnsetGuardParams, values: &[(&str, f32)]) {
     for (id, ptr, _) in params.param_map() {
-        // never let a preset change level, bypass or the meter calibration
-        if matches!(id.as_str(), "output" | "mix" | "matched_bypass" | "ref_level") {
+        // never let a preset change level, bypass, the meter calibration, or the mix
+        // decisions (stereo, loudness balance, pre-EQ)
+        if matches!(id.as_str(), "output" | "mix" | "matched_bypass" | "ref_level" | "width_hz" | "width" | "guard")
+            || id.starts_with("balance")
+            || id.starts_with("eq")
+        {
             continue;
         }
         let normalized = match values.iter().find(|(pid, _)| *pid == id.as_str()) {

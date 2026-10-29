@@ -606,3 +606,161 @@ fn sub_protect_routing_under_onset_protection() {
     assert!(db(rows[3].2) > db(rows[2].2) + 1.0, "Protect should give the sub back the level the plain clip takes");
     assert!(db(rows[3].1) > db(rows[2].1) - 1.0, "rms should keep within 1 dB of the plain clip");
 }
+
+/// Stereo stage: Width must leave the mono sum untouched; the anti-phase guard must remove
+/// Side that is in anti-phase and leave in-phase (and merely panned) material alone.
+#[test]
+fn stereo_width_is_mono_compatible_and_guard_removes_antiphase() {
+    let len = (1.0 * SR) as usize;
+    let t = |i: usize| i as f32 / SR;
+    // 1 kHz in anti-phase (L = -R), 3 kHz panned 70% left (in phase), 150 Hz centered
+    let l: Vec<f32> = (0..len).map(|i| 0.2 * (2.0 * std::f32::consts::PI * 1000.0 * t(i)).sin() + 0.2 * (2.0 * std::f32::consts::PI * 3000.0 * t(i)).sin() + 0.2 * (2.0 * std::f32::consts::PI * 150.0 * t(i)).sin()).collect();
+    let r: Vec<f32> = (0..len).map(|i| -0.2 * (2.0 * std::f32::consts::PI * 1000.0 * t(i)).sin() + 0.06 * (2.0 * std::f32::consts::PI * 3000.0 * t(i)).sin() + 0.2 * (2.0 * std::f32::consts::PI * 150.0 * t(i)).sin()).collect();
+    let mut base = Settings::default();
+    base.dyn_.down_ratio = 1.0;
+    base.dyn_.up_ratio = 1.0;
+    base.dyn_.mono_below_hz = 0.0;
+    base.clip_on = false;
+    base.protect_on = false;
+    let seg = |v: &Vec<f32>| v[len / 2..].to_vec();
+    let mid = |a: &[f32], b: &[f32]| -> Vec<f32> { a.iter().zip(b).map(|(x, y)| (x + y) * 0.5).collect() };
+    let side = |a: &[f32], b: &[f32]| -> Vec<f32> { a.iter().zip(b).map(|(x, y)| (x - y) * 0.5).collect() };
+
+    // width +6 dB above 300 Hz: mid identical, side above 300 Hz doubled, 150 Hz side unchanged
+    let mut s = base;
+    s.stereo.width_db = 6.0;
+    s.stereo.width_hz = 300.0;
+    let out = run(&[l.clone(), r.clone()], &s);
+    let (ol, or) = (seg(&out[0]), seg(&out[1]));
+    let (il, ir) = (seg(&l), seg(&r));
+    let m_in = mid(&il, &ir);
+    let m_out = mid(&ol, &or);
+    let m_err = m_in.iter().zip(&m_out).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    let s_in = side(&il, &ir);
+    let s_out = side(&ol, &or);
+    let (s1k_in, s1k_out) = (goertzel(&s_in, SR, 1000.0), goertzel(&s_out, SR, 1000.0));
+    let (s3k_in, s3k_out) = (goertzel(&s_in, SR, 3000.0), goertzel(&s_out, SR, 3000.0));
+    println!("width +6 dB: mid max error {:.1} dB, side 1 kHz {:+.2} dB, side 3 kHz {:+.2} dB", db(m_err / 0.2), db(s1k_out / s1k_in), db(s3k_out / s3k_in));
+    assert!(db(m_err / 0.2) < -80.0, "width must not touch the mono sum");
+    assert!((db(s1k_out / s1k_in) - 6.0).abs() < 0.2 && (db(s3k_out / s3k_in) - 6.0).abs() < 0.2);
+
+    // guard 100%: 1 kHz anti-phase side removed, 3 kHz panned side kept, mid unchanged
+    let mut s = base;
+    s.stereo.guard = 1.0;
+    let out = run(&[l.clone(), r.clone()], &s);
+    let (ol, or) = (seg(&out[0]), seg(&out[1]));
+    let m_out = mid(&ol, &or);
+    let m_err = m_in.iter().zip(&m_out).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    let s_out = side(&ol, &or);
+    let (g1k, g3k) = (db(goertzel(&s_out, SR, 1000.0) / s1k_in), db(goertzel(&s_out, SR, 3000.0) / s3k_in));
+    let (l3k_in, l3k_out) = (goertzel(&il, SR, 3000.0), goertzel(&ol, SR, 3000.0));
+    println!("guard 100%: mid max error {:.1} dB, anti-phase 1 kHz side {:+.1} dB, panned 3 kHz side {:+.2} dB, left 3 kHz {:+.2} dB", db(m_err / 0.2), g1k, g3k, db(l3k_out / l3k_in));
+    assert!(db(m_err / 0.2) < -80.0, "guard must not touch the mono sum");
+    assert!(g1k < -40.0, "anti-phase side should be removed");
+    assert!(g3k.abs() < 0.2 && db(l3k_out / l3k_in).abs() < 0.2, "panned in-phase material must be untouched");
+}
+
+/// Loudness Balance: on a dull (-9 dB/oct) noise the specific-loudness spread across Bark
+/// bands must shrink, gains must stay within Balance Range, overall level must not change by
+/// more than the range allows, and the output must stay sample-aligned (zero-phase).
+#[test]
+fn loudness_balance_flattens_specific_loudness_within_range() {
+    use onsetguard::dsp::sone::{SoneMeter, BANDS};
+    let len = (8.0 * SR) as usize;
+    // dull noise: white noise through a one-pole lowpass (about -6 dB/oct above 200 Hz), twice
+    let mut st = 12345u32;
+    let mut y1 = 0.0f32;
+    let mut y2 = 0.0f32;
+    let a = (-2.0 * std::f32::consts::PI * 200.0 / SR).exp();
+    let x: Vec<f32> = (0..len)
+        .map(|_| {
+            st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+            let w = (st as f32 / u32::MAX as f32) * 2.0 - 1.0;
+            y1 = w * (1.0 - a) + y1 * a;
+            y2 = y1 * (1.0 - a) + y2 * a;
+            y2 * 3.0
+        })
+        .collect();
+    let mut s = Settings::default();
+    s.dyn_.down_ratio = 1.0;
+    s.dyn_.up_ratio = 1.0;
+    s.dyn_.mono_below_hz = 0.0;
+    s.clip_on = false;
+    s.protect_on = false;
+    s.balance.strength = 1.0;
+    s.balance.speed_s = 1.0;
+    s.balance.range_db = 6.0;
+    let out = run(&[x.clone()], &s);
+    let spread = |v: &[f32]| -> (f32, f32) {
+        let mut m = SoneMeter::new(SR, 1, 100.0);
+        for &smp in &v[v.len() - (2.0 * SR) as usize..] {
+            m.push(&[smp]);
+        }
+        let n: Vec<f32> = (0..BANDS).filter(|&b| b <= 22 && m.specific[b] > 0.3).map(|b| m.specific[b].ln()).collect();
+        let mean = n.iter().sum::<f32>() / n.len() as f32;
+        let sd = (n.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n.len() as f32).sqrt();
+        (sd, m.sone)
+    };
+    let (sd_in, sone_in) = spread(&x);
+    let (sd_out, sone_out) = spread(&out[0]);
+    {
+        let bands = |v: &[f32]| -> Vec<f32> {
+            let mut m = SoneMeter::new(SR, 1, 100.0);
+            for &smp in &v[v.len() - (2.0 * SR) as usize..] { m.push(&[smp]); }
+            m.specific.to_vec()
+        };
+        let (bi, bo) = (bands(&x), bands(&out[0]));
+        for b in 0..BANDS { print!("{b}:{:.2}/{:.2} ", bi[b], bo[b]); }
+        println!();
+    }
+    let rms = |v: &[f32]| (v[v.len() / 2..].iter().map(|a| a * a).sum::<f32>() / (v.len() / 2) as f32).sqrt();
+    println!(
+        "balance: specific-loudness spread (ln sd) {:.2} -> {:.2}, sones {:.1} -> {:.1}, rms {:+.2} dB, lag {}",
+        sd_in, sd_out, sone_in, sone_out, db(rms(&out[0]) / rms(&x)), best_lag(&x[len / 2..], &out[0][len / 2..])
+    );
+    assert!(sd_out < sd_in, "balance should flatten specific loudness");
+    assert!(sone_out > sone_in * 1.05, "flatter specific loudness at equal energy should read louder");
+    assert!(db(rms(&out[0]) / rms(&x)).abs() < 1.0, "balance is energy-preserving");
+    assert_eq!(best_lag(&x[len / 2..], &out[0][len / 2..]), 0, "balance must be zero-phase");
+}
+
+/// Pre-EQ: the measured response of the whole plugin (dynamics and clip off) must match the
+/// biquad design, and the EQ must be shared by the dry path (Mix 0% is also EQ'd).
+#[test]
+fn pre_eq_matches_its_design_and_feeds_both_paths() {
+    let len = (1.0 * SR) as usize;
+    let tones = [30.0f32, 80.0, 200.0, 400.0, 1000.0, 2500.0, 6000.0, 10000.0, 20000.0];
+    let x: Vec<f32> = (0..len)
+        .map(|i| {
+            let t = i as f32 / SR;
+            tones.iter().map(|f| 0.05 * (2.0 * std::f32::consts::PI * f * t).sin()).sum()
+        })
+        .collect();
+    let mut s = Settings::default();
+    s.dyn_.down_ratio = 1.0;
+    s.dyn_.up_ratio = 1.0;
+    s.dyn_.mono_below_hz = 0.0;
+    s.clip_on = false;
+    s.protect_on = false;
+    s.eq.freq_hz = [80.0, 400.0, 2500.0, 10000.0];
+    s.eq.gain_db = [4.0, -6.0, 3.0, 5.0];
+    for mix in [1.0f32, 0.0] {
+        s.mix = mix;
+        let out = run(&[x.clone()], &s);
+        let seg_in = &x[len / 2..];
+        let seg_out = &out[0][len / 2..];
+        let mut line = format!("pre-eq (mix {:.0}%):", mix * 100.0);
+        for f in tones {
+            let g = db(goertzel(seg_out, SR, f) / goertzel(seg_in, SR, f));
+            line += &format!(" {f:.0}Hz {g:+.1}");
+            // expected: shelves reach their gain well past the corner, bells peak at centre
+            let expect = match f as u32 {
+                30 => Some(4.0), 400 => Some(-6.0), 2500 => Some(3.0), 20000 => Some(5.0), _ => None,
+            };
+            if let Some(e) = expect {
+                assert!((g - e).abs() < 0.7, "{f} Hz: got {g:+.1} dB, designed {e:+.1}");
+            }
+        }
+        println!("{line}");
+    }
+}

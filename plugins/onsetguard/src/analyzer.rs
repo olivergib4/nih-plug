@@ -2,8 +2,12 @@
 //! per-frequency gain applied by the two spectral dynamics stages. Data is sampled on a fixed
 //! log-frequency grid so both resolutions draw as one curve.
 
+use crate::dsp::eq::{EqSettings, PreEq, NODES};
+use crate::OnsetGuardParams;
+use nih_plug::prelude::Param;
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::vizia::vg;
+use nih_plug_vizia::widgets::RawParamEvent;
 use std::sync::{Arc, Mutex};
 
 pub const GRID: usize = 320;
@@ -36,20 +40,86 @@ const GAIN_DOWN_COLOR: vg::Color = vg::Color::rgbaf(0.30, 0.65, 1.0, 0.75);
 const GAIN_UP_COLOR: vg::Color = vg::Color::rgbaf(0.35, 0.85, 0.55, 0.75);
 const PROTECT_COLOR: vg::Color = vg::Color::rgbaf(1.0, 0.85, 0.3, 0.9);
 const GRID_COLOR: vg::Color = vg::Color::rgbaf(0.5, 0.5, 0.5, 0.35);
+const EQ_COLOR: vg::Color = vg::Color::rgbaf(0.80, 0.55, 1.0, 0.95);
+const EQ_FILL: vg::Color = vg::Color::rgbaf(0.80, 0.55, 1.0, 0.12);
+/// The pre-EQ curve is drawn around the vertical middle: +-EQ_SPAN_DB spans the full height.
+const EQ_SPAN_DB: f32 = 15.0;
+const NODE_RADIUS: f32 = 6.0;
+const EQ_SR: f32 = 48000.0;
 
 const DB_TOP: f32 = 12.0;
 const DB_BOTTOM: f32 = -84.0;
 
 pub struct Analyzer {
     data: Arc<Mutex<triple_buffer::Output<AnalyzerData>>>,
+    params: Arc<OnsetGuardParams>,
+    /// Node being dragged, if any.
+    drag: Option<usize>,
+    /// Node under the cursor (for highlighting).
+    hover: Option<usize>,
 }
 
 impl Analyzer {
-    pub fn new<L>(cx: &mut Context, data: L) -> Handle<'_, Self>
+    pub fn new<L, P>(cx: &mut Context, data: L, params: P) -> Handle<'_, Self>
     where
         L: Lens<Target = Arc<Mutex<triple_buffer::Output<AnalyzerData>>>>,
+        P: Lens<Target = Arc<OnsetGuardParams>>,
     {
-        Self { data: data.get(cx) }.build(cx, |_| ())
+        Self { data: data.get(cx), params: params.get(cx), drag: None, hover: None }.build(cx, |_| ())
+    }
+
+    fn eq_settings(&self) -> EqSettings {
+        let mut s = EqSettings::default();
+        for n in 0..NODES {
+            s.freq_hz[n] = self.params.eq.freq(n).value();
+            s.gain_db[n] = self.params.eq.gain(n).value();
+        }
+        s
+    }
+
+    /// Node positions in the view's coordinate frame.
+    fn node_xy(&self, b: &BoundingBox) -> [(f32, f32); NODES] {
+        let mut out = [(0.0, 0.0); NODES];
+        for (n, o) in out.iter_mut().enumerate() {
+            let f = self.params.eq.freq(n).value().clamp(F_LO, F_HI);
+            let g = self.params.eq.gain(n).value();
+            let tx = (f.ln() - F_LO.ln()) / (F_HI.ln() - F_LO.ln());
+            *o = (b.x + b.w * tx, b.y + b.h * (0.5 - g / (2.0 * EQ_SPAN_DB)));
+        }
+        out
+    }
+
+    fn node_at(&self, b: &BoundingBox, x: f32, y: f32) -> Option<usize> {
+        let pts = self.node_xy(b);
+        let mut best = None;
+        let mut best_d = (NODE_RADIUS * 2.5).powi(2);
+        for (n, (px, py)) in pts.iter().enumerate() {
+            let d = (px - x).powi(2) + (py - y).powi(2);
+            if d < best_d {
+                best_d = d;
+                best = Some(n);
+            }
+        }
+        best
+    }
+
+    fn set(&self, cx: &mut EventContext, n: usize, freq: Option<f32>, gain: Option<f32>) {
+        if let Some(f) = freq {
+            let p = self.params.eq.freq(n);
+            let ptr = p.as_ptr();
+            let norm = p.preview_normalized(f.clamp(20.0, 20000.0));
+            cx.emit(RawParamEvent::BeginSetParameter(ptr));
+            cx.emit(RawParamEvent::SetParameterNormalized(ptr, norm));
+            cx.emit(RawParamEvent::EndSetParameter(ptr));
+        }
+        if let Some(g) = gain {
+            let p = self.params.eq.gain(n);
+            let ptr = p.as_ptr();
+            let norm = p.preview_normalized(g.clamp(-12.0, 12.0));
+            cx.emit(RawParamEvent::BeginSetParameter(ptr));
+            cx.emit(RawParamEvent::SetParameterNormalized(ptr, norm));
+            cx.emit(RawParamEvent::EndSetParameter(ptr));
+        }
     }
 }
 
@@ -61,6 +131,53 @@ fn db_t(db: f32) -> f32 {
 impl View for Analyzer {
     fn element(&self) -> Option<&'static str> {
         Some("analyzer")
+    }
+
+    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        let b = cx.bounds();
+        event.map(|window_event, meta| match window_event {
+            WindowEvent::MouseMove(x, y) => {
+                if let Some(n) = self.drag {
+                    let tx = ((x - b.x) / b.w.max(1.0)).clamp(0.0, 1.0);
+                    let f = (F_LO.ln() + tx * (F_HI.ln() - F_LO.ln())).exp();
+                    let g = (0.5 - (y - b.y) / b.h.max(1.0)) * 2.0 * EQ_SPAN_DB;
+                    self.set(cx, n, Some(f), Some(g));
+                    cx.needs_redraw();
+                } else {
+                    let h = self.node_at(&b, *x, *y);
+                    if h != self.hover {
+                        self.hover = h;
+                        cx.needs_redraw();
+                    }
+                }
+            }
+            WindowEvent::MouseDown(MouseButton::Left) => {
+                let (x, y) = (cx.mouse().left.pos_down.0, cx.mouse().left.pos_down.1);
+                if let Some(n) = self.node_at(&b, x, y) {
+                    self.drag = Some(n);
+                    cx.capture();
+                    cx.focus_with_visibility(false);
+                    meta.consume();
+                }
+            }
+            WindowEvent::MouseUp(MouseButton::Left) => {
+                if self.drag.take().is_some() {
+                    cx.release();
+                    cx.needs_redraw();
+                }
+            }
+            WindowEvent::MouseDoubleClick(MouseButton::Left) => {
+                let (x, y) = (cx.mouse().left.pos_down.0, cx.mouse().left.pos_down.1);
+                if let Some(n) = self.node_at(&b, x, y) {
+                    self.set(cx, n, None, Some(0.0));
+                    self.drag = None;
+                    cx.release();
+                    cx.needs_redraw();
+                    meta.consume();
+                }
+            }
+            _ => {}
+        });
     }
 
     fn draw(&self, cx: &mut DrawContext, canvas: &mut Canvas) {
@@ -139,6 +256,45 @@ impl View for Analyzer {
         canvas.scissor(b.x, b.y, b.w, b.h);
         canvas.stroke_path(&thr, &vg::Paint::color(THRESHOLD_COLOR).with_line_width(2.0));
         canvas.reset_scissor();
+
+        // pre-EQ curve and nodes (around the vertical middle; +-EQ_SPAN_DB spans the height)
+        {
+            let settings = self.eq_settings();
+            let mut eq = PreEq::new(EQ_SR, 1);
+            eq.update(&settings);
+            let mid = b.y + b.h * 0.5;
+            let y_eq = |g: f32| mid - g / (2.0 * EQ_SPAN_DB) * b.h;
+            let mut curve = vg::Path::new();
+            let mut fill = vg::Path::new();
+            fill.move_to(b.x, mid);
+            for i in 0..GRID {
+                let t = i as f32 / (GRID - 1) as f32;
+                let f = (F_LO.ln() + t * (F_HI.ln() - F_LO.ln())).exp();
+                let g = 20.0 * eq.magnitude_at(f).max(1e-6).log10();
+                let (x, y) = (x_of(i), y_eq(g));
+                if i == 0 {
+                    curve.move_to(x, y);
+                } else {
+                    curve.line_to(x, y);
+                }
+                fill.line_to(x, y);
+            }
+            fill.line_to(b.x + b.w, mid);
+            fill.close();
+            canvas.scissor(b.x, b.y, b.w, b.h);
+            if eq.active() {
+                canvas.fill_path(&fill, &vg::Paint::color(EQ_FILL));
+            }
+            canvas.stroke_path(&curve, &vg::Paint::color(EQ_COLOR).with_line_width(1.5));
+            for (n, (px, py)) in self.node_xy(&b).iter().enumerate() {
+                let lit = self.drag == Some(n) || self.hover == Some(n);
+                let mut dot = vg::Path::new();
+                dot.circle(*px, *py, if lit { NODE_RADIUS + 1.5 } else { NODE_RADIUS });
+                canvas.fill_path(&dot, &vg::Paint::color(if lit { vg::Color::rgbaf(1.0, 1.0, 1.0, 0.95) } else { EQ_COLOR }));
+                canvas.stroke_path(&dot, &vg::Paint::color(vg::Color::rgbaf(0.08, 0.08, 0.09, 1.0)).with_line_width(1.5));
+            }
+            canvas.reset_scissor();
+        }
 
         // protection indicator: a bar along the top edge while a hit is being guarded
         if data.protect > 0.01 {

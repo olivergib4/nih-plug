@@ -37,6 +37,11 @@ pub struct DynamicsSettings {
     /// Bins more than this far below the threshold get no upward boost (fading out over the
     /// next 12 dB), so the noise floor is not lifted along with the body.
     pub up_depth_db: f32,
+    /// Upward Zone: per-frequency amount (0..1) of upward boost, as 4 nodes (Hz, amount)
+    /// interpolated on a log-frequency axis; below the first / above the last node the
+    /// nearest node's amount holds. All at 1 = the zone does nothing.
+    pub up_zone_hz: [f32; 4],
+    pub up_zone_amt: [f32; 4],
     pub attack_ms: f32,
     pub release_ms: f32,
     pub smooth_oct: f32,
@@ -55,6 +60,8 @@ pub struct Dynamics {
     cached: Option<DynamicsSettings>,
 
     thresholds_db: Vec<f32>,
+    /// Upward Zone amount per bin (0..1).
+    up_zone: Vec<f32>,
     band_weight: Vec<f32>,
     /// Detector weight per bin (linear), from `weighting`.
     det_weight: Vec<f32>,
@@ -90,6 +97,7 @@ impl Dynamics {
             num_bins: 0,
             cached: None,
             thresholds_db: vec![0.0; nb],
+            up_zone: vec![1.0; nb],
             band_weight: vec![0.0; nb],
             det_weight: vec![1.0; nb],
             mono_weight: vec![0.0; nb],
@@ -144,6 +152,7 @@ impl Dynamics {
             }
             self.band_weight[k] = w;
             self.det_weight[k] = lin(weighting_db(s.weighting, self.sample_rate, f));
+            self.up_zone[k] = zone_amount(&s.up_zone_hz, &s.up_zone_amt, f);
             // mono-below: full below mono_hz, crossfade over one octave above it
             self.mono_weight[k] = if mono <= 0.0 {
                 0.0
@@ -182,6 +191,8 @@ impl Dynamics {
                     || c.crossover_hz != s.crossover_hz
                     || c.mono_below_hz != s.mono_below_hz
                     || c.weighting != s.weighting
+                    || c.up_zone_hz != s.up_zone_hz
+                    || c.up_zone_amt != s.up_zone_amt
             }
         };
         if needs {
@@ -250,7 +261,7 @@ impl Dynamics {
                         let under = -over;
                         // fade the boost out below the depth so the floor is left alone
                         let fade = ((under - s.up_depth_db.max(0.0)) / UP_FADE_DB).clamp(0.0, 1.0);
-                        g = under.min(s.up_range_db) * up_k * (1.0 - fade);
+                        g = under.min(s.up_range_db) * up_k * (1.0 - fade) * self.up_zone[k];
                     }
                 }
                 self.gain_db[k] = g * self.band_weight[k];
@@ -332,4 +343,24 @@ pub fn weighting_db(w: Weighting, sr: f32, f: f32) -> f32 {
             -needed
         }
     }
+}
+
+/// Upward Zone amount at `f` Hz: nodes sorted by frequency, linear interpolation of the
+/// amount on a log-frequency axis, clamped to the end nodes outside their range.
+pub fn zone_amount(hz: &[f32; 4], amt: &[f32; 4], f: f32) -> f32 {
+    let mut nodes: [(f32, f32); 4] = [(hz[0], amt[0]), (hz[1], amt[1]), (hz[2], amt[2]), (hz[3], amt[3])];
+    nodes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let lf = f.max(1.0).ln();
+    if lf <= nodes[0].0.max(1.0).ln() {
+        return nodes[0].1.clamp(0.0, 1.0);
+    }
+    for w in nodes.windows(2) {
+        let (f0, a0) = (w[0].0.max(1.0).ln(), w[0].1);
+        let (f1, a1) = (w[1].0.max(1.0).ln(), w[1].1);
+        if lf <= f1 {
+            let t = if f1 > f0 { (lf - f0) / (f1 - f0) } else { 1.0 };
+            return (a0 + (a1 - a0) * t).clamp(0.0, 1.0);
+        }
+    }
+    nodes[3].1.clamp(0.0, 1.0)
 }

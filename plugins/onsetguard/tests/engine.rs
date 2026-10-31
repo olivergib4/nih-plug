@@ -873,3 +873,43 @@ fn upward_depth_lifts_the_body_but_not_the_floor() {
     assert!(rows[0].1 < 1.0, "with 24 dB depth the floor (50 dB under) must not be lifted");
     assert!(rows[1].1 > 4.0, "with 60 dB depth the floor is lifted (the old behaviour)");
 }
+
+/// Upward Zone: with the zone at 0% around 300 Hz and 100% around 3 kHz, only the 3 kHz tone
+/// is lifted by the upward compressor; both are 6 dB under the threshold.
+#[test]
+fn upward_zone_selects_where_the_lift_happens() {
+    let len = (2.0 * SR) as usize;
+    let x: Vec<f32> = (0..len)
+        .map(|i| {
+            let t = i as f32 / SR;
+            0.0316 * (2.0 * std::f32::consts::PI * 300.0 * t).sin() + 0.0316 * (2.0 * std::f32::consts::PI * 3000.0 * t).sin()
+        })
+        .collect();
+    let mut s = Settings::default();
+    s.protect_on = false;
+    s.clip_on = false;
+    s.dyn_.mono_below_hz = 0.0;
+    s.dyn_.weighting = onsetguard::dsp::dynamics::Weighting::Off;
+    s.dyn_.threshold_db = -24.0;
+    s.dyn_.slope_db_oct = 0.0;
+    s.dyn_.curve_db_oct2 = 0.0;
+    s.dyn_.down_ratio = 1.0;
+    s.dyn_.up_ratio = 3.0;
+    s.dyn_.up_range_db = 12.0;
+    s.dyn_.smooth_oct = 0.0;
+    let t300_in = db(goertzel(&x[len / 2..], SR, 300.0));
+    let t3k_in = db(goertzel(&x[len / 2..], SR, 3000.0));
+    let mut rows = Vec::new();
+    for zone in [[1.0f32, 1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]] {
+        s.dyn_.up_zone_hz = [100.0, 600.0, 1500.0, 8000.0];
+        s.dyn_.up_zone_amt = zone;
+        let out = run(&[x.clone()], &s);
+        let g300 = db(goertzel(&out[0][len / 2..], SR, 300.0)) - t300_in;
+        let g3k = db(goertzel(&out[0][len / 2..], SR, 3000.0)) - t3k_in;
+        println!("upward zone {zone:?}: 300 Hz {g300:+.1} dB, 3 kHz {g3k:+.1} dB");
+        rows.push((g300, g3k));
+    }
+    assert!(rows[0].0 > 3.0 && rows[0].1 > 3.0, "all at 100%: both lifted");
+    assert!(rows[1].0.abs() < 0.5, "zone 0% around 300 Hz: not lifted");
+    assert!((rows[1].1 - rows[0].1).abs() < 0.5, "zone 100% around 3 kHz: lifted as before");
+}

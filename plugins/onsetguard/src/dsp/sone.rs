@@ -63,6 +63,9 @@ pub struct SoneMeter {
     pub specific: [f32; BANDS],
     /// Smoothed total loudness in sones.
     pub sone: f32,
+    /// Smoothed spectral flatness (Wiener entropy) over 100 Hz..16 kHz: 0 = pure tones,
+    /// 1 = white noise. A "noise-likeness" readout.
+    pub flatness: f32,
     /// 0 dBFS full-scale sine → this SPL.
     pub ref_spl: f32,
     /// Window power normalisation: a full-scale sine → 1.0 power.
@@ -103,6 +106,7 @@ impl SoneMeter {
             band_power: [0.0; BANDS],
             specific: [0.0; BANDS],
             sone: 0.0,
+            flatness: 0.0,
             ref_spl,
             norm: (2.0 / wsum) * (2.0 / wsum) / 2.0, // |X|^2 scale so a full-scale sine → 0.5 (RMS^2)
             lo_bin: 1,
@@ -125,6 +129,7 @@ impl SoneMeter {
         self.since = 0;
         self.specific = [0.0; BANDS];
         self.sone = 0.0;
+        self.flatness = 0.0;
     }
 
     /// Push one multi-channel sample. Loudness is updated every HOP samples.
@@ -145,6 +150,7 @@ impl SoneMeter {
     fn analyze(&mut self) {
         self.band_power = [0.0; BANDS];
         let start = self.pos; // ring index (pos + i) % WIN == sample (pos - WIN + i)
+        let mut flat_sum = 0.0f32;
         for ch in 0..self.num_channels {
             for i in 0..WIN {
                 self.time_buf[i] = self.ring[ch][(start + i) % WIN] * self.window[i];
@@ -155,6 +161,24 @@ impl SoneMeter {
             for k in self.lo_bin..self.hi_bin {
                 let p = self.spec[k].norm_sqr() * self.norm;
                 self.band_power[self.bin_band[k]] += p;
+            }
+            // spectral flatness over 100 Hz..16 kHz (geometric / arithmetic mean of power)
+            let per_bin = self.sample_rate / WIN as f32;
+            let (k0, k1) = (((100.0 / per_bin) as usize).max(1), ((16000.0 / per_bin) as usize).min(NB - 1));
+            let (mut lg, mut ar) = (0.0f64, 0.0f64);
+            for k in k0..k1 {
+                let p = (self.spec[k].norm_sqr() * self.norm).max(1e-20) as f64;
+                lg += p.ln();
+                ar += p;
+            }
+            let n = (k1 - k0).max(1) as f64;
+            flat_sum += ((lg / n).exp() / (ar / n).max(1e-30)) as f32;
+        }
+        {
+            let f = flat_sum / self.num_channels as f32;
+            // only meaningful when there is signal; hold the last value in silence
+            if self.band_power.iter().sum::<f32>() > 1e-9 {
+                self.flatness += (f - self.flatness) * 0.2;
             }
         }
         // average over channels (a stereo signal of two identical channels is one source)

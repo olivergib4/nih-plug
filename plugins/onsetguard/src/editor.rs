@@ -102,6 +102,7 @@ pub struct MeterModel {
     pub tr_full: String,
     pub tr_laptop: String,
     pub tr_phone: String,
+    pub tr_flat: String,
     meters: Arc<Meters>,
 }
 
@@ -135,6 +136,8 @@ impl Model for MeterModel {
                 self.tr_full = row("full", d, w);
                 self.tr_laptop = row("laptop", t[2], t[3]);
                 self.tr_phone = row("phone", t[0], t[1]);
+                let (fd, fw) = (self.meters.flat_dry.load(Ordering::Relaxed), self.meters.flat_wet.load(Ordering::Relaxed));
+                self.tr_flat = format!("noise-likeness: {:.0}% → {:.0}%  (0 = tones, 100 = white noise)", fd * 100.0, fw * 100.0);
             }
         });
     }
@@ -204,6 +207,7 @@ pub(crate) fn create(
             tr_full: String::new(),
             tr_laptop: String::new(),
             tr_phone: String::new(),
+            tr_flat: String::new(),
             meters: meters.clone(),
         }
         .build(cx);
@@ -328,10 +332,11 @@ pub(crate) fn create(
                             Label::new(cx, MeterModel::tr_full).font_size(11.0).height(Pixels(16.0));
                             Label::new(cx, MeterModel::tr_laptop).font_size(11.0).height(Pixels(16.0));
                             Label::new(cx, MeterModel::tr_phone).font_size(11.0).height(Pixels(16.0));
+                            Label::new(cx, MeterModel::tr_flat).font_size(11.0).height(Pixels(16.0)).top(Pixels(4.0));
                         })
                         .layout_type(LayoutType::Column)
                         .width(COLUMN_WIDTH)
-                        .height(Pixels(74.0))
+                        .height(Pixels(94.0))
                         .top(Pixels(4.0))
                         .left(Pixels(15.0));
                     })
@@ -358,6 +363,7 @@ fn apply_preset(cx: &mut EventContext, params: &OnsetGuardParams, values: &[(&st
         if matches!(id.as_str(), "output" | "mix" | "matched_bypass" | "ref_level" | "width_hz" | "width" | "guard")
             || id.starts_with("balance")
             || id.starts_with("eq")
+            || id.starts_with("uz")
         {
             continue;
         }

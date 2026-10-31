@@ -55,6 +55,9 @@ pub struct Meters {
     pub wet_sone: AtomicF32,
     /// Translation readouts: phone dry/processed, laptop dry/processed.
     pub tr_sone: [AtomicF32; 4],
+    /// Spectral flatness: dry, processed.
+    pub flat_dry: AtomicF32,
+    pub flat_wet: AtomicF32,
     /// Current matched-bypass gain, dB.
     pub match_db: AtomicF32,
 }
@@ -68,6 +71,8 @@ impl Default for Meters {
             dry_sone: AtomicF32::new(0.0),
             wet_sone: AtomicF32::new(0.0),
             tr_sone: [AtomicF32::new(0.0), AtomicF32::new(0.0), AtomicF32::new(0.0), AtomicF32::new(0.0)],
+            flat_dry: AtomicF32::new(0.0),
+            flat_wet: AtomicF32::new(0.0),
             match_db: AtomicF32::new(0.0),
         }
     }
@@ -141,6 +146,38 @@ pub struct OnsetGuardParams {
     pub balance: Arc<BalanceParams>,
     #[nested(group = "Pre EQ")]
     pub eq: Arc<EqParams>,
+    #[nested(group = "Upward Zone")]
+    pub zone: Arc<ZoneParams>,
+}
+
+/// Four nodes drawn on the analyzer: where (and how much) the upward compressor may lift.
+#[derive(Params)]
+pub struct ZoneParams {
+    #[id = "uz1_hz"]
+    pub f1: FloatParam,
+    #[id = "uz1_amt"]
+    pub a1: FloatParam,
+    #[id = "uz2_hz"]
+    pub f2: FloatParam,
+    #[id = "uz2_amt"]
+    pub a2: FloatParam,
+    #[id = "uz3_hz"]
+    pub f3: FloatParam,
+    #[id = "uz3_amt"]
+    pub a3: FloatParam,
+    #[id = "uz4_hz"]
+    pub f4: FloatParam,
+    #[id = "uz4_amt"]
+    pub a4: FloatParam,
+}
+
+impl ZoneParams {
+    pub fn freq(&self, n: usize) -> &FloatParam {
+        [&self.f1, &self.f2, &self.f3, &self.f4][n]
+    }
+    pub fn amount(&self, n: usize) -> &FloatParam {
+        [&self.a1, &self.a2, &self.a3, &self.a4][n]
+    }
 }
 
 /// Four nodes drawn on the analyzer: low shelf, two bells (one octave wide), high shelf.
@@ -437,6 +474,16 @@ impl Default for OnsetGuardParams {
             f4: eq_hz_param("EQ High Shelf Freq", d.eq.freq_hz[3]),
             g4: db_param("EQ High Shelf Gain", d.eq.gain_db[3], -12.0, 12.0),
             }),
+            zone: Arc::new(ZoneParams {
+            f1: eq_hz_param("Upward Zone 1 Freq", d.dyn_.up_zone_hz[0]),
+            a1: pct_param("Upward Zone 1 Amount", d.dyn_.up_zone_amt[0]),
+            f2: eq_hz_param("Upward Zone 2 Freq", d.dyn_.up_zone_hz[1]),
+            a2: pct_param("Upward Zone 2 Amount", d.dyn_.up_zone_amt[1]),
+            f3: eq_hz_param("Upward Zone 3 Freq", d.dyn_.up_zone_hz[2]),
+            a3: pct_param("Upward Zone 3 Amount", d.dyn_.up_zone_amt[2]),
+            f4: eq_hz_param("Upward Zone 4 Freq", d.dyn_.up_zone_hz[3]),
+            a4: pct_param("Upward Zone 4 Amount", d.dyn_.up_zone_amt[3]),
+            }),
             threshold: Arc::new(ThresholdParams {
             weighting: EnumParam::new("Detector Weighting", DetectorWeighting::Off),
             threshold_db: db_param("Threshold", d.dyn_.threshold_db, -80.0, 0.0),
@@ -585,6 +632,10 @@ impl OnsetGuardParams {
         for n in 0..dsp::eq::NODES {
             s.eq.freq_hz[n] = self.eq.freq(n).value();
             s.eq.gain_db[n] = self.eq.gain(n).value();
+        }
+        for n in 0..4 {
+            s.dyn_.up_zone_hz[n] = self.zone.freq(n).value();
+            s.dyn_.up_zone_amt[n] = self.zone.amount(n).value();
         }
         s.long_order = self.resolution.long_order.value() as usize;
         s.short_order = self.resolution.short_order.value() as usize;
@@ -735,6 +786,9 @@ impl Plugin for OnsetGuard {
             for (m, v) in self.meters.tr_sone.iter().zip(engine.translation_sones()) {
                 m.store(v, Ordering::Relaxed);
             }
+            let (fd, fw) = engine.flatness();
+            self.meters.flat_dry.store(fd, Ordering::Relaxed);
+            self.meters.flat_wet.store(fw, Ordering::Relaxed);
             self.meters.match_db.store(20.0 * match_gain.max(1e-4).log10(), Ordering::Relaxed);
             self.meters.gr_post_db.store(gr_post, Ordering::Relaxed);
             self.meters.dry_lufs.store(dry, Ordering::Relaxed);

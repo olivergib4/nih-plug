@@ -2,6 +2,7 @@
 //! per-frequency gain applied by the two spectral dynamics stages. Data is sampled on a fixed
 //! log-frequency grid so both resolutions draw as one curve.
 
+use crate::dsp::dynamics::zone_amount;
 use crate::dsp::eq::{EqSettings, PreEq, NODES};
 use crate::OnsetGuardParams;
 use nih_plug::prelude::Param;
@@ -45,6 +46,19 @@ const EQ_FILL: vg::Color = vg::Color::rgbaf(0.80, 0.55, 1.0, 0.12);
 /// The pre-EQ curve is drawn around the vertical middle: +-EQ_SPAN_DB spans the full height.
 const EQ_SPAN_DB: f32 = 15.0;
 const NODE_RADIUS: f32 = 6.0;
+const ZONE_COLOR: vg::Color = vg::Color::rgbaf(0.35, 0.85, 0.55, 0.95);
+const ZONE_FILL: vg::Color = vg::Color::rgbaf(0.35, 0.85, 0.55, 0.08);
+/// The zone's 100%..0% maps to this vertical band of the view (fraction of height).
+const ZONE_TOP: f32 = 0.07;
+const ZONE_BOTTOM: f32 = 0.93;
+#[inline]
+fn zone_ty(amount: f32) -> f32 {
+    ZONE_TOP + (1.0 - amount) * (ZONE_BOTTOM - ZONE_TOP)
+}
+#[inline]
+fn zone_amount_of_ty(ty: f32) -> f32 {
+    (1.0 - (ty - ZONE_TOP) / (ZONE_BOTTOM - ZONE_TOP)).clamp(0.0, 1.0)
+}
 const EQ_SR: f32 = 48000.0;
 
 const DB_TOP: f32 = 12.0;
@@ -77,14 +91,20 @@ impl Analyzer {
         s
     }
 
-    /// Node positions in the view's coordinate frame.
-    fn node_xy(&self, b: &BoundingBox) -> [(f32, f32); NODES] {
-        let mut out = [(0.0, 0.0); NODES];
+    /// Node positions in the view's coordinate frame: EQ nodes 0..4, Upward Zone nodes 4..8.
+    fn node_xy(&self, b: &BoundingBox) -> [(f32, f32); 2 * NODES] {
+        let mut out = [(0.0, 0.0); 2 * NODES];
         for (n, o) in out.iter_mut().enumerate() {
-            let f = self.params.eq.freq(n).value().clamp(F_LO, F_HI);
-            let g = self.params.eq.gain(n).value();
+            let (f, ty) = if n < NODES {
+                let g = self.params.eq.gain(n).value();
+                (self.params.eq.freq(n).value(), 0.5 - g / (2.0 * EQ_SPAN_DB))
+            } else {
+                let a = self.params.zone.amount(n - NODES).value();
+                (self.params.zone.freq(n - NODES).value(), zone_ty(a))
+            };
+            let f = f.clamp(F_LO, F_HI);
             let tx = (f.ln() - F_LO.ln()) / (F_HI.ln() - F_LO.ln());
-            *o = (b.x + b.w * tx, b.y + b.h * (0.5 - g / (2.0 * EQ_SPAN_DB)));
+            *o = (b.x + b.w * tx, b.y + b.h * ty);
         }
         out
     }
@@ -103,22 +123,36 @@ impl Analyzer {
         best
     }
 
-    fn set(&self, cx: &mut EventContext, n: usize, freq: Option<f32>, gain: Option<f32>) {
-        if let Some(f) = freq {
-            let p = self.params.eq.freq(n);
+    /// Set a node from a view position (`ty` = 0 top .. 1 bottom); `reset` resets the vertical.
+    fn set(&self, cx: &mut EventContext, n: usize, freq: Option<f32>, ty: Option<f32>, reset: bool) {
+        let emit = |cx: &mut EventContext, p: &nih_plug::prelude::FloatParam, plain: f32| {
             let ptr = p.as_ptr();
-            let norm = p.preview_normalized(f.clamp(20.0, 20000.0));
+            let norm = p.preview_normalized(plain);
             cx.emit(RawParamEvent::BeginSetParameter(ptr));
             cx.emit(RawParamEvent::SetParameterNormalized(ptr, norm));
             cx.emit(RawParamEvent::EndSetParameter(ptr));
-        }
-        if let Some(g) = gain {
-            let p = self.params.eq.gain(n);
-            let ptr = p.as_ptr();
-            let norm = p.preview_normalized(g.clamp(-12.0, 12.0));
-            cx.emit(RawParamEvent::BeginSetParameter(ptr));
-            cx.emit(RawParamEvent::SetParameterNormalized(ptr, norm));
-            cx.emit(RawParamEvent::EndSetParameter(ptr));
+        };
+        if n < NODES {
+            if let Some(f) = freq {
+                emit(cx, self.params.eq.freq(n), f.clamp(20.0, 20000.0));
+            }
+            if let Some(t) = ty {
+                emit(cx, self.params.eq.gain(n), ((0.5 - t) * 2.0 * EQ_SPAN_DB).clamp(-12.0, 12.0));
+            }
+            if reset {
+                emit(cx, self.params.eq.gain(n), 0.0);
+            }
+        } else {
+            let m = n - NODES;
+            if let Some(f) = freq {
+                emit(cx, self.params.zone.freq(m), f.clamp(20.0, 20000.0));
+            }
+            if let Some(t) = ty {
+                emit(cx, self.params.zone.amount(m), zone_amount_of_ty(t));
+            }
+            if reset {
+                emit(cx, self.params.zone.amount(m), 1.0);
+            }
         }
     }
 }
@@ -146,8 +180,8 @@ impl View for Analyzer {
                 if let Some(n) = self.drag {
                     let tx = ((x - b.x) / b.w.max(1.0)).clamp(0.0, 1.0);
                     let f = (F_LO.ln() + tx * (F_HI.ln() - F_LO.ln())).exp();
-                    let g = (0.5 - (y - b.y) / b.h.max(1.0)) * 2.0 * EQ_SPAN_DB;
-                    self.set(cx, n, Some(f), Some(g));
+                    let ty = ((y - b.y) / b.h.max(1.0)).clamp(0.0, 1.0);
+                    self.set(cx, n, Some(f), Some(ty), false);
                     cx.needs_redraw();
                 } else {
                     let h = self.node_at(&b, *x, *y);
@@ -175,7 +209,7 @@ impl View for Analyzer {
             WindowEvent::MouseDoubleClick(MouseButton::Left) => {
                 let (x, y) = (cx.mouse().left.pos_down.0, cx.mouse().left.pos_down.1);
                 if let Some(n) = self.node_at(&b, x, y) {
-                    self.set(cx, n, None, Some(0.0));
+                    self.set(cx, n, None, None, true);
                     self.drag = None;
                     cx.release();
                     cx.needs_redraw();
@@ -292,11 +326,48 @@ impl View for Analyzer {
                 canvas.fill_path(&fill, &vg::Paint::color(EQ_FILL));
             }
             canvas.stroke_path(&curve, &vg::Paint::color(EQ_COLOR).with_line_width(1.5));
+            // upward zone: amount curve (top = 100%) with its own nodes
+            {
+                let mut hz = [0.0f32; NODES];
+                let mut amt = [0.0f32; NODES];
+                for n in 0..NODES {
+                    hz[n] = self.params.zone.freq(n).value();
+                    amt[n] = self.params.zone.amount(n).value();
+                }
+                let active = amt.iter().any(|a| *a < 0.995);
+                let mut zc = vg::Path::new();
+                let mut zf = vg::Path::new();
+                zf.move_to(b.x, b.y + b.h);
+                for i in 0..GRID {
+                    let t = i as f32 / (GRID - 1) as f32;
+                    let f = (F_LO.ln() + t * (F_HI.ln() - F_LO.ln())).exp();
+                    let a = zone_amount(&hz, &amt, f);
+                    let (x, y) = (x_of(i), b.y + b.h * zone_ty(a));
+                    if i == 0 {
+                        zc.move_to(x, y);
+                    } else {
+                        zc.line_to(x, y);
+                    }
+                    zf.line_to(x, y);
+                }
+                zf.line_to(b.x + b.w, b.y + b.h);
+                zf.close();
+                if active {
+                    canvas.fill_path(&zf, &vg::Paint::color(ZONE_FILL));
+                }
+                canvas.stroke_path(&zc, &vg::Paint::color(ZONE_COLOR).with_line_width(if active { 1.5 } else { 1.0 }));
+            }
             for (n, (px, py)) in self.node_xy(&b).iter().enumerate() {
                 let lit = self.drag == Some(n) || self.hover == Some(n);
+                let color = if n < NODES { EQ_COLOR } else { ZONE_COLOR };
                 let mut dot = vg::Path::new();
-                dot.circle(*px, *py, if lit { NODE_RADIUS + 1.5 } else { NODE_RADIUS });
-                canvas.fill_path(&dot, &vg::Paint::color(if lit { vg::Color::rgbaf(1.0, 1.0, 1.0, 0.95) } else { EQ_COLOR }));
+                if n < NODES {
+                    dot.circle(*px, *py, if lit { NODE_RADIUS + 1.5 } else { NODE_RADIUS });
+                } else {
+                    let r = if lit { NODE_RADIUS + 1.0 } else { NODE_RADIUS - 0.5 };
+                    dot.rect(*px - r, *py - r, 2.0 * r, 2.0 * r);
+                }
+                canvas.fill_path(&dot, &vg::Paint::color(if lit { vg::Color::rgbaf(1.0, 1.0, 1.0, 0.95) } else { color }));
                 canvas.stroke_path(&dot, &vg::Paint::color(vg::Color::rgbaf(0.08, 0.08, 0.09, 1.0)).with_line_width(1.5));
             }
             canvas.reset_scissor();

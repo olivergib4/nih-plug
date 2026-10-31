@@ -118,6 +118,8 @@ impl Default for Settings {
                 up_ratio: 2.0,
                 up_range_db: 12.0,
                 up_depth_db: 24.0,
+                up_zone_hz: [60.0, 300.0, 2000.0, 10000.0],
+                up_zone_amt: [1.0; 4],
                 attack_ms: 10.0,
                 release_ms: 120.0,
                 smooth_oct: 0.17,
@@ -473,6 +475,11 @@ impl Engine {
     /// Translation readouts in sones: [phone dry, phone processed, laptop dry, laptop processed].
     pub fn translation_sones(&self) -> [f32; 4] {
         [self.sone_tr[0].sone, self.sone_tr[1].sone, self.sone_tr[2].sone, self.sone_tr[3].sone]
+    }
+
+    /// Spectral flatness (0 = tones, 1 = white noise) of the dry (unity) and processed signal.
+    pub fn flatness(&self) -> (f32, f32) {
+        (self.sone_tr[2].flatness, self.sone_tr[3].flatness)
     }
 
     /// Fill analyzer arrays on a log-frequency grid from `f_lo` to `f_hi` Hz: envelope dB, gain dB

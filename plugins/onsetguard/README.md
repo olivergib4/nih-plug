@@ -23,6 +23,15 @@ input ─ pre-EQ (min-phase) ─┬─ long STFT (stereo, balance, mono-below, l
   untouched reference just before each hit (Pre), holds through it (Hold) and fades back
   (Post). This is what removes pre-ring smear while keeping the transient's exact phase.
 * **Transient boost.** Optional upward expansion on detected hits only.
+* **Upward Zone.** Four green nodes on the analyzer set how much of the upward boost is
+  allowed per frequency (0-100%), so you choose where the lift happens instead of steering
+  it with the threshold shape. Measured: zone 0% around a 300 Hz tone leaves it at +0.0 dB
+  while a 3 kHz tone at 100% is lifted +4.9 dB, both 6 dB under the threshold.
+* **Noise-likeness readout.** Spectral flatness (100 Hz-16 kHz, 0% = tones, 100% = white
+  noise) of dry vs processed. Measured at equal peak, dense noise reads louder in sones than
+  clean peaky content (bandwidth effect: 77 vs 69 sones for a growl with/without a noise
+  bed), but peaky content stays defined; the readout shows when processing is filling
+  valleys and turning definition into wall.
 * **Upward Depth.** The upward compressor only lifts bins within this many dB of the
   threshold (fading out over the next 12 dB), so the body is lifted and the noise floor is not
   (measured: tone 6 dB under +5.3 dB, floor 58 dB under +0.0 dB; without it the floor rises +8).

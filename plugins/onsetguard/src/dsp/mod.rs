@@ -194,6 +194,27 @@ impl Delay {
     }
 }
 
+/// Distortion readout over the last second.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Distortion {
+    /// Peak-to-RMS of the dry input, dB.
+    pub crest_dry_db: f32,
+    /// Peak-to-RMS of the processed output, dB. Drums at a ceiling sit around 4-6; a square is ~1.
+    pub crest_wet_db: f32,
+    /// Share of processed samples within 0.1 dB of the ceiling, percent.
+    pub rail_pct: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DistortionAcc {
+    dry_sq: f32,
+    wet_sq: f32,
+    dry_pk: f32,
+    wet_pk: f32,
+    rail: usize,
+    n: usize,
+}
+
 /// A ring of per-sample envelope values indexed by absolute input time, with a reset value.
 struct EnvRing {
     buf: Vec<f32>,
@@ -283,6 +304,10 @@ pub struct Engine {
     sone_dry: sone::SoneMeter,
     /// Translation readouts: band-limited loudness (phone, laptop), dry at unity and processed.
     sone_tr: [sone::SoneMeter; 4],
+    /// Distortion readout: over the last second, peak and sum of squares (dry, processed) and
+    /// the number of processed samples within 0.1 dB of the ceiling.
+    dist_acc: DistortionAcc,
+    pub dist: Distortion,
     match_gain: f32,
     /// Gain reduction meters (dB, <= 0): spectral (per-bin ceiling) stage and post soft clip.
     gr_post_db: f32,
@@ -353,6 +378,8 @@ impl Engine {
             k_wet: loudness::KMeter::new(sample_rate, num_channels, 3.0),
             sone_wet: sone::SoneMeter::new(sample_rate, num_channels, 100.0),
             sone_dry: sone::SoneMeter::new(sample_rate, num_channels, 100.0),
+            dist_acc: DistortionAcc::default(),
+            dist: Distortion::default(),
             sone_tr: {
                 let mk = |lo: f32, hi: f32| {
                     let mut m = sone::SoneMeter::new(sample_rate, num_channels, 100.0);
@@ -455,6 +482,8 @@ impl Engine {
         for m in &mut self.sone_tr {
             m.reset();
         }
+        self.dist_acc = DistortionAcc::default();
+        self.dist = Distortion::default();
         self.match_gain = 1.0;
         self.gr_post_db = 0.0;
     }
@@ -937,6 +966,34 @@ impl Engine {
             }
             self.sone_tr[0].push(&self.tmp_in[..nc]);
             self.sone_tr[2].push(&self.tmp_in[..nc]);
+            {
+                let a = &mut self.dist_acc;
+                for ch in 0..nc {
+                    let d = self.dry[ch][i];
+                    let w = self.cl[ch][i];
+                    a.dry_sq += d * d;
+                    a.wet_sq += w * w;
+                    a.dry_pk = a.dry_pk.max(d.abs());
+                    a.wet_pk = a.wet_pk.max(w.abs());
+                    if w.abs() >= out_ceil * 0.9886 {
+                        a.rail += 1;
+                    }
+                }
+                a.n += nc;
+                if a.n >= (sr as usize) * nc {
+                    let inv = 1.0 / a.n as f32;
+                    let dry_rms = (a.dry_sq * inv).sqrt();
+                    let wet_rms = (a.wet_sq * inv).sqrt();
+                    if wet_rms > 1e-5 {
+                        self.dist = Distortion {
+                            crest_dry_db: 20.0 * (a.dry_pk / dry_rms.max(1e-9)).log10(),
+                            crest_wet_db: 20.0 * (a.wet_pk / wet_rms).log10(),
+                            rail_pct: 100.0 * a.rail as f32 * inv,
+                        };
+                    }
+                    *a = DistortionAcc::default();
+                }
+            }
             for ch in 0..nc {
                 self.tmp_in[ch] = self.dry[ch][i] * self.match_gain;
             }

@@ -55,7 +55,9 @@ input ─ pre-EQ (min-phase) ─┬─ long STFT (stereo, balance, mono-below, l
   concave). Energy-preserving, limited to Balance Range per band, measured before the pre-EQ.
   Measured on a dull noise at equal energy: 35.8 -> 40.0 sones.
 * **Translation readouts.** Sones of dry vs processed through full range, laptop (120 Hz-15 kHz)
-  and phone (300 Hz-8 kHz) bands.
+  and phone (300 Hz-8 kHz) bands, plus a distortion line the sone numbers cannot see: crest
+  factor (peak/RMS over the last second; drums at a ceiling ~4-6 dB, a square ~1 dB) and the
+  share of output samples pinned at the ceiling.
 * **Mono below** a set frequency, done in the long STFT (zero-phase).
 * **Sub Split.** The band below Sub Split Freq is separated at the long resolution (sharp,
   zero-phase) and carried through the same onset protection as the full signal, so

@@ -952,3 +952,43 @@ fn antiphase_guard_does_not_pre_ring() {
     assert!(db(burst / burst_in) < -20.0, "the anti-phase burst itself must be removed");
     assert!(db(mid_err / 0.2) < -80.0, "mid untouched");
 }
+
+/// Distortion readout: a clap loop driven 20 dB into a 1x hard clip must read a crest factor
+/// near a square wave's and a large share of samples at the ceiling; at 0 dB drive with no
+/// clipping it must read the dry crest and ~0% at the ceiling.
+#[test]
+fn distortion_readout_tracks_crest_and_rail() {
+    let len = (3.0 * SR) as usize;
+    let clap = synth_clap(9);
+    let x: Vec<f32> = (0..len).map(|i| clap.get(i % (SR as usize / 4)).copied().unwrap_or(0.0) * 0.5).collect();
+    let mut s = Settings::default();
+    s.protect_on = false;
+    s.dyn_.down_ratio = 1.0;
+    s.dyn_.up_ratio = 1.0;
+    s.dyn_.mono_below_hz = 0.0;
+    s.oversample = 1;
+    s.trans_clip = 1.0;
+    let mut rows = Vec::new();
+    for drive in [0.0f32, 20.0] {
+        s.drive_db = drive;
+        s.clip_on = drive > 0.0;
+        let mut e = Engine::new(1, SR, BLOCK);
+        e.set_windows(s.long_order, s.short_order, s.oversample);
+        let total = len + e.latency();
+        let mut pos = 0;
+        while pos < total {
+            let n = BLOCK.min(total - pos);
+            let mut c: Vec<f32> = (0..n).map(|i| x.get(pos + i).copied().unwrap_or(0.0)).collect();
+            { let mut r: Vec<&mut [f32]> = vec![&mut c[..]]; e.process(&mut r, n, &s); }
+            pos += n;
+            if pos > len { break; } // read the readout while the loop is still playing
+        }
+        let d = e.dist;
+        println!("drive {drive} dB: crest dry {:.1} dB, processed {:.1} dB, at ceiling {:.1}%", d.crest_dry_db, d.crest_wet_db, d.rail_pct);
+        rows.push(d);
+    }
+    assert!((rows[0].crest_wet_db - rows[0].crest_dry_db).abs() < 0.5, "no clipping: processed crest equals dry");
+    assert!(rows[0].rail_pct < 0.5, "no clipping: nothing at the ceiling");
+    assert!(rows[1].crest_wet_db < rows[1].crest_dry_db - 6.0, "20 dB into a hard clip collapses the crest");
+    assert!(rows[1].rail_pct > 2.0, "20 dB into a hard clip pins a visible share of samples (sparse claps: short hits, long gaps)");
+}

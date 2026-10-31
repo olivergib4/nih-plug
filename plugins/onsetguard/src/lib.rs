@@ -58,6 +58,10 @@ pub struct Meters {
     /// Spectral flatness: dry, processed.
     pub flat_dry: AtomicF32,
     pub flat_wet: AtomicF32,
+    /// Distortion readout: crest dry, crest processed (dB), share of samples at the ceiling (%).
+    pub crest_dry: AtomicF32,
+    pub crest_wet: AtomicF32,
+    pub rail_pct: AtomicF32,
     /// Current matched-bypass gain, dB.
     pub match_db: AtomicF32,
 }
@@ -73,6 +77,9 @@ impl Default for Meters {
             tr_sone: [AtomicF32::new(0.0), AtomicF32::new(0.0), AtomicF32::new(0.0), AtomicF32::new(0.0)],
             flat_dry: AtomicF32::new(0.0),
             flat_wet: AtomicF32::new(0.0),
+            crest_dry: AtomicF32::new(0.0),
+            crest_wet: AtomicF32::new(0.0),
+            rail_pct: AtomicF32::new(0.0),
             match_db: AtomicF32::new(0.0),
         }
     }
@@ -789,6 +796,10 @@ impl Plugin for OnsetGuard {
             let (fd, fw) = engine.flatness();
             self.meters.flat_dry.store(fd, Ordering::Relaxed);
             self.meters.flat_wet.store(fw, Ordering::Relaxed);
+            let d = engine.dist;
+            self.meters.crest_dry.store(d.crest_dry_db, Ordering::Relaxed);
+            self.meters.crest_wet.store(d.crest_wet_db, Ordering::Relaxed);
+            self.meters.rail_pct.store(d.rail_pct, Ordering::Relaxed);
             self.meters.match_db.store(20.0 * match_gain.max(1e-4).log10(), Ordering::Relaxed);
             self.meters.gr_post_db.store(gr_post, Ordering::Relaxed);
             self.meters.dry_lufs.store(dry, Ordering::Relaxed);

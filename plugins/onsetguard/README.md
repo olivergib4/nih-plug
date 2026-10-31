@@ -46,8 +46,9 @@ input ─ pre-EQ (min-phase) ─┬─ long STFT (stereo, balance, mono-below, l
   compressor sees the shaped signal.
 * **Stereo.** Zero-phase, in the long STFT: Width scales the Side above a frequency (the mono
   sum is the Mid, untouched, so it is mono-compatible by construction); the Anti-phase Guard
-  pulls down Side where left and right are in anti-phase per bin, which vanishes on a mono sum
-  and wastes clipper headroom. Measured: mono-sum error below -119 dB with Width at +6 dB; an
+  pulls down Side where left and right are in anti-phase per bin (correlation followed over
+  200 ms, gain smoothed across 1/3 octave so it cannot ring: Side pre-ring before an anti-phase
+  onset measures -73 dB), which vanishes on a mono sum and wastes clipper headroom. Measured: mono-sum error below -119 dB with Width at +6 dB; an
   anti-phase tone's Side removed by 77 dB while panned in-phase material is untouched.
 * **Loudness Balance.** A slow, zero-phase per-band gain toward equal specific loudness across
   the Bark bands (Zwicker). For a fixed energy, that balance reads loudest (the loudness sum is

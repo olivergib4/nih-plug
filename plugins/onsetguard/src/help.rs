@@ -17,7 +17,7 @@ pub fn for_param(id: &str) -> Option<&'static str> {
         "mono_below" => "Mono Below. Sums the sides to mono below this frequency, inside the long FFT (zero-phase). Stops out-of-phase sub from cancelling on club systems and phones. 0 turns it off.",
         "width_hz" => "Width Above. Where Width starts to apply (one-octave crossfade). Keep it above the bass so the low end stays centred.",
         "width" => "Width. Side gain above Width Above, in dB. The mono sum is the Mid, which this never touches, so any setting is mono-compatible. It can only widen stereo that already exists.",
-        "guard" => "Anti-phase Guard. Per bin, where left and right are in anti-phase, the Side is pulled down by this amount. Anti-phase content vanishes on a mono sum and eats clipper headroom for nothing; removing it is free level on club and phone systems. 100% on a bus, lower on deliberately wide FX.",
+        "guard" => "Anti-phase Guard. Per bin, where left and right are in anti-phase, the Side is pulled down by this amount. Follows the image slowly (200 ms) and smoothly across frequency, so it cannot ring on hits. Anti-phase content vanishes on a mono sum and eats clipper headroom for nothing; removing it is free level on club and phone systems. 100% on a bus, lower on deliberately wide FX.",
 
         // --- Loudness Balance ---
         "balance" => "Balance Strength. A slow, zero-phase per-band gain that nudges the long-term spectrum toward equal specific loudness across the hearing bands (Zwicker). For a fixed energy that balance reads loudest. Measured on the input before the pre-EQ, so your EQ moves add to it rather than being fought. 0% = off.",

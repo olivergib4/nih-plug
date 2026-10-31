@@ -614,7 +614,7 @@ fn sub_protect_routing_under_onset_protection() {
 /// Side that is in anti-phase and leave in-phase (and merely panned) material alone.
 #[test]
 fn stereo_width_is_mono_compatible_and_guard_removes_antiphase() {
-    let len = (1.0 * SR) as usize;
+    let len = (3.0 * SR) as usize;
     let t = |i: usize| i as f32 / SR;
     // 1 kHz in anti-phase (L = -R), 3 kHz panned 70% left (in phase), 150 Hz centered
     let l: Vec<f32> = (0..len).map(|i| 0.2 * (2.0 * std::f32::consts::PI * 1000.0 * t(i)).sin() + 0.2 * (2.0 * std::f32::consts::PI * 3000.0 * t(i)).sin() + 0.2 * (2.0 * std::f32::consts::PI * 150.0 * t(i)).sin()).collect();
@@ -625,7 +625,7 @@ fn stereo_width_is_mono_compatible_and_guard_removes_antiphase() {
     base.dyn_.mono_below_hz = 0.0;
     base.clip_on = false;
     base.protect_on = false;
-    let seg = |v: &Vec<f32>| v[len / 2..].to_vec();
+    let seg = |v: &Vec<f32>| v[len * 2 / 3..].to_vec();
     let mid = |a: &[f32], b: &[f32]| -> Vec<f32> { a.iter().zip(b).map(|(x, y)| (x + y) * 0.5).collect() };
     let side = |a: &[f32], b: &[f32]| -> Vec<f32> { a.iter().zip(b).map(|(x, y)| (x - y) * 0.5).collect() };
 
@@ -912,4 +912,43 @@ fn upward_zone_selects_where_the_lift_happens() {
     assert!(rows[0].0 > 3.0 && rows[0].1 > 3.0, "all at 100%: both lifted");
     assert!(rows[1].0.abs() < 0.5, "zone 0% around 300 Hz: not lifted");
     assert!((rows[1].1 - rows[0].1).abs() < 0.5, "zone 100% around 3 kHz: lifted as before");
+}
+
+/// Anti-phase guard must not pre-ring: an anti-phase noise burst starts from silence at 1.0 s
+/// (nothing in the Side before it). The Side output in the 40 ms before the burst, relative
+/// to the burst's own level, must stay well down; the in-phase Mid is untouched throughout.
+#[test]
+fn antiphase_guard_does_not_pre_ring() {
+    let len = (3.0 * SR) as usize;
+    let mut st = 31337u32;
+    let (mut l, mut r) = (vec![0.0f32; len], vec![0.0f32; len]);
+    for i in 0..len {
+        let t = i as f32 / SR;
+        st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+        let w = (st as f32 / u32::MAX as f32) * 2.0 - 1.0;
+        let m = 0.2 * (2.0 * std::f32::consts::PI * 220.0 * t).sin(); // steady in-phase content
+        let s = if t >= 1.0 { w * 0.3 } else { 0.0 }; // anti-phase burst from 1.0 s on
+        l[i] = m + s;
+        r[i] = m - s;
+    }
+    let mut s = Settings::default();
+    s.dyn_.down_ratio = 1.0;
+    s.dyn_.up_ratio = 1.0;
+    s.dyn_.mono_below_hz = 0.0;
+    s.clip_on = false;
+    s.protect_on = false;
+    s.stereo.guard = 1.0;
+    let out = run(&[l.clone(), r.clone()], &s);
+    let side = |a: &[f32], b: &[f32], i0: usize, i1: usize| -> f32 {
+        (a[i0..i1].iter().zip(&b[i0..i1]).map(|(x, y)| ((x - y) * 0.5).powi(2)).sum::<f32>() / (i1 - i0) as f32).sqrt()
+    };
+    let t0 = SR as usize;
+    let pre = side(&out[0], &out[1], t0 - (0.040 * SR) as usize, t0 - 1);
+    let burst = side(&out[0], &out[1], t0 + (1.5 * SR) as usize, t0 + (1.9 * SR) as usize);
+    let burst_in = side(&l, &r, t0 + (1.5 * SR) as usize, t0 + (1.9 * SR) as usize);
+    let mid_err = (0..len).map(|i| ((out[0][i] + out[1][i]) * 0.5 - (l[i] + r[i]) * 0.5).abs()).fold(0.0f32, f32::max);
+    println!("guard 100%: side pre-ring (40 ms before) {:.1} dB re input burst, burst passed at {:.1} dB, mid max error {:.1} dB", db(pre / burst_in), db(burst / burst_in), db(mid_err / 0.2));
+    assert!(db(pre / burst_in) < -50.0, "no pre-ring on the Side before the anti-phase onset");
+    assert!(db(burst / burst_in) < -20.0, "the anti-phase burst itself must be removed");
+    assert!(db(mid_err / 0.2) < -80.0, "mid untouched");
 }

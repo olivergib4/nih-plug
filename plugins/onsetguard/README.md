@@ -23,6 +23,9 @@ input ─ pre-EQ (min-phase) ─┬─ long STFT (stereo, balance, mono-below, l
   untouched reference just before each hit (Pre), holds through it (Hold) and fades back
   (Post). This is what removes pre-ring smear while keeping the transient's exact phase.
 * **Transient boost.** Optional upward expansion on detected hits only.
+* **Upward Depth.** The upward compressor only lifts bins within this many dB of the
+  threshold (fading out over the next 12 dB), so the body is lifted and the noise floor is not
+  (measured: tone 6 dB under +5.3 dB, floor 58 dB under +0.0 dB; without it the floor rises +8).
 * **Frequency smoothing** of the gain curve removes the watery per-bin swirl.
 * **Clip.** Clip Drive into an oversampled clipper with a hard output ceiling. Transient Clip
   decides how much of each hit goes through the oversampled clipper; the ceiling holds at every
@@ -53,8 +56,11 @@ input ─ pre-EQ (min-phase) ─┬─ long STFT (stereo, balance, mono-below, l
   vs -34 dB for a plain clip on a 50 Hz + 2 kHz test, same overall rms within 0.2 dB). Protect
   Amount blends this with the plain clip-everything output.
 * **Preserve Highs.** The band above Preserve Above bypasses the clipper and is summed back;
-  Highs Amount sets how much of it. Off by default: on sounds whose highs are the hit (zaps)
-  there is nothing to protect.
+  Highs Amount sets how much of it, Highs on Hits how much of it during a detected hit (0% =
+  a hit's highs are clipped with everything else, so zaps keep their clipped snap and only the
+  air between hits is preserved).
+* **Simple / Advanced view.** Simple shows the controls you touch per track; Advanced shows
+  everything. The choice is saved with the set.
 * **Perceived loudness in sones.** A Zwicker-style model (outer/middle-ear transfer, 24 Bark
   bands, level-dependent masking spread, threshold in quiet, Zwicker specific loudness) runs
   on the processed output and on the dry signal. It needs Reference Level: what 0 dBFS plays

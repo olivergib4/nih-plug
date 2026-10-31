@@ -83,6 +83,9 @@ pub struct Settings {
     pub hf_hz: f32,
     /// How much of the preserved band bypasses the clipper (0 = none of it, 1 = all of it).
     pub hf_amount: f32,
+    /// During a detected hit, how much of the preserved band still bypasses the clipper
+    /// (0 = the highs of a hit are clipped with everything else, 1 = preserved throughout).
+    pub hf_on_hits: f32,
     pub sub_mode: SubMode,
     pub sub_hz: f32,
     /// Blend between "clip everything" (0) and "protected bands" (1): with Sub Split or
@@ -114,6 +117,7 @@ impl Default for Settings {
                 down_ratio: 3.0,
                 up_ratio: 2.0,
                 up_range_db: 12.0,
+                up_depth_db: 24.0,
                 attack_ms: 10.0,
                 release_ms: 120.0,
                 smooth_oct: 0.17,
@@ -140,6 +144,7 @@ impl Default for Settings {
             hf_preserve: false,
             hf_hz: 8000.0,
             hf_amount: 1.0,
+            hf_on_hits: 0.0,
             sub_mode: SubMode::Off,
             sub_hz: 100.0,
             band_protect: 0.6,
@@ -208,6 +213,11 @@ impl EnvRing {
         let v = self.buf[i];
         self.buf[i] = self.reset_value;
         v
+    }
+    /// Read without clearing (for a stage earlier in the chain than the one that takes).
+    #[inline]
+    fn peek(&self, t: usize) -> f32 {
+        self.buf[t & self.mask]
     }
     #[inline]
     fn min_at(&mut self, t: usize, v: f32) {
@@ -770,6 +780,30 @@ impl Engine {
                     for ch in 0..nc {
                         self.clw[ch][i] = self.tmp_out[ch];
                         self.clw[2 * nc + ch][i] = 0.0;
+                    }
+                }
+            }
+            // Highs on Hits: during a detected hit, fold (1 - amount) of the preserved highs
+            // back into the rest so they are clipped with everything else. The hit envelope is
+            // the clip-protection one (8 ms hold, 20 ms fade), read at this stage's own time.
+            let k_hits = 1.0 - s.hf_on_hits.clamp(0.0, 1.0);
+            if hf_on && k_hits > 0.0 {
+                let n_s = self.clip_stft.window_size();
+                let l_here = l_spec_total + n_s;
+                for i in 0..len {
+                    let t_in = base_t + i;
+                    if t_in < l_here {
+                        continue;
+                    }
+                    let pc = self.pc_ring.peek(t_in - l_here);
+                    if pc <= 0.0 {
+                        continue;
+                    }
+                    let k = k_hits * pc;
+                    for ch in 0..nc {
+                        let m = self.clw[2 * nc + ch][i] * k;
+                        self.clw[2 * nc + ch][i] -= m;
+                        self.clw[ch][i] += m;
                     }
                 }
             }

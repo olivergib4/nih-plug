@@ -21,6 +21,9 @@ pub enum Weighting {
     EqualLoudness,
 }
 
+/// Width of the upward-boost fade below Upward Depth.
+const UP_FADE_DB: f32 = 12.0;
+
 #[derive(Clone, Copy, Debug)]
 pub struct DynamicsSettings {
     pub weighting: Weighting,
@@ -31,6 +34,9 @@ pub struct DynamicsSettings {
     pub down_ratio: f32,
     pub up_ratio: f32,
     pub up_range_db: f32,
+    /// Bins more than this far below the threshold get no upward boost (fading out over the
+    /// next 12 dB), so the noise floor is not lifted along with the body.
+    pub up_depth_db: f32,
     pub attack_ms: f32,
     pub release_ms: f32,
     pub smooth_oct: f32,
@@ -241,7 +247,10 @@ impl Dynamics {
                     if over > 0.0 {
                         g = -over * down_k;
                     } else if s.up_ratio > 1.0 && e_db > -90.0 {
-                        g = (-over).min(s.up_range_db) * up_k;
+                        let under = -over;
+                        // fade the boost out below the depth so the floor is left alone
+                        let fade = ((under - s.up_depth_db.max(0.0)) / UP_FADE_DB).clamp(0.0, 1.0);
+                        g = under.min(s.up_range_db) * up_k * (1.0 - fade);
                     }
                 }
                 self.gain_db[k] = g * self.band_weight[k];

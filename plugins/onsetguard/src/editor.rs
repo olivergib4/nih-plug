@@ -29,6 +29,47 @@ pub struct Data {
 
 impl Model for Data {}
 
+/// Simple / Advanced view. Simple shows the controls you touch per track; Advanced shows all.
+#[derive(Lens)]
+pub struct ViewModel {
+    pub advanced: bool,
+    params: Arc<OnsetGuardParams>,
+}
+
+pub enum ViewEvent {
+    Toggle,
+}
+
+impl Model for ViewModel {
+    fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
+        event.map(|e, _| match e {
+            ViewEvent::Toggle => {
+                self.advanced = !self.advanced;
+                self.params.advanced.store(self.advanced, Ordering::Relaxed);
+            }
+        });
+    }
+}
+
+/// Parameters shown in the Simple view.
+const SIMPLE_IDS: &[&str] = &[
+    "clip", "drive", "ceiling", "trans_clip", "hf_preserve", "hf_amount", "hf_hits", "sub_split", "band_protect", "oversample",
+    "weighting", "threshold", "slope",
+    "down_ratio", "up_ratio", "up_range", "up_depth", "attack", "release",
+    "protect", "sens", "trans_boost",
+    "mono_below", "width", "guard",
+    "balance",
+    "output", "mix", "matched_bypass", "ref_level",
+];
+
+fn shown(id: &str, advanced: bool) -> bool {
+    advanced || SIMPLE_IDS.contains(&id)
+}
+
+fn visible_rows<Ps: Params>(ps: &Ps, advanced: bool) -> usize {
+    ps.param_map().iter().filter(|(id, _, _)| shown(id, advanced)).count()
+}
+
 /// The help panel's text, updated by hovering any control.
 #[derive(Lens)]
 pub struct HelpModel {
@@ -148,6 +189,7 @@ pub(crate) fn create(
             analyzer: analyzer.clone(),
         }
         .build(cx);
+        ViewModel { advanced: params.advanced.load(Ordering::Relaxed), params: params.clone() }.build(cx);
         HelpModel {
             text: String::from(
                 "Hover any control, preset or meter and its explanation appears here. \
@@ -200,6 +242,15 @@ pub(crate) fn create(
                     .top(Pixels(3.0))
                     .right(Pixels(6.0));
                 }
+                Button::new(
+                    cx,
+                    |cx| cx.emit(ViewEvent::Toggle),
+                    |cx| Label::new(cx, ViewModel::advanced.map(|a| if *a { "Advanced view" } else { "Simple view" })),
+                )
+                .on_hover(|cx| cx.emit(HelpEvent::Show(help::VIEW_HELP)))
+                .top(Pixels(3.0))
+                .left(Stretch(1.0))
+                .right(Pixels(2.0));
             })
             .height(Pixels(32.0))
             .width(Pixels(CONTENT_WIDTH));
@@ -236,53 +287,59 @@ pub(crate) fn create(
             .height(Pixels(74.0))
             .width(Pixels(CONTENT_WIDTH));
 
-            // --- controls: three columns, groups stacked to balance height ---
-            HStack::new(cx, |cx| {
-                VStack::new(cx, |cx| {
-                    group(cx, "Clip", 14, |cx| params_with_help(cx, Data::params.map(|p| p.clip.clone())));
-                    HStack::new(cx, |cx| {
-                        meter(cx, "Clip GR", Data::meters.map(|m| m.gr_post_db.load(Ordering::Relaxed)), help::GR_POST_HELP);
+            // --- controls: four columns, rebuilt when the view switches ---
+            Binding::new(cx, ViewModel::advanced, |cx, adv| {
+                let advanced = adv.get(cx);
+                let p = Data::params.get(cx);
+                HStack::new(cx, |cx| {
+                    VStack::new(cx, |cx| {
+                        group(cx, "Clip", visible_rows(p.clip.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.clip.clone()), advanced));
+                        HStack::new(cx, |cx| {
+                            meter(cx, "Clip GR", Data::meters.map(|m| m.gr_post_db.load(Ordering::Relaxed)), help::GR_POST_HELP);
+                        })
+                        .size(Auto)
+                        .top(Pixels(4.0));
                     })
-                    .size(Auto)
-                    .top(Pixels(4.0));
-                })
-                .width(COLUMN_WIDTH)
-                .height(Auto);
-
-                VStack::new(cx, |cx| {
-                    group(cx, "Threshold", 5, |cx| params_with_help(cx, Data::params.map(|p| p.threshold.clone())));
-                    group(cx, "Dynamics", 7, |cx| params_with_help(cx, Data::params.map(|p| p.dynamics.clone())));
-                })
-                .width(COLUMN_WIDTH)
-                .height(Auto);
-
-                VStack::new(cx, |cx| {
-                    group(cx, "Onset Protection", 7, |cx| params_with_help(cx, Data::params.map(|p| p.protect.clone())));
-                    group(cx, "Resolution", 3, |cx| params_with_help(cx, Data::params.map(|p| p.resolution.clone())));
-                    group(cx, "Output", 4, |cx| params_with_help(cx, Data::params.map(|p| p.global.clone())));
-                })
-                .width(COLUMN_WIDTH)
-                .height(Auto);
-
-                VStack::new(cx, |cx| {
-                    group(cx, "Stereo", 4, |cx| params_with_help(cx, Data::params.map(|p| p.stereo.clone())));
-                    group(cx, "Loudness Balance", 3, |cx| params_with_help(cx, Data::params.map(|p| p.balance.clone())));
-                    HelpArea::new(cx, help::TRANSLATION_HELP, |cx| {
-                        Label::new(cx, "Translation (sone, dry → processed)").font_size(12.0).height(Pixels(18.0));
-                        Label::new(cx, MeterModel::tr_full).font_size(11.0).height(Pixels(16.0));
-                        Label::new(cx, MeterModel::tr_laptop).font_size(11.0).height(Pixels(16.0));
-                        Label::new(cx, MeterModel::tr_phone).font_size(11.0).height(Pixels(16.0));
-                    })
-                    .layout_type(LayoutType::Column)
                     .width(COLUMN_WIDTH)
-                    .height(Pixels(74.0))
-                    .top(Pixels(4.0))
-                    .left(Pixels(15.0));
+                    .height(Auto);
+
+                    VStack::new(cx, |cx| {
+                        group(cx, "Threshold", visible_rows(p.threshold.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.threshold.clone()), advanced));
+                        group(cx, "Dynamics", visible_rows(p.dynamics.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.dynamics.clone()), advanced));
+                    })
+                    .width(COLUMN_WIDTH)
+                    .height(Auto);
+
+                    VStack::new(cx, |cx| {
+                        group(cx, "Onset Protection", visible_rows(p.protect.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.protect.clone()), advanced));
+                        if advanced {
+                            group(cx, "Resolution", visible_rows(p.resolution.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.resolution.clone()), advanced));
+                        }
+                        group(cx, "Output", visible_rows(p.global.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.global.clone()), advanced));
+                    })
+                    .width(COLUMN_WIDTH)
+                    .height(Auto);
+
+                    VStack::new(cx, |cx| {
+                        group(cx, "Stereo", visible_rows(p.stereo.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.stereo.clone()), advanced));
+                        group(cx, "Loudness Balance", visible_rows(p.balance.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.balance.clone()), advanced));
+                        HelpArea::new(cx, help::TRANSLATION_HELP, |cx| {
+                            Label::new(cx, "Translation (sone, dry → processed)").font_size(12.0).height(Pixels(18.0));
+                            Label::new(cx, MeterModel::tr_full).font_size(11.0).height(Pixels(16.0));
+                            Label::new(cx, MeterModel::tr_laptop).font_size(11.0).height(Pixels(16.0));
+                            Label::new(cx, MeterModel::tr_phone).font_size(11.0).height(Pixels(16.0));
+                        })
+                        .layout_type(LayoutType::Column)
+                        .width(COLUMN_WIDTH)
+                        .height(Pixels(74.0))
+                        .top(Pixels(4.0))
+                        .left(Pixels(15.0));
+                    })
+                    .width(COLUMN_WIDTH)
+                    .height(Auto);
                 })
-                .width(COLUMN_WIDTH)
-                .height(Auto);
-            })
-            .size(Auto);
+                .size(Auto);
+            });
         })
         .row_between(Pixels(6.0))
         .child_top(Pixels(4.0))
@@ -330,7 +387,7 @@ fn meter(cx: &mut Context, title: &str, value_db: impl Lens<Target = f32>, help_
 }
 
 /// A generic parameter list where hovering a row shows its explanation in the help panel.
-fn params_with_help<L, PsRef, Ps>(cx: &mut Context, params: L)
+fn params_with_help<L, PsRef, Ps>(cx: &mut Context, params: L, advanced: bool)
 where
     L: Lens<Target = PsRef> + Copy,
     PsRef: AsRef<Ps> + 'static,
@@ -343,7 +400,11 @@ where
         .map(|(id, ptr, _)| (ptr, id))
         .collect();
     GenericUi::new_custom(cx, params, move |cx, param_ptr| {
-        let help_text = ids.get(&param_ptr).and_then(|id| help::for_param(id)).unwrap_or("");
+        let id = ids.get(&param_ptr).map(|s| s.as_str()).unwrap_or("");
+        if !shown(id, advanced) {
+            return;
+        }
+        let help_text = help::for_param(id).unwrap_or("");
         HelpArea::new(cx, help_text, |cx| {
             Label::new(cx, unsafe { param_ptr.name() }).class("label");
             GenericUi::draw_widget(cx, params, param_ptr);

@@ -395,6 +395,9 @@ fn post_ring_after_hits_is_measured() {
     base.dyn_.down_ratio = 6.0;
     base.dyn_.up_ratio = 3.0;
     base.dyn_.up_range_db = 18.0;
+    // this test measures what Post does to ringing; with Upward Depth the silence after the
+    // hit is not lifted at all (-144 dB), so use the old unlimited depth here
+    base.dyn_.up_depth_db = 60.0;
     base.dyn_.attack_ms = 2.0;
     base.dyn_.release_ms = 80.0;
     base.dyn_.mono_below_hz = 0.0;
@@ -763,4 +766,110 @@ fn pre_eq_matches_its_design_and_feeds_both_paths() {
         }
         println!("{line}");
     }
+}
+
+/// Highs on Hits: with it at 0%, a hit's highs are clipped like everything else (output
+/// during the hit matches Preserve Highs OFF), while between hits the highs are preserved
+/// (output matches Preserve Highs ON). At 100% the whole thing matches Preserve Highs ON.
+#[test]
+fn highs_on_hits_folds_the_highs_into_the_clip_during_hits_only() {
+    let len = (1.5 * SR) as usize;
+    let mut st = 777u32;
+    let x: Vec<f32> = (0..len)
+        .map(|i| {
+            let t = i as f32 / SR;
+            st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+            let w = (st as f32 / u32::MAX as f32) * 2.0 - 1.0;
+            // sustained bed: 200 Hz + 12 kHz tone; one bright burst at 0.5 s (high-passed noise)
+            let bed = 0.4 * (2.0 * std::f32::consts::PI * 200.0 * t).sin() + 0.1 * (2.0 * std::f32::consts::PI * 12000.0 * t).sin();
+            let burst = if (0.5..0.52).contains(&t) { w * 0.9 * (-(t - 0.5) * 150.0).exp() } else { 0.0 };
+            bed + burst
+        })
+        .collect();
+    let mut base = Settings::default();
+    base.drive_db = 8.0;
+    base.trans_clip = 1.0;
+    base.protect_on = true;
+    base.onset_sens = 0.6;
+    base.dyn_.down_ratio = 1.0;
+    base.dyn_.up_ratio = 1.0;
+    base.dyn_.mono_below_hz = 0.0;
+    base.hardness = 1.0;
+    base.hf_hz = 4000.0;
+    base.band_protect = 1.0;
+    let run_with = |hf: bool, hits: f32| {
+        let mut s = base;
+        s.hf_preserve = hf;
+        s.hf_on_hits = hits;
+        run(&[x.clone()], &s)[0].clone()
+    };
+    let off = run_with(false, 0.0);
+    let on = run_with(true, 1.0);
+    let hits0 = run_with(true, 0.0);
+    let diff = |a: &[f32], b: &[f32], from: f32, to: f32| -> f32 {
+        let (i0, i1) = ((from * SR) as usize, (to * SR) as usize);
+        let e: f32 = a[i0..i1].iter().zip(&b[i0..i1]).map(|(p, q)| (p - q).powi(2)).sum();
+        let r: f32 = a[i0..i1].iter().map(|p| p * p).sum();
+        10.0 * (e / r.max(1e-12)).max(1e-12).log10()
+    };
+    // during the hit (first 8 ms after the burst): hits0 ~ off; between hits (1.0..1.4 s): hits0 ~ on
+    let d_hit_off = diff(&hits0, &off, 0.5, 0.508);
+    let d_hit_on = diff(&hits0, &on, 0.5, 0.508);
+    let d_bed_on = diff(&hits0, &on, 1.0, 1.4);
+    let d_bed_off = diff(&hits0, &off, 1.0, 1.4);
+    println!("highs on hits 0%: vs OFF during hit {d_hit_off:.1} dB, vs ON during hit {d_hit_on:.1} dB; vs ON between hits {d_bed_on:.1} dB, vs OFF between hits {d_bed_off:.1} dB");
+    assert!(d_hit_off < -15.0, "during the hit the highs must be clipped like Preserve Highs off");
+    assert!(d_hit_off < d_hit_on - 10.0, "during the hit it must be closer to OFF than to ON");
+    assert!(d_bed_on < -60.0, "between hits it must equal Preserve Highs on");
+    assert!(d_bed_on < d_bed_off - 10.0);
+}
+
+/// Upward Depth: a tone a few dB under the threshold is lifted; a noise floor far under it is
+/// not (that is the "white noise" complaint). With a huge depth the floor IS lifted, which
+/// proves the depth is what stops it.
+#[test]
+fn upward_depth_lifts_the_body_but_not_the_floor() {
+    let len = (2.0 * SR) as usize;
+    let mut st = 4242u32;
+    let x: Vec<f32> = (0..len)
+        .map(|i| {
+            let t = i as f32 / SR;
+            st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+            let w = (st as f32 / u32::MAX as f32) * 2.0 - 1.0;
+            // tone at -30 dBFS (6 dB under a -24 threshold); white floor at about -55 dBFS,
+            // which is roughly -82 dB per bin in the 1024 window (58 dB under the threshold)
+            0.0316 * (2.0 * std::f32::consts::PI * 1000.0 * t).sin() + w * 0.0018
+        })
+        .collect();
+    let band_db = |v: &[f32], lo: f32, hi: f32| -> f32 {
+        // crude: sum of goertzel over a few probe frequencies well away from the tone
+        let fs = [lo, (lo + hi) * 0.5, hi];
+        db(fs.iter().map(|&f| goertzel(&v[len / 2..], SR, f).powi(2)).sum::<f32>().sqrt())
+    };
+    let mut s = Settings::default();
+    s.protect_on = false;
+    s.clip_on = false;
+    s.dyn_.mono_below_hz = 0.0;
+    s.dyn_.weighting = onsetguard::dsp::dynamics::Weighting::Off;
+    s.dyn_.threshold_db = -24.0;
+    s.dyn_.slope_db_oct = 0.0;
+    s.dyn_.curve_db_oct2 = 0.0;
+    s.dyn_.down_ratio = 1.0;
+    s.dyn_.up_ratio = 3.0;
+    s.dyn_.up_range_db = 12.0;
+    s.dyn_.smooth_oct = 0.0;
+    let tone_in = db(goertzel(&x[len / 2..], SR, 1000.0));
+    let floor_in = band_db(&x, 3000.0, 6000.0);
+    let mut rows = Vec::new();
+    for depth in [24.0f32, 60.0] {
+        s.dyn_.up_depth_db = depth;
+        let out = run(&[x.clone()], &s);
+        let tone = db(goertzel(&out[0][len / 2..], SR, 1000.0)) - tone_in;
+        let floor = band_db(&out[0], 3000.0, 6000.0) - floor_in;
+        println!("upward depth {depth} dB: tone {tone:+.1} dB, floor {floor:+.1} dB");
+        rows.push((tone, floor));
+    }
+    assert!(rows[0].0 > 2.0, "the tone (6 dB under) must be lifted");
+    assert!(rows[0].1 < 1.0, "with 24 dB depth the floor (50 dB under) must not be lifted");
+    assert!(rows[1].1 > 4.0, "with 60 dB depth the floor is lifted (the old behaviour)");
 }

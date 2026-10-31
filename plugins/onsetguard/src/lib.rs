@@ -119,6 +119,9 @@ pub enum Oversample {
 pub struct OnsetGuardParams {
     #[persist = "editor-state"]
     pub editor_state: Arc<ViziaState>,
+    /// Editor view: false = Simple (the controls you touch per track), true = Advanced (all).
+    #[persist = "advanced"]
+    pub advanced: Arc<std::sync::atomic::AtomicBool>,
 
     #[nested(group = "Global")]
     pub global: Arc<GlobalParams>,
@@ -242,6 +245,8 @@ pub struct DynamicsParams {
     pub up_ratio: FloatParam,
     #[id = "up_range"]
     pub up_range_db: FloatParam,
+    #[id = "up_depth"]
+    pub up_depth_db: FloatParam,
     #[id = "attack"]
     pub attack_ms: FloatParam,
     #[id = "release"]
@@ -292,6 +297,8 @@ pub struct ClipParams {
     pub hf_hz: FloatParam,
     #[id = "hf_amount"]
     pub hf_amount: FloatParam,
+    #[id = "hf_hits"]
+    pub hf_on_hits: FloatParam,
     #[id = "sub_split"]
     pub sub_split: EnumParam<SubSplit>,
     #[id = "sub_hz"]
@@ -334,6 +341,7 @@ impl Default for OnsetGuardParams {
         let d = Settings::default();
         OnsetGuardParams {
             editor_state: editor::default_state(),
+            advanced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             global: Arc::new(GlobalParams {
             output_gain: FloatParam::new(
                 "Output Gain",
@@ -484,6 +492,7 @@ impl Default for OnsetGuardParams {
             .with_value_to_string(formatters::v2s_compression_ratio(1))
             .with_string_to_value(formatters::s2v_compression_ratio()),
             up_range_db: db_param("Upward Range", d.dyn_.up_range_db, 0.0, 40.0),
+            up_depth_db: db_param("Upward Depth", d.dyn_.up_depth_db, 6.0, 60.0),
             attack_ms: ms_param("Attack", d.dyn_.attack_ms, 0.1, 500.0),
             release_ms: ms_param("Release", d.dyn_.release_ms, 5.0, 3000.0),
             smooth_oct: FloatParam::new(
@@ -525,6 +534,7 @@ impl Default for OnsetGuardParams {
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(1))
             .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
             hf_amount: pct_param("Highs Amount", d.hf_amount),
+            hf_on_hits: pct_param("Highs on Hits", d.hf_on_hits),
             sub_split: EnumParam::new("Sub Split", SubSplit::Off),
             sub_hz: FloatParam::new(
                 "Sub Split Freq",
@@ -559,6 +569,7 @@ impl OnsetGuardParams {
         s.dyn_.down_ratio = self.dynamics.down_ratio.value();
         s.dyn_.up_ratio = self.dynamics.up_ratio.value();
         s.dyn_.up_range_db = self.dynamics.up_range_db.value();
+        s.dyn_.up_depth_db = self.dynamics.up_depth_db.value();
         s.dyn_.attack_ms = self.dynamics.attack_ms.value();
         s.dyn_.release_ms = self.dynamics.release_ms.value();
         s.dyn_.smooth_oct = self.dynamics.smooth_oct.value();
@@ -599,6 +610,7 @@ impl OnsetGuardParams {
         s.hf_preserve = self.clip.hf_preserve.value();
         s.hf_hz = self.clip.hf_hz.value();
         s.hf_amount = self.clip.hf_amount.value();
+        s.hf_on_hits = self.clip.hf_on_hits.value();
         s.sub_ceil_db = self.clip.sub_ceil_db.value();
         s.band_protect = self.clip.band_protect.value();
         s.oversample = match self.clip.oversample.value() {

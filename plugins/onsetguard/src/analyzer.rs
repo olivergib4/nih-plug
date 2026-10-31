@@ -137,6 +137,12 @@ impl View for Analyzer {
         let b = cx.bounds();
         event.map(|window_event, meta| match window_event {
             WindowEvent::MouseMove(x, y) => {
+                // a release that never reached us (focus change, host dialog) must not leave
+                // the mouse captured
+                if self.drag.is_some() && cx.mouse().left.state == MouseButtonState::Released {
+                    self.drag = None;
+                    cx.release();
+                }
                 if let Some(n) = self.drag {
                     let tx = ((x - b.x) / b.w.max(1.0)).clamp(0.0, 1.0);
                     let f = (F_LO.ln() + tx * (F_HI.ln() - F_LO.ln())).exp();

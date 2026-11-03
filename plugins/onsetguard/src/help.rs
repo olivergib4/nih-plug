@@ -6,6 +6,7 @@ pub fn for_param(id: &str) -> Option<&'static str> {
         "output" => "Output Gain. Final level after everything else, before Mix. Use it to level-match against your old chain; it is not part of the sound.",
         "mix" => "Mix. Blends dry and processed. Everything is zero-phase and sample-aligned, so any blend is clean (no comb filtering). Parallel density: 50-70% keeps the dry transient and adds the processed body.",
         "matched_bypass" => "Matched Bypass. Plays the DRY signal, gained until it reads the same perceived loudness (sones) as the processed signal. Flip it on and off: if processed still wins at equal loudness the processing is earning its keep; if they sound alike, you were hearing volume.",
+        "meter_thru_clip" => "Meter Thru Clip. With Clip OFF, the processed-side readouts (sones, translation, crest, at-ceiling) and the Autopilot measure the output as a plain 1x hard clipper at Output Ceiling would make it: what your master clipper will do to these drums. The audio is untouched. Turn it off to meter the raw, unclipped output.",
         "ref_level" => "Reference Level. Tells the loudness model how loud 0 dBFS plays on your system, in dB SPL (club ~100-105, studio ~85). The sone numbers only mean something once this is roughly right. It changes no audio.",
 
         // --- Resolution ---
@@ -69,7 +70,7 @@ pub fn for_param(id: &str) -> Option<&'static str> {
         // --- Clip ---
         "clip" => "Clip. Turns the clip stage on: Clip Drive into an oversampled clipper with a hard output ceiling (at 1x, identical to a plain hard clipper). Off, the stage is a plain delay so latency stays constant.",
         "drive" => "Clip Drive. Gain into the clipper: the loudness knob. More drive = more clipping = louder. The GR meter shows how much is being shaved.",
-        "ceiling" => "Output Ceiling. Hard maximum of the clipped signal. 0 dBFS for maximum level; leave a few tenths if your encoder complains.",
+        "ceiling" => "Output Ceiling. Hard maximum of the clipped signal. 0 dBFS when this is the last clipper. Above 0 dB (up to +12) on a bus: only the extreme peaks are shaped here and the drums still hit the master clipper hot, so the final clip happens once, on the whole mix.",
         "hardness" => "Clip Hardness. 100% = hard clip (default: loudest, most harmonics). Lower starts a soft knee earlier for a rounder, quieter clip.",
         "trans_clip" => "Transient Clip. How much of each detected hit goes through the oversampled clipper. 0% = hits bypass it and are only hard-clamped at the ceiling (max punch), 100% = hits clipped like everything else (max density). The ceiling holds at every setting.",
         "clip_link" => "Clip Stereo Link. 100% gives both channels the same clip gain, driven by the louder side, so clipping cannot move the stereo image or soften the center. Lower only for deliberate width.",

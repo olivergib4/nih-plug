@@ -1058,7 +1058,10 @@ fn autopilot_hits_the_target_or_the_crest_floor() {
     s.trans_clip = 1.0;
     s.autopilot.on = true;
     s.autopilot.crest_floor_db = 6.0;
-    for target in [96.0f32, 130.0] {
+    // (clip on, 130) and (clip OFF + Meter Thru Clip, 130): the servo must behave the same
+    for (clip_on, target) in [(true, 96.0f32), (true, 130.0), (false, 130.0)] {
+        s.clip_on = clip_on;
+        s.meter_thru_clip = true;
         s.autopilot.target_phon = target;
         let mut e = Engine::new(1, SR, BLOCK);
         e.set_windows(s.long_order, s.short_order, s.oversample);
@@ -1072,7 +1075,7 @@ fn autopilot_hits_the_target_or_the_crest_floor() {
         let (_, wet) = e.sones();
         let phon = 40.0 + 10.0 * wet.max(1e-3).log2();
         let d = e.dist;
-        println!("autopilot target {target} phon: auto drive {:+.1} dB, processed {phon:.1} phon, crest {:.1} dB, at ceiling {:.1}%", e.auto_drive_db, d.crest_wet_db, d.rail_pct);
+        println!("autopilot clip {clip_on} target {target} phon: auto drive {:+.1} dB, processed {phon:.1} phon, crest {:.1} dB, at ceiling {:.1}%", e.auto_drive_db, d.crest_wet_db, d.rail_pct);
         if target < 100.0 {
             assert!((phon - target).abs() < 2.0, "reachable target should be met");
         } else {

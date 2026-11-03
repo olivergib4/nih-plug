@@ -61,6 +61,9 @@ pub struct Settings {
     pub eq: eq::EqSettings,
     pub rotate: rotate::RotateSettings,
     pub autopilot: AutopilotSettings,
+    /// With Clip off, meter the processed side (sones, crest, autopilot) through a simulated
+    /// 1x hard clip at Output Ceiling: what a hard clipper downstream will make of it.
+    pub meter_thru_clip: bool,
     pub long_order: usize,
     pub short_order: usize,
 
@@ -113,6 +116,7 @@ impl Default for Settings {
             eq: eq::EqSettings::default(),
             rotate: rotate::RotateSettings::default(),
             autopilot: AutopilotSettings::default(),
+            meter_thru_clip: true,
             dyn_: DynamicsSettings {
                 weighting: Weighting::Off,
                 threshold_db: -24.0,
@@ -983,8 +987,12 @@ impl Engine {
                 self.tmp_in[ch] = self.dry[ch][i];
             }
             self.k_dry.push_frame(&self.tmp_in[..nc]);
+            // meter the processed side as a downstream 1x hard clip would see it (Clip off +
+            // Meter Thru Clip); the audio itself is untouched
+            let sim = !s.clip_on && s.meter_thru_clip;
             for ch in 0..nc {
-                self.tmp_in[ch] = self.cl[ch][i];
+                let w = self.cl[ch][i];
+                self.tmp_in[ch] = if sim { w.clamp(-out_ceil, out_ceil) } else { w };
             }
             self.k_wet.push_frame(&self.tmp_in[..nc]);
             self.sone_wet.push(&self.tmp_in[..nc]);
@@ -999,7 +1007,7 @@ impl Engine {
                 let a = &mut self.dist_acc;
                 for ch in 0..nc {
                     let d = self.dry[ch][i];
-                    let w = self.cl[ch][i];
+                    let w = if sim { self.cl[ch][i].clamp(-out_ceil, out_ceil) } else { self.cl[ch][i] };
                     a.dry_sq += d * d;
                     a.wet_sq += w * w;
                     a.dry_pk = a.dry_pk.max(d.abs());

@@ -60,7 +60,7 @@ const SIMPLE_IDS: &[&str] = &[
     "protect", "sens", "trans_boost",
     "mono_below", "width", "guard",
     "balance",
-    "output", "mix", "matched_bypass", "ref_level",
+    "output", "mix", "matched_bypass", "ref_level", "meter_thru_clip",
 ];
 
 fn shown(id: &str, advanced: bool) -> bool {

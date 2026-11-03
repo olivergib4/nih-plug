@@ -270,6 +270,8 @@ pub struct GlobalParams {
     pub matched_bypass: BoolParam,
     #[id = "ref_level"]
     pub ref_spl: FloatParam,
+    #[id = "meter_thru_clip"]
+    pub meter_thru_clip: BoolParam,
 }
 
 #[derive(Params)]
@@ -427,6 +429,7 @@ impl Default for OnsetGuardParams {
             )
             .with_unit(" dB SPL")
             .with_step_size(1.0),
+            meter_thru_clip: BoolParam::new("Meter Thru Clip", d.meter_thru_clip),
             }),
             resolution: Arc::new(ResolutionParams {
             long_order: IntParam::new(
@@ -596,7 +599,7 @@ impl Default for OnsetGuardParams {
             clip: Arc::new(ClipParams {
             clip_on: BoolParam::new("Clip", d.clip_on),
             drive_db: db_param("Clip Drive", d.drive_db, 0.0, 24.0),
-            ceil_db: db_param("Output Ceiling", d.ceil_db, -12.0, 0.0),
+            ceil_db: db_param("Output Ceiling", d.ceil_db, -12.0, 12.0),
             hardness: pct_param("Clip Hardness", d.hardness),
             trans_clip: pct_param("Transient Clip", d.trans_clip),
             clip_link: pct_param("Clip Stereo Link", d.clip_link),
@@ -720,6 +723,7 @@ impl OnsetGuardParams {
         s.output_gain = self.global.output_gain.value();
         s.matched_bypass = self.global.matched_bypass.value();
         s.ref_spl = self.global.ref_spl.value();
+        s.meter_thru_clip = self.global.meter_thru_clip.value();
         s
     }
 }

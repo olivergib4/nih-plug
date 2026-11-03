@@ -299,8 +299,23 @@ pub struct Engine {
     balance: balance::Balance,
     pre_eq: eq::PreEq,
     rotator: rotate::PhaseRotator,
-    /// Autopilot: extra drive in dB on top of Clip Drive, servoed once a second.
+    /// Per-bin inverse rotation for the reference path (Rotate Hits), cached by key.
+    unrot: Vec<Complex32>,
+    unrot_key: (usize, f32, f32),
+    /// Autopilot: extra drive in dB on top of Clip Drive, learned once a second until it
+    /// settles, then held (`auto_locked`) until Autopilot is switched off and on again.
     pub auto_drive_db: f32,
+    pub auto_locked: bool,
+    auto_was_on: bool,
+    auto_settled: u32,
+    /// Last three one-second summaries for the autopilot: (peak, sum of squares, samples,
+    /// sone sum, sone samples) of the (simulated-clipped) processed signal.
+    ap_hist: [(f32, f32, usize, f32, usize); 3],
+    ap_sone_sum: f32,
+    ap_sone_n: usize,
+    /// Last four learned drive values, for the lock test (range < 1 dB = settled).
+    ap_drive_hist: [f32; 4],
+    ap_ticks: u32,
     high_dyn: Dynamics,
     oversampler: clip::Oversampler,
     detector: onset::OnsetDetector,
@@ -385,7 +400,17 @@ impl Engine {
             balance: balance::Balance::new(max_long / 2 + 1),
             pre_eq: eq::PreEq::new(sample_rate, num_channels),
             rotator: rotate::PhaseRotator::new(sample_rate, num_channels),
+            unrot: vec![Complex32::new(1.0, 0.0); max_long / 2 + 1],
+            unrot_key: (0, 0.0, 0.0),
             auto_drive_db: 0.0,
+            auto_locked: false,
+            auto_was_on: false,
+            auto_settled: 0,
+            ap_hist: [(0.0, 0.0, 0, 0.0, 0); 3],
+            ap_sone_sum: 0.0,
+            ap_sone_n: 0,
+            ap_drive_hist: [0.0; 4],
+            ap_ticks: 0,
             high_dyn: Dynamics::new(Band::High, num_channels, max_short),
             oversampler: clip::Oversampler::new(num_channels, MAX_OVERSAMPLE),
             detector: onset::OnsetDetector::new(sample_rate),
@@ -485,6 +510,13 @@ impl Engine {
         self.pre_eq.reset();
         self.rotator.reset();
         self.auto_drive_db = 0.0;
+        self.auto_locked = false;
+        self.auto_settled = 0;
+        self.ap_hist = [(0.0, 0.0, 0, 0.0, 0); 3];
+        self.ap_sone_sum = 0.0;
+        self.ap_sone_n = 0;
+        self.ap_drive_hist = [0.0; 4];
+        self.ap_ticks = 0;
         self.short_stft.reset();
         self.clip_stft.reset();
         self.low_dyn.reset();
@@ -660,6 +692,9 @@ impl Engine {
             let bal_s = s.balance;
             let bal = &mut self.balance;
             let eq_ref = &self.pre_eq;
+            let rot_s = s.rotate;
+            let unrot = &mut self.unrot;
+            let unrot_key = &mut self.unrot_key;
             let ref_spl = s.ref_spl;
             let mut refs = self.wide.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
             self.long_stft.process(refs.as_mut(), len, |spectra, nb, mag| {
@@ -680,6 +715,25 @@ impl Engine {
                     // the sub channels are scratch here; they must go back to silence
                     for ch in 0..nc {
                         measure[ch][..nb].fill(Complex32::default());
+                    }
+                }
+                // Rotate Hits: hand the onset protection an un-rotated reference, so a hit
+                // comes out with its original phase while the body stays rotated
+                if rot_s.on && rot_s.hits < 0.999 {
+                    let amt = 1.0 - rot_s.hits.clamp(0.0, 1.0);
+                    let key = (nb, rot_s.freq_hz, amt);
+                    if *unrot_key != key {
+                        *unrot_key = key;
+                        for k in 0..nb {
+                            let f = k as f32 * sr / n_l;
+                            let ph = -amt * rotate::cascade_phase(f, sr, rot_s.freq_hz);
+                            unrot[k] = Complex32::new(ph.cos(), ph.sin());
+                        }
+                    }
+                    for ch in 0..nc {
+                        for k in 0..nb {
+                            second[ch][k] *= unrot[k];
+                        }
                     }
                 }
                 // mono-below on the reference pair when stereo
@@ -996,6 +1050,8 @@ impl Engine {
             }
             self.k_wet.push_frame(&self.tmp_in[..nc]);
             self.sone_wet.push(&self.tmp_in[..nc]);
+            self.ap_sone_sum += self.sone_wet.sone;
+            self.ap_sone_n += 1;
             self.sone_tr[1].push(&self.tmp_in[..nc]);
             self.sone_tr[3].push(&self.tmp_in[..nc]);
             for ch in 0..nc {
@@ -1019,6 +1075,7 @@ impl Engine {
                 a.n += nc;
                 if a.n >= (sr as usize) * nc {
                     let inv = 1.0 / a.n as f32;
+                    let (wet_pk_1s, wet_sq_1s, n_1s) = (a.wet_pk, a.wet_sq, a.n);
                     let dry_rms = (a.dry_sq * inv).sqrt();
                     let wet_rms = (a.wet_sq * inv).sqrt();
                     if wet_rms > 1e-5 {
@@ -1031,26 +1088,74 @@ impl Engine {
                     *a = DistortionAcc::default();
                     // --- autopilot: once a second, step the extra drive toward the target
                     // loudness, never past the crest floor ---
+                    // one-second summary into the 3-second history
+                    self.ap_hist.rotate_right(1);
+                    self.ap_hist[0] = (wet_pk_1s, wet_sq_1s, n_1s, self.ap_sone_sum, self.ap_sone_n);
+                    self.ap_sone_sum = 0.0;
+                    self.ap_sone_n = 0;
                     if s.autopilot.on {
-                        let phon = if self.sone_wet.sone > 1e-3 { 40.0 + 10.0 * self.sone_wet.sone.log2() } else { 0.0 };
-                        if self.sone_wet.sone > 0.5 {
-                            let d = &self.dist;
-                            let err = s.autopilot.target_phon - phon;
-                            let floor = s.autopilot.crest_floor_db;
-                            let step = if d.crest_wet_db < floor {
-                                -1.0f32.min((floor - d.crest_wet_db).max(0.5))
-                            } else if err > 0.5 && d.crest_wet_db > floor + 0.5 {
-                                (err * 0.5).min(1.5)
-                            } else if err < -0.5 {
-                                (err * 0.5).max(-1.5)
+                        if !self.auto_was_on {
+                            // switched on: start a fresh learn
+                            self.auto_locked = false;
+                            self.auto_settled = 0;
+                            self.auto_drive_db = 0.0;
+                            self.ap_drive_hist = [0.0; 4];
+                            self.ap_ticks = 0;
+                        }
+                        // 3-second crest and loudness: steadier than one second on sparse drums
+                        let (mut pk, mut sq, mut n, mut ss, mut sn) = (0.0f32, 0.0f32, 0usize, 0.0f32, 0usize);
+                        for h in &self.ap_hist {
+                            pk = pk.max(h.0);
+                            sq += h.1;
+                            n += h.2;
+                            ss += h.3;
+                            sn += h.4;
+                        }
+                        let rms3 = if n > 0 { (sq / n as f32).sqrt() } else { 0.0 };
+                        let crest3 = 20.0 * (pk / rms3.max(1e-9)).log10();
+                        let sone3 = if sn > 0 { ss / sn as f32 } else { 0.0 };
+                        let phon3 = if sone3 > 1e-3 { 40.0 + 10.0 * sone3.log2() } else { 0.0 };
+                        let warm = self.ap_hist.iter().all(|h| h.2 > 0);
+                        if !self.auto_locked && warm && sone3 > 0.5 {
+                            let floor_err = crest3 - s.autopilot.crest_floor_db; // headroom to push
+                            let loud_err = s.autopilot.target_phon - phon3;
+                            // proportional: half the error per second, at most 2 dB; the floor
+                            // always wins; a +-1 phon deadband around the target
+                            let step = if floor_err < 0.0 {
+                                floor_err.max(-2.0)
+                            } else if loud_err > 1.0 {
+                                (loud_err * 0.5).min(floor_err * 0.5).min(2.0)
+                            } else if loud_err < -1.0 {
+                                (loud_err * 0.5).max(-2.0)
                             } else {
                                 0.0
                             };
-                            self.auto_drive_db = (self.auto_drive_db + step).clamp(-12.0, 24.0);
+                            // near the floor the measurement lags the drive by up to three
+                            // seconds, so damp the last dB to avoid hunting
+                            let step = if floor_err.abs() < 1.5 { step * 0.5 } else { step };
+                            let next = (self.auto_drive_db + step).clamp(-12.0, 24.0);
+                            self.auto_drive_db = next;
+                            // settled = the last four learned values span less than 1 dB
+                            self.ap_drive_hist.rotate_right(1);
+                            self.ap_drive_hist[0] = next;
+                            self.ap_ticks += 1;
+                            if self.ap_ticks >= 4 {
+                                let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+                                for v in self.ap_drive_hist {
+                                    lo = lo.min(v);
+                                    hi = hi.max(v);
+                                }
+                                if hi - lo < 1.0 {
+                                    self.auto_locked = true;
+                                }
+                            }
                         }
                     } else {
                         self.auto_drive_db = 0.0;
+                        self.auto_locked = false;
+                        self.auto_settled = 0;
                     }
+                    self.auto_was_on = s.autopilot.on;
                 }
             }
             for ch in 0..nc {

@@ -1,5 +1,5 @@
 use nih_plug::prelude::Editor;
-use nih_plug::prelude::{ParamPtr, Params};
+use nih_plug::prelude::{Param, ParamPtr, Params};
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
@@ -53,7 +53,7 @@ impl Model for ViewModel {
 
 /// Parameters shown in the Simple view.
 const SIMPLE_IDS: &[&str] = &[
-    "clip", "drive", "ceiling", "trans_clip", "hf_preserve", "hf_amount", "hf_hits", "sub_split", "band_protect", "oversample", "rotate",
+    "clip", "drive", "ceiling", "trans_clip", "hf_preserve", "hf_amount", "hf_hits", "sub_split", "band_protect", "oversample", "rotate", "rotate_hits",
     "autopilot", "target", "crest_floor",
     "weighting", "threshold", "slope",
     "down_ratio", "up_ratio", "up_range", "up_depth", "attack", "release",
@@ -143,7 +143,8 @@ impl Model for MeterModel {
                 self.tr_flat = format!("noise-likeness: {:.0}% → {:.0}%  (0 = tones, 100 = white noise)", fd * 100.0, fw * 100.0);
                 let (cd, cw, rp) = (self.meters.crest_dry.load(Ordering::Relaxed), self.meters.crest_wet.load(Ordering::Relaxed), self.meters.rail_pct.load(Ordering::Relaxed));
                 self.tr_dist = format!("crest: {cd:.1} → {cw:.1} dB · at ceiling: {rp:.0}% of samples");
-                self.auto_drive = format!("auto drive {:+.1} dB", self.meters.auto_drive_db.load(Ordering::Relaxed));
+                let locked = self.meters.auto_locked.load(Ordering::Relaxed);
+                self.auto_drive = format!("auto drive {:+.1} dB{}", self.meters.auto_drive_db.load(Ordering::Relaxed), if locked { "  (settled, holding)" } else { "" });
             }
         });
     }
@@ -319,11 +320,26 @@ pub(crate) fn create(
                         group(cx, "Threshold", visible_rows(p.threshold.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.threshold.clone()), advanced));
                         group(cx, "Dynamics", visible_rows(p.dynamics.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.dynamics.clone()), advanced));
                         group(cx, "Autopilot", visible_rows(p.autopilot.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.autopilot.clone()), advanced));
-                        HelpArea::new(cx, help::AUTO_DRIVE_HELP, |cx| {
-                            Label::new(cx, MeterModel::auto_drive).font_size(11.0).height(Pixels(16.0));
+                        HStack::new(cx, |cx| {
+                            HelpArea::new(cx, help::AUTO_DRIVE_HELP, |cx| {
+                                Label::new(cx, MeterModel::auto_drive).font_size(11.0).height(Pixels(16.0)).top(Pixels(5.0));
+                            })
+                            .height(Pixels(26.0))
+                            .width(Pixels(230.0))
+                            .left(Pixels(15.0));
+                            let params = Data::params.get(cx);
+                            let meters = Data::meters.get(cx);
+                            Button::new(
+                                cx,
+                                move |cx| freeze_autopilot(cx, params.as_ref(), meters.as_ref()),
+                                |cx| Label::new(cx, "Freeze"),
+                            )
+                            .on_hover(|cx| cx.emit(HelpEvent::Show(help::FREEZE_HELP)))
+                            .height(Pixels(22.0))
+                            .top(Pixels(2.0));
                         })
-                        .height(Pixels(16.0))
-                        .left(Pixels(15.0));
+                        .height(Pixels(26.0))
+                        .width(COLUMN_WIDTH);
                     })
                     .width(COLUMN_WIDTH)
                     .height(Auto);
@@ -370,6 +386,19 @@ pub(crate) fn create(
     })
 }
 
+/// Write Clip Drive + auto drive into Clip Drive and switch Autopilot off: the learned
+/// setting becomes static.
+fn freeze_autopilot(cx: &mut EventContext, params: &OnsetGuardParams, meters: &Meters) {
+    let auto = meters.auto_drive_db.load(Ordering::Relaxed);
+    if params.autopilot.on.value() {
+        let total = params.clip.drive_db.value() + auto;
+        let drive = &params.clip.drive_db;
+        set_param(cx, drive.as_ptr(), drive.preview_normalized(total));
+        let on = &params.autopilot.on;
+        set_param(cx, on.as_ptr(), on.preview_normalized(false));
+    }
+}
+
 /// Set every parameter: listed ones to the preset value, the rest to their defaults.
 fn apply_preset(cx: &mut EventContext, params: &OnsetGuardParams, values: &[(&str, f32)]) {
     for (id, ptr, _) in params.param_map() {
@@ -379,7 +408,7 @@ fn apply_preset(cx: &mut EventContext, params: &OnsetGuardParams, values: &[(&st
             || id.starts_with("balance")
             || id.starts_with("eq")
             || id.starts_with("uz")
-            || matches!(id.as_str(), "rotate" | "rotate_hz" | "autopilot" | "target" | "crest_floor")
+            || matches!(id.as_str(), "rotate" | "rotate_hz" | "rotate_hits" | "autopilot" | "target" | "crest_floor")
         {
             continue;
         }

@@ -16,11 +16,14 @@ pub struct RotateSettings {
     pub on: bool,
     /// Corner frequency of the all-pass sections, Hz.
     pub freq_hz: f32,
+    /// How much of the rotation a detected hit keeps (0 = the transient is handed out
+    /// un-rotated by the onset protection, 1 = rotated like everything else).
+    pub hits: f32,
 }
 
 impl Default for RotateSettings {
     fn default() -> Self {
-        RotateSettings { on: false, freq_hz: 200.0 }
+        RotateSettings { on: false, freq_hz: 200.0, hits: 0.0 }
     }
 }
 
@@ -89,4 +92,18 @@ impl PhaseRotator {
             }
         }
     }
+}
+
+/// Phase response (radians) of the whole cascade at `hz`, for undoing the rotation in the
+/// frequency domain: multiply a bin by exp(-j * phase) to un-rotate it.
+pub fn cascade_phase(hz: f32, sample_rate: f32, freq_hz: f32) -> f32 {
+    let fc = freq_hz.clamp(20.0, sample_rate * 0.45);
+    let t = (std::f32::consts::PI * fc / sample_rate).tan();
+    let a = (t - 1.0) / (t + 1.0);
+    let w = 2.0 * std::f32::consts::PI * hz / sample_rate;
+    // H(z) = (a + z^-1) / (1 + a z^-1)
+    let (c, sn) = (w.cos(), w.sin());
+    let num = realfft::num_complex::Complex32::new(a + c, -sn);
+    let den = realfft::num_complex::Complex32::new(1.0 + a * c, -a * sn);
+    (num / den).arg() * STAGES as f32
 }

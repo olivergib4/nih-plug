@@ -1084,3 +1084,120 @@ fn autopilot_hits_the_target_or_the_crest_floor() {
         }
     }
 }
+
+/// Autopilot must learn, lock, and then HOLD: after it has settled on a loud section, a
+/// quieter section must not move the drive (the drums must not change through the song).
+#[test]
+fn autopilot_locks_and_holds_when_the_material_changes() {
+    let clap = synth_clap(33);
+    // loud section: hits with a body (sub + tone), so the crest floor can bind
+    let loud = |i: usize| {
+        let t = i as f32 / SR;
+        clap.get(i % (SR as usize / 2)).copied().unwrap_or(0.0) * 0.6
+            + 0.15 * (2.0 * std::f32::consts::PI * 55.0 * t).sin()
+            + 0.08 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+    };
+    let quiet = |i: usize| clap.get(i % (SR as usize)).copied().unwrap_or(0.0) * 0.15;
+    let n_loud = (12.0 * SR) as usize;
+    let n_quiet = (10.0 * SR) as usize;
+    let mut s = Settings::default();
+    s.protect_on = false;
+    s.dyn_.down_ratio = 1.0;
+    s.dyn_.up_ratio = 1.0;
+    s.dyn_.mono_below_hz = 0.0;
+    s.clip_on = false;
+    s.meter_thru_clip = true;
+    s.oversample = 1;
+    s.autopilot.on = true;
+    s.autopilot.target_phon = 130.0;
+    s.autopilot.crest_floor_db = 6.0;
+    let mut e = Engine::new(1, SR, BLOCK);
+    e.set_windows(s.long_order, s.short_order, s.oversample);
+    let mut c = vec![0.0f32; BLOCK];
+    let mut feed = |e: &mut Engine, f: &dyn Fn(usize) -> f32, n: usize| {
+        let mut pos = 0;
+        let mut last_sec = 0;
+        while pos + BLOCK <= n {
+            for i in 0..BLOCK { c[i] = f(pos + i); }
+            { let mut r: Vec<&mut [f32]> = vec![&mut c[..]]; e.process(&mut r, BLOCK, &s); }
+            pos += BLOCK;
+            if pos / SR as usize != last_sec {
+                last_sec = pos / SR as usize;
+                print!("[{last_sec}s {:+.1}{}] ", e.auto_drive_db, if e.auto_locked { "L" } else { "" });
+            }
+        }
+        println!();
+    };
+    feed(&mut e, &loud, n_loud);
+    let learned = e.auto_drive_db;
+    let locked = e.auto_locked;
+    feed(&mut e, &quiet, n_quiet);
+    println!("autopilot: learned {learned:+.1} dB on the loud section (locked {locked}); after 10 s of a quiet section: {:+.1} dB (locked {})", e.auto_drive_db, e.auto_locked);
+    assert!(locked, "should have locked on the loud section");
+    assert!((e.auto_drive_db - learned).abs() < 1e-6, "a quiet section must not move a locked drive");
+}
+
+/// Rotate Hits 0%: with onset protection on, a hit comes out with its ORIGINAL phase (nulls
+/// against the un-rotated run over the first 6 ms) while the asymmetric body between hits is
+/// still rotated (its crest is lower than un-rotated).
+#[test]
+fn rotate_hits_keeps_the_transient_and_rotates_the_body() {
+    let len = (3.0 * SR) as usize;
+    // one sharp noise burst per second (instant attack, 3 ms decay) over an asymmetric body
+    let mut st = 4444u32;
+    let burst: Vec<f32> = (0..(0.012 * SR) as usize)
+        .map(|i| {
+            st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+            ((st as f32 / u32::MAX as f32) * 2.0 - 1.0) * (-(i as f32) / (0.003 * SR)).exp()
+        })
+        .collect();
+    let f0 = 110.0f32;
+    let period = SR as usize; // one hit per second, at t = 0, 1, 2
+    let x: Vec<f32> = (0..len)
+        .map(|i| {
+            let t = i as f32 / SR;
+            let body = (1..=12).map(|h| (2.0 * std::f32::consts::PI * f0 * h as f32 * t).cos() / h as f32).sum::<f32>() * 0.15;
+            body + burst.get(i % period).copied().unwrap_or(0.0) * 0.8
+        })
+        .collect();
+    let mut s = Settings::default();
+    s.dyn_.down_ratio = 1.0;
+    s.dyn_.up_ratio = 1.0;
+    s.dyn_.mono_below_hz = 0.0;
+    s.clip_on = false;
+    s.protect_on = true;
+    s.onset_sens = 0.6;
+    s.hold_ms = 6.0;
+    let run_with = |on: bool, hits: f32| {
+        let mut s = s;
+        s.rotate.on = on;
+        s.rotate.hits = hits;
+        run(&[x.clone()], &s)[0].clone()
+    };
+    let plain = run_with(false, 0.0);
+    let rotated_all = run_with(true, 1.0);
+    let rotated_body = run_with(true, 0.0);
+    let onset = first_onset(&x[period..]) + period; // the second hit
+    let win = (0.006 * SR) as usize;
+    let null = |a: &[f32], b: &[f32]| -> f32 {
+        let e: f32 = a[onset..onset + win].iter().zip(&b[onset..onset + win]).map(|(p, q)| (p - q).powi(2)).sum();
+        let r: f32 = a[onset..onset + win].iter().map(|p| p * p).sum();
+        10.0 * (e / r.max(1e-12)).max(1e-12).log10()
+    };
+    let crest_body = |v: &[f32]| {
+        // 300..900 ms after the second hit: body only
+        let seg = &v[onset + (0.3 * SR) as usize..onset + (0.9 * SR) as usize];
+        let pk = seg.iter().fold(0.0f32, |m, a| m.max(a.abs()));
+        let rms = (seg.iter().map(|a| a * a).sum::<f32>() / seg.len() as f32).sqrt();
+        db(pk / rms)
+    };
+    let n_all = null(&plain, &rotated_all);
+    let n_body = null(&plain, &rotated_body);
+    println!(
+        "rotate hits: transient null vs un-rotated: hits 100% {n_all:.1} dB, hits 0% {n_body:.1} dB; body crest plain {:.2} dB, rotated {:.2} dB, hits-0% {:.2} dB",
+        crest_body(&plain), crest_body(&rotated_all), crest_body(&rotated_body)
+    );
+    assert!(n_body < -25.0, "with Rotate Hits 0% the transient must match the original");
+    assert!(n_body < n_all - 10.0, "Rotate Hits 0% must be much closer to the original than full rotation");
+    assert!(crest_body(&rotated_body) < crest_body(&plain) - 1.0, "the body must still be rotated");
+}

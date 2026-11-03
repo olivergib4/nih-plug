@@ -62,8 +62,9 @@ pub struct Meters {
     pub crest_dry: AtomicF32,
     pub crest_wet: AtomicF32,
     pub rail_pct: AtomicF32,
-    /// Autopilot's extra drive, dB.
+    /// Autopilot's extra drive, dB, and whether it has locked.
     pub auto_drive_db: AtomicF32,
+    pub auto_locked: std::sync::atomic::AtomicBool,
     /// Current matched-bypass gain, dB.
     pub match_db: AtomicF32,
 }
@@ -83,6 +84,7 @@ impl Default for Meters {
             crest_wet: AtomicF32::new(0.0),
             rail_pct: AtomicF32::new(0.0),
             auto_drive_db: AtomicF32::new(0.0),
+            auto_locked: std::sync::atomic::AtomicBool::new(false),
             match_db: AtomicF32::new(0.0),
         }
     }
@@ -372,6 +374,8 @@ pub struct ClipParams {
     pub rotate: BoolParam,
     #[id = "rotate_hz"]
     pub rotate_hz: FloatParam,
+    #[id = "rotate_hits"]
+    pub rotate_hits: FloatParam,
 }
 
 fn db_param(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
@@ -640,6 +644,7 @@ impl Default for OnsetGuardParams {
             )
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
             .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
+            rotate_hits: pct_param("Rotate Hits", d.rotate.hits),
             }),
         }
     }
@@ -710,6 +715,7 @@ impl OnsetGuardParams {
         s.band_protect = self.clip.band_protect.value();
         s.rotate.on = self.clip.rotate.value();
         s.rotate.freq_hz = self.clip.rotate_hz.value();
+        s.rotate.hits = self.clip.rotate_hits.value();
         s.autopilot.on = self.autopilot.on.value();
         s.autopilot.target_phon = self.autopilot.target_phon.value();
         s.autopilot.crest_floor_db = self.autopilot.crest_floor_db.value();
@@ -844,6 +850,7 @@ impl Plugin for OnsetGuard {
             self.meters.crest_wet.store(d.crest_wet_db, Ordering::Relaxed);
             self.meters.rail_pct.store(d.rail_pct, Ordering::Relaxed);
             self.meters.auto_drive_db.store(engine.auto_drive_db, Ordering::Relaxed);
+            self.meters.auto_locked.store(engine.auto_locked, Ordering::Relaxed);
             self.meters.match_db.store(20.0 * match_gain.max(1e-4).log10(), Ordering::Relaxed);
             self.meters.gr_post_db.store(gr_post, Ordering::Relaxed);
             self.meters.dry_lufs.store(dry, Ordering::Relaxed);

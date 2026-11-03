@@ -45,14 +45,17 @@ input ─ pre-EQ (min-phase) ─┬─ long STFT (stereo, balance, mono-below, l
   is untouched, only the phase between harmonics changes, so one-sided waveforms get a lower
   peak at the same loudness and take more drive before the clipper bites. Measured on a
   cosine-phase pulse train: crest 11.6 -> 6.2 dB, every harmonic magnitude within 0.02 dB.
-  The one stage that changes phase on purpose, hence off by default.
+  The one stage that changes phase on purpose, hence off by default. Rotate Hits (default 0%)
+  hands detected hits out with their original phase through the onset protection (transient
+  nulls against the un-rotated signal at -55 dB) while the body stays rotated.
 * **Meter Thru Clip** (Output, on by default). With Clip off, the processed-side readouts and
   the Autopilot measure the output through a simulated 1x hard clip at Output Ceiling: what a
   hard clipper on the master will make of these drums. For the bus workflow where the plugin
   makes the drums dense and the master clips once, on the sum. Output Ceiling now goes to
   +12 dB so a bus instance can shape only the extreme peaks and still hit the master hot.
-* **Autopilot.** Once a second, steps an extra drive toward Target Loudness (phon at Reference
-  Level) and never past Crest Floor. Measured: a 96-phon target lands at 95.7; an unreachable
+* **Autopilot.** Learns an extra drive toward Target Loudness (phon at Reference Level), never
+  past Crest Floor, on 3-second statistics; once steady it holds until switched off and on, and
+  Freeze writes the result into Clip Drive. Measured: a 96-phon target lands at 95.7; an unreachable
   130-phon target stops at the 6 dB floor (crest 6.1) with +12 dB of extra drive.
 * **Pre-EQ.** Four minimum-phase nodes drawn on the analyzer (low shelf, two one-octave bells,
   high shelf), applied at the input before every path. No pre-ringing by construction; the

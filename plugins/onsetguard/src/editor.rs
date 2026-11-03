@@ -16,7 +16,7 @@ const COLUMN_WIDTH: Units = Pixels(340.0);
 const CONTENT_WIDTH: f32 = 1360.0;
 /// Fits a 13" MacBook (900 px tall minus the menu bar and the host's window chrome).
 const GUI_WIDTH: u32 = 1380;
-const GUI_HEIGHT: u32 = 780;
+const GUI_HEIGHT: u32 = 800;
 /// Measured: one generic-UI row is 26 px tall at our stylesheet.
 const ROW_PX: f32 = 26.0;
 
@@ -53,7 +53,8 @@ impl Model for ViewModel {
 
 /// Parameters shown in the Simple view.
 const SIMPLE_IDS: &[&str] = &[
-    "clip", "drive", "ceiling", "trans_clip", "hf_preserve", "hf_amount", "hf_hits", "sub_split", "band_protect", "oversample",
+    "clip", "drive", "ceiling", "trans_clip", "hf_preserve", "hf_amount", "hf_hits", "sub_split", "band_protect", "oversample", "rotate",
+    "autopilot", "target", "crest_floor",
     "weighting", "threshold", "slope",
     "down_ratio", "up_ratio", "up_range", "up_depth", "attack", "release",
     "protect", "sens", "trans_boost",
@@ -104,6 +105,7 @@ pub struct MeterModel {
     pub tr_phone: String,
     pub tr_flat: String,
     pub tr_dist: String,
+    pub auto_drive: String,
     meters: Arc<Meters>,
 }
 
@@ -141,6 +143,7 @@ impl Model for MeterModel {
                 self.tr_flat = format!("noise-likeness: {:.0}% → {:.0}%  (0 = tones, 100 = white noise)", fd * 100.0, fw * 100.0);
                 let (cd, cw, rp) = (self.meters.crest_dry.load(Ordering::Relaxed), self.meters.crest_wet.load(Ordering::Relaxed), self.meters.rail_pct.load(Ordering::Relaxed));
                 self.tr_dist = format!("crest: {cd:.1} → {cw:.1} dB · at ceiling: {rp:.0}% of samples");
+                self.auto_drive = format!("auto drive {:+.1} dB", self.meters.auto_drive_db.load(Ordering::Relaxed));
             }
         });
     }
@@ -212,6 +215,7 @@ pub(crate) fn create(
             tr_phone: String::new(),
             tr_flat: String::new(),
             tr_dist: String::new(),
+            auto_drive: String::new(),
             meters: meters.clone(),
         }
         .build(cx);
@@ -314,6 +318,12 @@ pub(crate) fn create(
                     VStack::new(cx, |cx| {
                         group(cx, "Threshold", visible_rows(p.threshold.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.threshold.clone()), advanced));
                         group(cx, "Dynamics", visible_rows(p.dynamics.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.dynamics.clone()), advanced));
+                        group(cx, "Autopilot", visible_rows(p.autopilot.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.autopilot.clone()), advanced));
+                        HelpArea::new(cx, help::AUTO_DRIVE_HELP, |cx| {
+                            Label::new(cx, MeterModel::auto_drive).font_size(11.0).height(Pixels(16.0));
+                        })
+                        .height(Pixels(16.0))
+                        .left(Pixels(15.0));
                     })
                     .width(COLUMN_WIDTH)
                     .height(Auto);
@@ -369,6 +379,7 @@ fn apply_preset(cx: &mut EventContext, params: &OnsetGuardParams, values: &[(&st
             || id.starts_with("balance")
             || id.starts_with("eq")
             || id.starts_with("uz")
+            || matches!(id.as_str(), "rotate" | "rotate_hz" | "autopilot" | "target" | "crest_floor")
         {
             continue;
         }

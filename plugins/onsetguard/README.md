@@ -41,6 +41,14 @@ input ─ pre-EQ (min-phase) ─┬─ long STFT (stereo, balance, mono-below, l
   setting. At 1x the clip stage is bit-identical to a plain sample-level hard clip; at 2-8x it
   matches one within 0.1 dB in every band except the alias energy it removes. (A per-bin
   "spectral ceiling" was measured and removed: it gave no loudness.)
+* **Phase Rotate** (off by default). Four first-order all-pass stages at 200 Hz: the spectrum
+  is untouched, only the phase between harmonics changes, so one-sided waveforms get a lower
+  peak at the same loudness and take more drive before the clipper bites. Measured on a
+  cosine-phase pulse train: crest 11.6 -> 6.2 dB, every harmonic magnitude within 0.02 dB.
+  The one stage that changes phase on purpose, hence off by default.
+* **Autopilot.** Once a second, steps an extra drive toward Target Loudness (phon at Reference
+  Level) and never past Crest Floor. Measured: a 96-phon target lands at 95.7; an unreachable
+  130-phon target stops at the 6 dB floor (crest 6.1) with +12 dB of extra drive.
 * **Pre-EQ.** Four minimum-phase nodes drawn on the analyzer (low shelf, two one-octave bells,
   high shelf), applied at the input before every path. No pre-ringing by construction; the
   compressor sees the shaped signal.

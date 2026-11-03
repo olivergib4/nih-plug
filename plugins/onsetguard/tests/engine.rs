@@ -992,3 +992,92 @@ fn distortion_readout_tracks_crest_and_rail() {
     assert!(rows[1].crest_wet_db < rows[1].crest_dry_db - 6.0, "20 dB into a hard clip collapses the crest");
     assert!(rows[1].rail_pct > 2.0, "20 dB into a hard clip pins a visible share of samples (sparse claps: short hits, long gaps)");
 }
+
+/// Phase rotation: on a one-sided waveform (harmonics with aligned phases, a pulse-like
+/// snare body) the crest factor must drop while every harmonic's magnitude stays the same.
+#[test]
+fn phase_rotation_lowers_crest_without_changing_magnitudes() {
+    let len = (2.0 * SR) as usize;
+    let f0 = 110.0f32;
+    let x: Vec<f32> = (0..len)
+        .map(|i| {
+            let t = i as f32 / SR;
+            // cosine-phase harmonics: a sharp, asymmetric pulse train
+            (1..=16).map(|h| (2.0 * std::f32::consts::PI * f0 * h as f32 * t).cos() / h as f32).sum::<f32>() * 0.25
+        })
+        .collect();
+    let mut s = Settings::default();
+    s.dyn_.down_ratio = 1.0;
+    s.dyn_.up_ratio = 1.0;
+    s.dyn_.mono_below_hz = 0.0;
+    s.clip_on = false;
+    s.protect_on = false;
+    let crest = |v: &[f32]| {
+        let seg = &v[len / 2..];
+        let pk = seg.iter().fold(0.0f32, |m, a| m.max(a.abs()));
+        let rms = (seg.iter().map(|a| a * a).sum::<f32>() / seg.len() as f32).sqrt();
+        db(pk / rms)
+    };
+    let mut rows = Vec::new();
+    for on in [false, true] {
+        s.rotate.on = on;
+        let out = run(&[x.clone()], &s);
+        let c = crest(&out[0]);
+        let mags: Vec<f32> = (1..=8).map(|h| db(goertzel(&out[0][len / 2..], SR, f0 * h as f32))).collect();
+        println!("rotate {on}: crest {c:.2} dB, harmonics 1-8 {:?}", mags.iter().map(|m| format!("{m:.2}")).collect::<Vec<_>>());
+        rows.push((c, mags));
+    }
+    assert!(rows[1].0 < rows[0].0 - 1.0, "rotation should lower the crest by more than 1 dB on a one-sided pulse");
+    for (a, b) in rows[0].1.iter().zip(&rows[1].1) {
+        assert!((a - b).abs() < 0.1, "harmonic magnitude must be unchanged ({a:.2} vs {b:.2})");
+    }
+}
+
+/// Autopilot: a loop at a given level; target reachable -> processed loudness lands within
+/// 2 phon of the target; target unreachable without squaring -> the crest floor holds and
+/// the drive stops rising.
+#[test]
+fn autopilot_hits_the_target_or_the_crest_floor() {
+    let len = (14.0 * SR) as usize;
+    let clap = synth_clap(21);
+    let x: Vec<f32> = (0..len)
+        .map(|i| {
+            let t = i as f32 / SR;
+            let hit = clap.get(i % (SR as usize / 2)).copied().unwrap_or(0.0) * 0.6;
+            hit + 0.15 * (2.0 * std::f32::consts::PI * 55.0 * t).sin() + 0.08 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+        })
+        .collect();
+    let mut s = Settings::default();
+    s.protect_on = false;
+    s.dyn_.down_ratio = 1.0;
+    s.dyn_.up_ratio = 1.0;
+    s.dyn_.mono_below_hz = 0.0;
+    s.clip_on = true;
+    s.drive_db = 0.0;
+    s.oversample = 1;
+    s.trans_clip = 1.0;
+    s.autopilot.on = true;
+    s.autopilot.crest_floor_db = 6.0;
+    for target in [96.0f32, 130.0] {
+        s.autopilot.target_phon = target;
+        let mut e = Engine::new(1, SR, BLOCK);
+        e.set_windows(s.long_order, s.short_order, s.oversample);
+        let mut pos = 0;
+        let mut c = vec![0.0f32; BLOCK];
+        while pos + BLOCK <= len {
+            c.copy_from_slice(&x[pos..pos + BLOCK]);
+            { let mut r: Vec<&mut [f32]> = vec![&mut c[..]]; e.process(&mut r, BLOCK, &s); }
+            pos += BLOCK;
+        }
+        let (_, wet) = e.sones();
+        let phon = 40.0 + 10.0 * wet.max(1e-3).log2();
+        let d = e.dist;
+        println!("autopilot target {target} phon: auto drive {:+.1} dB, processed {phon:.1} phon, crest {:.1} dB, at ceiling {:.1}%", e.auto_drive_db, d.crest_wet_db, d.rail_pct);
+        if target < 100.0 {
+            assert!((phon - target).abs() < 2.0, "reachable target should be met");
+        } else {
+            assert!(d.crest_wet_db > s.autopilot.crest_floor_db - 1.0, "crest floor must hold on an unreachable target");
+            assert!(e.auto_drive_db < 24.0, "drive must stop short of the clamp");
+        }
+    }
+}

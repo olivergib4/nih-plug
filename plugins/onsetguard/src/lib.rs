@@ -62,6 +62,8 @@ pub struct Meters {
     pub crest_dry: AtomicF32,
     pub crest_wet: AtomicF32,
     pub rail_pct: AtomicF32,
+    /// Autopilot's extra drive, dB.
+    pub auto_drive_db: AtomicF32,
     /// Current matched-bypass gain, dB.
     pub match_db: AtomicF32,
 }
@@ -80,6 +82,7 @@ impl Default for Meters {
             crest_dry: AtomicF32::new(0.0),
             crest_wet: AtomicF32::new(0.0),
             rail_pct: AtomicF32::new(0.0),
+            auto_drive_db: AtomicF32::new(0.0),
             match_db: AtomicF32::new(0.0),
         }
     }
@@ -155,6 +158,18 @@ pub struct OnsetGuardParams {
     pub eq: Arc<EqParams>,
     #[nested(group = "Upward Zone")]
     pub zone: Arc<ZoneParams>,
+    #[nested(group = "Autopilot")]
+    pub autopilot: Arc<AutopilotParams>,
+}
+
+#[derive(Params)]
+pub struct AutopilotParams {
+    #[id = "autopilot"]
+    pub on: BoolParam,
+    #[id = "target"]
+    pub target_phon: FloatParam,
+    #[id = "crest_floor"]
+    pub crest_floor_db: FloatParam,
 }
 
 /// Four nodes drawn on the analyzer: where (and how much) the upward compressor may lift.
@@ -351,6 +366,10 @@ pub struct ClipParams {
     pub sub_ceil_db: FloatParam,
     #[id = "band_protect"]
     pub band_protect: FloatParam,
+    #[id = "rotate"]
+    pub rotate: BoolParam,
+    #[id = "rotate_hz"]
+    pub rotate_hz: FloatParam,
 }
 
 fn db_param(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
@@ -491,6 +510,13 @@ impl Default for OnsetGuardParams {
             f4: eq_hz_param("Upward Zone 4 Freq", d.dyn_.up_zone_hz[3]),
             a4: pct_param("Upward Zone 4 Amount", d.dyn_.up_zone_amt[3]),
             }),
+            autopilot: Arc::new(AutopilotParams {
+            on: BoolParam::new("Autopilot", d.autopilot.on),
+            target_phon: FloatParam::new("Target Loudness", d.autopilot.target_phon, FloatRange::Linear { min: 60.0, max: 130.0 })
+                .with_unit(" phon")
+                .with_step_size(0.5),
+            crest_floor_db: db_param("Crest Floor", d.autopilot.crest_floor_db, 1.0, 12.0),
+            }),
             threshold: Arc::new(ThresholdParams {
             weighting: EnumParam::new("Detector Weighting", DetectorWeighting::Off),
             threshold_db: db_param("Threshold", d.dyn_.threshold_db, -80.0, 0.0),
@@ -603,6 +629,14 @@ impl Default for OnsetGuardParams {
             .with_step_size(1.0),
             sub_ceil_db: db_param("Sub Ceiling", d.sub_ceil_db, -24.0, 0.0),
             band_protect: pct_param("Protect Amount", d.band_protect),
+            rotate: BoolParam::new("Phase Rotate", d.rotate.on),
+            rotate_hz: FloatParam::new(
+                "Rotate Freq",
+                d.rotate.freq_hz,
+                FloatRange::Skewed { min: 50.0, max: 1000.0, factor: FloatRange::skew_factor(-1.0) },
+            )
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
+            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
             }),
         }
     }
@@ -671,6 +705,11 @@ impl OnsetGuardParams {
         s.hf_on_hits = self.clip.hf_on_hits.value();
         s.sub_ceil_db = self.clip.sub_ceil_db.value();
         s.band_protect = self.clip.band_protect.value();
+        s.rotate.on = self.clip.rotate.value();
+        s.rotate.freq_hz = self.clip.rotate_hz.value();
+        s.autopilot.on = self.autopilot.on.value();
+        s.autopilot.target_phon = self.autopilot.target_phon.value();
+        s.autopilot.crest_floor_db = self.autopilot.crest_floor_db.value();
         s.oversample = match self.clip.oversample.value() {
             Oversample::X1 => 1,
             Oversample::X2 => 2,
@@ -800,6 +839,7 @@ impl Plugin for OnsetGuard {
             self.meters.crest_dry.store(d.crest_dry_db, Ordering::Relaxed);
             self.meters.crest_wet.store(d.crest_wet_db, Ordering::Relaxed);
             self.meters.rail_pct.store(d.rail_pct, Ordering::Relaxed);
+            self.meters.auto_drive_db.store(engine.auto_drive_db, Ordering::Relaxed);
             self.meters.match_db.store(20.0 * match_gain.max(1e-4).log10(), Ordering::Relaxed);
             self.meters.gr_post_db.store(gr_post, Ordering::Relaxed);
             self.meters.dry_lufs.store(dry, Ordering::Relaxed);

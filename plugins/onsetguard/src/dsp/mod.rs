@@ -16,6 +16,7 @@ pub mod dynamics;
 pub mod eq;
 pub mod loudness;
 pub mod onset;
+pub mod rotate;
 pub mod sone;
 pub mod stereo;
 pub mod stft;
@@ -58,6 +59,8 @@ pub struct Settings {
     pub stereo: stereo::StereoSettings,
     pub balance: balance::BalanceSettings,
     pub eq: eq::EqSettings,
+    pub rotate: rotate::RotateSettings,
+    pub autopilot: AutopilotSettings,
     pub long_order: usize,
     pub short_order: usize,
 
@@ -108,6 +111,8 @@ impl Default for Settings {
             stereo: stereo::StereoSettings::default(),
             balance: balance::BalanceSettings::default(),
             eq: eq::EqSettings::default(),
+            rotate: rotate::RotateSettings::default(),
+            autopilot: AutopilotSettings::default(),
             dyn_: DynamicsSettings {
                 weighting: Weighting::Off,
                 threshold_db: -24.0,
@@ -194,6 +199,22 @@ impl Delay {
     }
 }
 
+/// Loudness autopilot: servo the clip drive toward a target loudness, never past a crest floor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AutopilotSettings {
+    pub on: bool,
+    /// Target perceived loudness of the processed signal, phon (at Reference Level).
+    pub target_phon: f32,
+    /// The processed crest factor the autopilot must not go below, dB.
+    pub crest_floor_db: f32,
+}
+
+impl Default for AutopilotSettings {
+    fn default() -> Self {
+        AutopilotSettings { on: false, target_phon: 100.0, crest_floor_db: 4.0 }
+    }
+}
+
 /// Distortion readout over the last second.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Distortion {
@@ -273,6 +294,9 @@ pub struct Engine {
     stereo_stage: stereo::StereoStage,
     balance: balance::Balance,
     pre_eq: eq::PreEq,
+    rotator: rotate::PhaseRotator,
+    /// Autopilot: extra drive in dB on top of Clip Drive, servoed once a second.
+    pub auto_drive_db: f32,
     high_dyn: Dynamics,
     oversampler: clip::Oversampler,
     detector: onset::OnsetDetector,
@@ -356,6 +380,8 @@ impl Engine {
             stereo_stage: stereo::StereoStage::new(max_long / 2 + 1),
             balance: balance::Balance::new(max_long / 2 + 1),
             pre_eq: eq::PreEq::new(sample_rate, num_channels),
+            rotator: rotate::PhaseRotator::new(sample_rate, num_channels),
+            auto_drive_db: 0.0,
             high_dyn: Dynamics::new(Band::High, num_channels, max_short),
             oversampler: clip::Oversampler::new(num_channels, MAX_OVERSAMPLE),
             detector: onset::OnsetDetector::new(sample_rate),
@@ -453,6 +479,8 @@ impl Engine {
         self.stereo_stage.reset();
         self.balance.reset();
         self.pre_eq.reset();
+        self.rotator.reset();
+        self.auto_drive_db = 0.0;
         self.short_stft.reset();
         self.clip_stft.reset();
         self.low_dyn.reset();
@@ -550,6 +578,7 @@ impl Engine {
         // --- pre-EQ: minimum-phase, on the input, before every path ---
         self.pre_eq.update(&s.eq);
         self.pre_eq.process(channels, len);
+        self.rotator.process(channels, len, &s.rotate);
 
         // --- dry delay, onset detection, protection ring writes (input timeline) ---
         let pre = (s.pre_ms.clamp(0.0, MAX_PRE_MS) / 1000.0 * sr).round() as usize;
@@ -691,7 +720,7 @@ impl Engine {
         }
 
         // --- align, protect, boost; then drive ---
-        let drive = 10f32.powf(s.drive_db / 20.0);
+        let drive = 10f32.powf((s.drive_db + if s.autopilot.on { self.auto_drive_db } else { 0.0 }) / 20.0);
         let base_t = self.pos; // input time of channels[..][0]
         let l_spec_total = self.long_stft.window_size() + self.short_stft.window_size() + self.extra_delay;
         let mut prot_count = 0usize;
@@ -992,6 +1021,28 @@ impl Engine {
                         };
                     }
                     *a = DistortionAcc::default();
+                    // --- autopilot: once a second, step the extra drive toward the target
+                    // loudness, never past the crest floor ---
+                    if s.autopilot.on {
+                        let phon = if self.sone_wet.sone > 1e-3 { 40.0 + 10.0 * self.sone_wet.sone.log2() } else { 0.0 };
+                        if self.sone_wet.sone > 0.5 {
+                            let d = &self.dist;
+                            let err = s.autopilot.target_phon - phon;
+                            let floor = s.autopilot.crest_floor_db;
+                            let step = if d.crest_wet_db < floor {
+                                -1.0f32.min((floor - d.crest_wet_db).max(0.5))
+                            } else if err > 0.5 && d.crest_wet_db > floor + 0.5 {
+                                (err * 0.5).min(1.5)
+                            } else if err < -0.5 {
+                                (err * 0.5).max(-1.5)
+                            } else {
+                                0.0
+                            };
+                            self.auto_drive_db = (self.auto_drive_db + step).clamp(-12.0, 24.0);
+                        }
+                    } else {
+                        self.auto_drive_db = 0.0;
+                    }
                 }
             }
             for ch in 0..nc {

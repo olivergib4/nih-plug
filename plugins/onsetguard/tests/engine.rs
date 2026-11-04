@@ -653,12 +653,17 @@ fn stereo_width_is_mono_compatible_and_guard_removes_antiphase() {
     let out = run(&[l.clone(), r.clone()], &s);
     let (ol, or) = (seg(&out[0]), seg(&out[1]));
     let m_out = mid(&ol, &or);
-    let m_err = m_in.iter().zip(&m_out).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
     let s_out = side(&ol, &or);
+    let energy = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * x + y * y).sum::<f32>();
+    let e_ratio = db((energy(&ol, &or) / energy(&il, &ir)).sqrt());
+    let mono_ratio = db((m_out.iter().map(|v| v * v).sum::<f32>() / m_in.iter().map(|v| v * v).sum::<f32>()).sqrt());
     let (g1k, g3k) = (db(goertzel(&s_out, SR, 1000.0) / s1k_in), db(goertzel(&s_out, SR, 3000.0) / s3k_in));
     let (l3k_in, l3k_out) = (goertzel(&il, SR, 3000.0), goertzel(&ol, SR, 3000.0));
-    println!("guard 100%: mid max error {:.1} dB, anti-phase 1 kHz side {:+.1} dB, panned 3 kHz side {:+.2} dB, left 3 kHz {:+.2} dB", db(m_err / 0.2), g1k, g3k, db(l3k_out / l3k_in));
-    assert!(db(m_err / 0.2) < -80.0, "guard must not touch the mono sum");
+    println!("guard 100%: stereo energy {e_ratio:+.2} dB, mono sum {mono_ratio:+.2} dB, anti-phase 1 kHz side {g1k:+.1} dB, panned 3 kHz side {g3k:+.2} dB, left 3 kHz {:+.2} dB", db(l3k_out / l3k_in));
+    // a pure anti-phase tone has no mid at its bins, so its energy cannot be handed over;
+    // the contract is: mono never quieter, stereo loses at most that pure-side share
+    assert!(mono_ratio > -0.1, "guard must never make the mono sum quieter");
+    assert!(e_ratio > -3.5, "stereo loses at most the pure-side share");
     assert!(g1k < -40.0, "anti-phase side should be removed");
     assert!(g3k.abs() < 0.2 && db(l3k_out / l3k_in).abs() < 0.2, "panned in-phase material must be untouched");
 }
@@ -946,11 +951,12 @@ fn antiphase_guard_does_not_pre_ring() {
     let pre = side(&out[0], &out[1], t0 - (0.040 * SR) as usize, t0 - 1);
     let burst = side(&out[0], &out[1], t0 + (1.5 * SR) as usize, t0 + (1.9 * SR) as usize);
     let burst_in = side(&l, &r, t0 + (1.5 * SR) as usize, t0 + (1.9 * SR) as usize);
-    let mid_err = (0..len).map(|i| ((out[0][i] + out[1][i]) * 0.5 - (l[i] + r[i]) * 0.5).abs()).fold(0.0f32, f32::max);
-    println!("guard 100%: side pre-ring (40 ms before) {:.1} dB re input burst, burst passed at {:.1} dB, mid max error {:.1} dB", db(pre / burst_in), db(burst / burst_in), db(mid_err / 0.2));
+    let e_in: f32 = (0..len).map(|i| l[i] * l[i] + r[i] * r[i]).sum();
+    let e_out: f32 = (0..len).map(|i| out[0][i] * out[0][i] + out[1][i] * out[1][i]).sum();
+    println!("guard 100%: side pre-ring (40 ms before) {:.1} dB re input burst, burst passed at {:.1} dB, stereo energy {:+.2} dB", db(pre / burst_in), db(burst / burst_in), db((e_out / e_in).sqrt()));
     assert!(db(pre / burst_in) < -50.0, "no pre-ring on the Side before the anti-phase onset");
     assert!(db(burst / burst_in) < -20.0, "the anti-phase burst itself must be removed");
-    assert!(db(mid_err / 0.2) < -80.0, "mid untouched");
+    assert!(db((e_out / e_in).sqrt()) > -3.5, "stereo loses at most the pure-side burst's share");
 }
 
 /// Distortion readout: a clap loop driven 20 dB into a 1x hard clip must read a crest factor
@@ -1253,4 +1259,84 @@ fn hit_drive_is_independent_of_clip_drive() {
             assert!((gh - 12.0).abs() < 1.0 && gb.abs() < 0.5, "hit drive must move the hit only");
         }
     }
+}
+
+/// Correlation Floor: weakly-correlated (rho ~ 0) wide content is narrowed into the mid, so the
+/// mono sum gets louder; in-phase panned content is untouched; floor 0 leaves rho ~ 0 alone.
+#[test]
+fn correlation_floor_narrows_weakly_correlated_content_only() {
+    let len = (3.0 * SR) as usize;
+    let (mut s1, mut s2) = (111u32, 222u32);
+    let (mut l, mut r) = (vec![0.0f32; len], vec![0.0f32; len]);
+    for i in 0..len {
+        let t = i as f32 / SR;
+        s1 ^= s1 << 13; s1 ^= s1 >> 17; s1 ^= s1 << 5;
+        s2 ^= s2 << 13; s2 ^= s2 >> 17; s2 ^= s2 << 5;
+        let (n1, n2) = ((s1 as f32 / u32::MAX as f32) * 2.0 - 1.0, (s2 as f32 / u32::MAX as f32) * 2.0 - 1.0);
+        // independent noise per side (rho ~ 0, a "wide" bed) + a 3 kHz tone panned 70% left
+        l[i] = 0.2 * n1 + 0.2 * (2.0 * std::f32::consts::PI * 3000.0 * t).sin();
+        r[i] = 0.2 * n2 + 0.06 * (2.0 * std::f32::consts::PI * 3000.0 * t).sin();
+    }
+    let mut base = Settings::default();
+    base.dyn_.down_ratio = 1.0;
+    base.dyn_.up_ratio = 1.0;
+    base.dyn_.mono_below_hz = 0.0;
+    base.clip_on = false;
+    base.protect_on = false;
+    base.stereo.guard = 1.0;
+    let seg = len * 2 / 3;
+    let mono_rms = |a: &[f32], b: &[f32]| (a[seg..].iter().zip(&b[seg..]).map(|(x, y)| ((x + y) * 0.5).powi(2)).sum::<f32>() / (len - seg) as f32).sqrt();
+    let side_rms = |a: &[f32], b: &[f32]| (a[seg..].iter().zip(&b[seg..]).map(|(x, y)| ((x - y) * 0.5).powi(2)).sum::<f32>() / (len - seg) as f32).sqrt();
+    let (m_in, s_in) = (mono_rms(&l, &r), side_rms(&l, &r));
+    let tone_l_in = goertzel(&l[seg..], SR, 3000.0);
+    let mut rows = Vec::new();
+    for floor in [0.0f32, 0.5] {
+        let mut s = base;
+        s.stereo.floor = floor;
+        let out = run(&[l.clone(), r.clone()], &s);
+        let (m, sd) = (mono_rms(&out[0], &out[1]), side_rms(&out[0], &out[1]));
+        let tone_l = goertzel(&out[0][seg..], SR, 3000.0);
+        println!("floor {floor}: mono sum {:+.2} dB, side {:+.2} dB, panned 3 kHz left {:+.2} dB", db(m / m_in), db(sd / s_in), db(tone_l / tone_l_in));
+        rows.push((db(m / m_in), db(sd / s_in), db(tone_l / tone_l_in)));
+    }
+    assert!(rows[0].1.abs() < 1.0, "floor 0 must (nearly) leave uncorrelated content alone");
+    assert!(rows[1].1 < -2.0, "floor 0.5 must narrow the uncorrelated bed");
+    assert!(rows[1].0 > 0.5, "narrowing must make the mono sum louder");
+    assert!(rows[1].2.abs() < 0.3, "the in-phase panned tone must be untouched");
+}
+
+/// Drive smoothing: a 12 dB jump in Clip Drive mid-stream must ramp, not step. On a 100 Hz
+/// sine the largest sample-to-sample change must stay close to the sine's own slope.
+#[test]
+fn drive_changes_are_ramped() {
+    let len = (2.0 * SR) as usize;
+    let x: Vec<f32> = (0..len).map(|i| 0.2 * (2.0 * std::f32::consts::PI * 100.0 * i as f32 / SR).sin()).collect();
+    let mut s = Settings::default();
+    s.dyn_.down_ratio = 1.0;
+    s.dyn_.up_ratio = 1.0;
+    s.dyn_.mono_below_hz = 0.0;
+    s.clip_on = false;
+    s.protect_on = false;
+    s.drive_db = 0.0;
+    let mut e = Engine::new(1, SR, BLOCK);
+    e.set_windows(s.long_order, s.short_order, s.oversample);
+    let total = len + e.latency();
+    let mut out = Vec::with_capacity(total);
+    let mut pos = 0;
+    while pos < total {
+        let n = BLOCK.min(total - pos);
+        if pos >= SR as usize + e.latency() { s.drive_db = 12.0; }
+        let mut c: Vec<f32> = (0..n).map(|i| x.get(pos + i).copied().unwrap_or(0.0)).collect();
+        { let mut r: Vec<&mut [f32]> = vec![&mut c[..]]; e.process(&mut r, n, &s); }
+        out.extend_from_slice(&c);
+        pos += n;
+    }
+    let out = &out[e.latency()..];
+    // max sample-to-sample step after the drive jump vs the sine's own max slope at 12 dB
+    let from = SR as usize - 100;
+    let to = (1.5 * SR) as usize;
+    let max_step = out[from..to].windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+    let sine_slope = 0.2 * 10f32.powf(12.0 / 20.0) * 2.0 * std::f32::consts::PI * 100.0 / SR;
+    println!("drive jump: max sample step {max_step:.4} vs the sine's own max slope {sine_slope:.4} (a hard step would be ~{:.3})", 0.2 * (10f32.powf(12.0 / 20.0) - 1.0));
+    assert!(max_step < sine_slope * 1.5, "a drive change must ramp, not step");
 }

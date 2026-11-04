@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::analyzer::{Analyzer, AnalyzerData, SoneBars};
+use crate::analyzer::{Analyzer, AnalyzerData, LoudBar, LoudSource};
 use crate::help;
 use crate::presets::PRESETS;
 use crate::{Meters, OnsetGuardParams};
@@ -19,6 +19,8 @@ const GUI_WIDTH: u32 = 1380;
 const GUI_HEIGHT: u32 = 800;
 /// Measured: one generic-UI row is 26 px tall at our stylesheet.
 const ROW_PX: f32 = 26.0;
+/// Height of the three meter panels under the analyzer.
+const PANEL_H: f32 = 116.0;
 
 #[derive(Clone, Lens)]
 pub struct Data {
@@ -58,7 +60,7 @@ const SIMPLE_IDS: &[&str] = &[
     "weighting", "threshold", "slope",
     "down_ratio", "up_ratio", "up_range", "up_depth", "attack", "release",
     "protect", "sens", "trans_boost",
-    "mono_below", "width", "guard",
+    "mono_below", "width", "guard", "corr_floor",
     "balance",
     "output", "mix", "matched_bypass", "ref_level", "meter_thru_clip",
 ];
@@ -99,10 +101,12 @@ impl Model for HelpModel {
 pub struct MeterModel {
     pub dry: String,
     pub wet: String,
+    pub mono: String,
     pub matched: String,
     pub tr_full: String,
     pub tr_laptop: String,
     pub tr_phone: String,
+    pub tr_mono: String,
     pub tr_flat: String,
     pub tr_dist: String,
     pub auto_drive: String,
@@ -128,8 +132,10 @@ impl Model for MeterModel {
                 let d = self.meters.dry_sone.load(Ordering::Relaxed);
                 let w = self.meters.wet_sone.load(Ordering::Relaxed);
                 let m = self.meters.match_db.load(Ordering::Relaxed);
+                let (md, mw) = (self.meters.mono_dry_sone.load(Ordering::Relaxed), self.meters.mono_wet_sone.load(Ordering::Relaxed));
                 self.dry = format!("dry  {d:.1} sone · {:.0} phon", phon(d));
                 self.wet = format!("processed  {w:.1} sone · {:.0} phon", phon(w));
+                self.mono = format!("mono sum  {mw:.1} sone · {:.0} phon", phon(mw));
                 self.matched = format!("match {m:+.1} dB");
                 let t: Vec<f32> = self.meters.tr_sone.iter().map(|v| v.load(Ordering::Relaxed)).collect();
                 let row = |name: &str, dry: f32, wet: f32| {
@@ -139,6 +145,7 @@ impl Model for MeterModel {
                 self.tr_full = row("full", d, w);
                 self.tr_laptop = row("laptop", t[2], t[3]);
                 self.tr_phone = row("phone", t[0], t[1]);
+                self.tr_mono = format!("mono: {md:.1} → {mw:.1} sone ({:+.1} phon) · {:+.1} vs stereo", phon(mw) - phon(md), phon(mw) - phon(w));
                 let (fd, fw) = (self.meters.flat_dry.load(Ordering::Relaxed), self.meters.flat_wet.load(Ordering::Relaxed));
                 self.tr_flat = format!("noise-likeness: {:.0}% → {:.0}%  (0 = tones, 100 = white noise)", fd * 100.0, fw * 100.0);
                 let (cd, cw, rp) = (self.meters.crest_dry.load(Ordering::Relaxed), self.meters.crest_wet.load(Ordering::Relaxed), self.meters.rail_pct.load(Ordering::Relaxed));
@@ -210,10 +217,12 @@ pub(crate) fn create(
         MeterModel {
             dry: String::from("dry"),
             wet: String::from("processed"),
+            mono: String::from("mono sum"),
             matched: String::new(),
             tr_full: String::new(),
             tr_laptop: String::new(),
             tr_phone: String::new(),
+            tr_mono: String::new(),
             tr_flat: String::new(),
             tr_dist: String::new(),
             auto_drive: String::new(),
@@ -270,34 +279,46 @@ pub(crate) fn create(
 
             // --- analyzer ---
             HelpArea::new(cx, help::ANALYZER_HELP, |cx| {
-                Analyzer::new(cx, Data::analyzer, Data::params).width(Pixels(CONTENT_WIDTH)).height(Pixels(140.0));
+                Analyzer::new(cx, Data::analyzer, Data::params).width(Pixels(CONTENT_WIDTH)).height(Pixels(124.0));
             })
             .width(Pixels(CONTENT_WIDTH))
-            .height(Pixels(140.0));
+            .height(Pixels(124.0));
 
-            // --- loudness readout + help panel ---
+            // --- meters row: loudness | translation | help, three matching panels ---
             HStack::new(cx, |cx| {
                 HelpArea::new(cx, help::SONE_HELP, |cx| {
-                    HStack::new(cx, |cx| {
-                        Label::new(cx, MeterModel::dry).font_size(11.0).width(Pixels(230.0));
-                        Label::new(cx, MeterModel::wet).font_size(11.0).width(Pixels(230.0));
-                    })
-                    .height(Pixels(16.0));
-                    SoneBars::new(cx, Data::meters).width(Pixels(460.0)).height(Pixels(40.0));
+                    Label::new(cx, "Loudness").class("paneltitle");
+                    loud_row(cx, MeterModel::dry, LoudSource::Dry);
+                    loud_row(cx, MeterModel::wet, LoudSource::Wet);
+                    loud_row(cx, MeterModel::mono, LoudSource::MonoWet);
                     Label::new(cx, MeterModel::matched).font_size(11.0).height(Pixels(16.0));
                 })
                 .layout_type(LayoutType::Column)
-                .width(Pixels(460.0))
-                .height(Pixels(74.0));
+                .width(Pixels(330.0))
+                .height(Pixels(PANEL_H))
+                .class("panel");
+                HelpArea::new(cx, help::TRANSLATION_HELP, |cx| {
+                    Label::new(cx, "Translation  (sone, dry → processed)").class("paneltitle");
+                    Label::new(cx, MeterModel::tr_full).font_size(11.0).height(Pixels(14.0));
+                    Label::new(cx, MeterModel::tr_laptop).font_size(11.0).height(Pixels(14.0));
+                    Label::new(cx, MeterModel::tr_phone).font_size(11.0).height(Pixels(14.0));
+                    Label::new(cx, MeterModel::tr_mono).font_size(11.0).height(Pixels(14.0));
+                    Label::new(cx, MeterModel::tr_flat).font_size(11.0).height(Pixels(14.0));
+                    Label::new(cx, MeterModel::tr_dist).font_size(11.0).height(Pixels(14.0));
+                })
+                .layout_type(LayoutType::Column)
+                .width(Pixels(360.0))
+                .height(Pixels(PANEL_H))
+                .class("panel");
                 Label::new(cx, HelpModel::text)
                     .text_wrap(true)
                     .font_size(11.0)
-                    .width(Pixels(CONTENT_WIDTH - 472.0))
-                    .height(Pixels(74.0))
-                    .left(Pixels(12.0))
-                    .class("helppanel");
+                    .width(Stretch(1.0))
+                    .height(Pixels(PANEL_H))
+                    .class("panel");
             })
-            .height(Pixels(74.0))
+            .col_between(Pixels(8.0))
+            .height(Pixels(PANEL_H))
             .width(Pixels(CONTENT_WIDTH));
 
             // --- controls: four columns, rebuilt when the view switches ---
@@ -319,6 +340,24 @@ pub(crate) fn create(
                     VStack::new(cx, |cx| {
                         group(cx, "Threshold", visible_rows(p.threshold.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.threshold.clone()), advanced));
                         group(cx, "Dynamics", visible_rows(p.dynamics.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.dynamics.clone()), advanced));
+                    })
+                    .width(COLUMN_WIDTH)
+                    .height(Auto);
+
+                    VStack::new(cx, |cx| {
+                        group(cx, "Onset Protection", visible_rows(p.protect.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.protect.clone()), advanced));
+                        if advanced {
+                            group(cx, "Resolution", visible_rows(p.resolution.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.resolution.clone()), advanced));
+                        }
+                        group(cx, "Output", visible_rows(p.global.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.global.clone()), advanced));
+                    })
+                    .width(COLUMN_WIDTH)
+                    .height(Auto);
+
+                    VStack::new(cx, |cx| {
+                        group(cx, "Stereo", visible_rows(p.stereo.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.stereo.clone()), advanced));
+                        group(cx, "Loudness Balance", visible_rows(p.balance.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.balance.clone()), advanced));
+                        group(cx, "Phase Rotate", visible_rows(p.rotate.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.rotate.clone()), advanced));
                         group(cx, "Autopilot", visible_rows(p.autopilot.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.autopilot.clone()), advanced));
                         HStack::new(cx, |cx| {
                             HelpArea::new(cx, help::AUTO_DRIVE_HELP, |cx| {
@@ -343,36 +382,6 @@ pub(crate) fn create(
                     })
                     .width(COLUMN_WIDTH)
                     .height(Auto);
-
-                    VStack::new(cx, |cx| {
-                        group(cx, "Onset Protection", visible_rows(p.protect.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.protect.clone()), advanced));
-                        if advanced {
-                            group(cx, "Resolution", visible_rows(p.resolution.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.resolution.clone()), advanced));
-                        }
-                        group(cx, "Output", visible_rows(p.global.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.global.clone()), advanced));
-                    })
-                    .width(COLUMN_WIDTH)
-                    .height(Auto);
-
-                    VStack::new(cx, |cx| {
-                        group(cx, "Stereo", visible_rows(p.stereo.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.stereo.clone()), advanced));
-                        group(cx, "Loudness Balance", visible_rows(p.balance.as_ref(), advanced), |cx| params_with_help(cx, Data::params.map(|p| p.balance.clone()), advanced));
-                        HelpArea::new(cx, help::TRANSLATION_HELP, |cx| {
-                            Label::new(cx, "Translation (sone, dry → processed)").font_size(12.0).height(Pixels(18.0));
-                            Label::new(cx, MeterModel::tr_full).font_size(11.0).height(Pixels(16.0));
-                            Label::new(cx, MeterModel::tr_laptop).font_size(11.0).height(Pixels(16.0));
-                            Label::new(cx, MeterModel::tr_phone).font_size(11.0).height(Pixels(16.0));
-                            Label::new(cx, MeterModel::tr_flat).font_size(11.0).height(Pixels(16.0)).top(Pixels(4.0));
-                            Label::new(cx, MeterModel::tr_dist).font_size(11.0).height(Pixels(16.0));
-                        })
-                        .layout_type(LayoutType::Column)
-                        .width(COLUMN_WIDTH)
-                        .height(Pixels(110.0))
-                        .top(Pixels(4.0))
-                        .left(Pixels(15.0));
-                    })
-                    .width(COLUMN_WIDTH)
-                    .height(Auto);
                 })
                 .size(Auto);
             });
@@ -384,6 +393,16 @@ pub(crate) fn create(
 
         ResizeHandle::new(cx);
     })
+}
+
+/// One loudness row: label + bar.
+fn loud_row(cx: &mut Context, text: impl Lens<Target = String>, src: LoudSource) {
+    HStack::new(cx, |cx| {
+        Label::new(cx, text).font_size(11.0).width(Pixels(170.0)).top(Pixels(3.0));
+        LoudBar::new(cx, Data::meters, src).width(Stretch(1.0)).height(Pixels(20.0));
+    })
+    .height(Pixels(22.0))
+    .col_between(Pixels(6.0));
 }
 
 /// Write Clip Drive + auto drive into Clip Drive and switch Autopilot off: the learned
@@ -408,7 +427,7 @@ fn apply_preset(cx: &mut EventContext, params: &OnsetGuardParams, values: &[(&st
             || id.starts_with("balance")
             || id.starts_with("eq")
             || id.starts_with("uz")
-            || matches!(id.as_str(), "rotate" | "rotate_hz" | "rotate_hits" | "autopilot" | "target" | "crest_floor")
+            || matches!(id.as_str(), "rotate" | "rotate_hz" | "rotate_hits" | "autopilot" | "target" | "crest_floor" | "corr_floor")
         {
             continue;
         }

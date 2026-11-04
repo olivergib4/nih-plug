@@ -309,6 +309,9 @@ pub struct Engine {
     /// settles, then held (`auto_locked`) until Autopilot is switched off and on again.
     pub auto_drive_db: f32,
     pub auto_locked: bool,
+    /// Smoothed (20 ms) body and hit drive, linear.
+    drive_cur: f32,
+    hit_drive_cur: f32,
     auto_was_on: bool,
     auto_settled: u32,
     /// Last three one-second summaries for the autopilot: (peak, sum of squares, samples,
@@ -350,6 +353,8 @@ pub struct Engine {
     sone_dry: sone::SoneMeter,
     /// Translation readouts: band-limited loudness (phone, laptop), dry at unity and processed.
     sone_tr: [sone::SoneMeter; 4],
+    /// Mono-sum loudness (what a mono rig gets): dry, processed.
+    sone_mono: [sone::SoneMeter; 2],
     /// Distortion readout: over the last second, peak and sum of squares (dry, processed) and
     /// the number of processed samples within 0.1 dB of the ceiling.
     dist_acc: DistortionAcc,
@@ -407,6 +412,8 @@ impl Engine {
             unrot_key: (0, 0.0, 0.0),
             auto_drive_db: 0.0,
             auto_locked: false,
+            drive_cur: 1.0,
+            hit_drive_cur: 1.0,
             auto_was_on: false,
             auto_settled: 0,
             ap_hist: [(0.0, 0.0, 0, 0.0, 0); 3],
@@ -438,6 +445,7 @@ impl Engine {
             sone_dry: sone::SoneMeter::new(sample_rate, num_channels, 100.0),
             dist_acc: DistortionAcc::default(),
             dist: Distortion::default(),
+            sone_mono: [sone::SoneMeter::new(sample_rate, 1, 100.0), sone::SoneMeter::new(sample_rate, 1, 100.0)],
             sone_tr: {
                 let mk = |lo: f32, hi: f32| {
                     let mut m = sone::SoneMeter::new(sample_rate, num_channels, 100.0);
@@ -549,6 +557,9 @@ impl Engine {
         for m in &mut self.sone_tr {
             m.reset();
         }
+        for m in &mut self.sone_mono {
+            m.reset();
+        }
         self.dist_acc = DistortionAcc::default();
         self.dist = Distortion::default();
         self.match_gain = 1.0;
@@ -571,6 +582,11 @@ impl Engine {
     /// Translation readouts in sones: [phone dry, phone processed, laptop dry, laptop processed].
     pub fn translation_sones(&self) -> [f32; 4] {
         [self.sone_tr[0].sone, self.sone_tr[1].sone, self.sone_tr[2].sone, self.sone_tr[3].sone]
+    }
+
+    /// Mono-sum loudness in sones: (dry, processed).
+    pub fn mono_sones(&self) -> (f32, f32) {
+        (self.sone_mono[0].sone, self.sone_mono[1].sone)
     }
 
     /// Spectral flatness (0 = tones, 1 = white noise) of the dry (unity) and processed signal.
@@ -785,6 +801,8 @@ impl Engine {
         // Hit Drive: detected hits get their own drive (the clip-protection envelope decides
         // what is a hit, with its 8 ms hold and 20 ms fade), so Clip Drive only moves the body
         let hit_drive = 10f32.powf(s.hit_drive_db / 20.0);
+        // 20 ms one-pole ramp on both drives: slider moves and autopilot steps never click
+        let drive_c = 1.0 - (-1.0 / (0.020 * sr)).exp();
         let base_t = self.pos; // input time of channels[..][0]
         let l_spec_total = self.long_stft.window_size() + self.short_stft.window_size() + self.extra_delay;
         let mut prot_count = 0usize;
@@ -818,7 +836,9 @@ impl Engine {
                 prot_count += 1;
             }
             let pc_here = if base_t + i >= l_spec_total { self.pc_ring.peek(t) } else { 0.0 };
-            let drive_t = drive + (hit_drive - drive) * pc_here;
+            self.drive_cur += (drive - self.drive_cur) * drive_c;
+            self.hit_drive_cur += (hit_drive - self.hit_drive_cur) * drive_c;
+            let drive_t = self.drive_cur + (self.hit_drive_cur - self.drive_cur) * pc_here;
             for ch in 0..nc {
                 let r = self.tmp_out[ch];
                 let y = r + (self.a[ch][i] - r) * p + r * tb;
@@ -1058,6 +1078,12 @@ impl Engine {
             }
             self.k_wet.push_frame(&self.tmp_in[..nc]);
             self.sone_wet.push(&self.tmp_in[..nc]);
+            {
+                let m = self.tmp_in[..nc].iter().sum::<f32>() / nc as f32;
+                self.sone_mono[1].push(&[m]);
+                let md = self.dry[..nc].iter().map(|c| c[i]).sum::<f32>() / nc as f32;
+                self.sone_mono[0].push(&[md]);
+            }
             self.ap_sone_sum += self.sone_wet.sone;
             self.ap_sone_n += 1;
             self.sone_tr[1].push(&self.tmp_in[..nc]);
@@ -1191,6 +1217,9 @@ impl Engine {
             self.sone_wet.ref_spl = s.ref_spl;
             self.sone_dry.ref_spl = s.ref_spl;
             for m in &mut self.sone_tr {
+                m.ref_spl = s.ref_spl;
+            }
+            for m in &mut self.sone_mono {
                 m.ref_spl = s.ref_spl;
             }
         }

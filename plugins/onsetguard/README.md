@@ -63,7 +63,11 @@ input ─ pre-EQ (min-phase) ─┬─ long STFT (stereo, balance, mono-below, l
 * **Pre-EQ.** Four minimum-phase nodes drawn on the analyzer (low shelf, two one-octave bells,
   high shelf), applied at the input before every path. No pre-ringing by construction; the
   compressor sees the shaped signal.
-* **Stereo.** Zero-phase, in the long STFT: Width scales the Side above a frequency (the mono
+* **Stereo.** Zero-phase, in the long STFT. Correlation Floor extends the anti-phase guard to
+  weakly-correlated "fake wide" content; the narrowing is energy-preserving (what the Side
+  loses the Mid gains, capped at +6 dB), measured: uncorrelated bed at floor 0.5 -> side
+  -2.2 dB, mono sum +0.9 dB, panned in-phase tone untouched. Drive changes ramp over 20 ms.
+  Original stereo stage: Width scales the Side above a frequency (the mono
   sum is the Mid, untouched, so it is mono-compatible by construction); the Anti-phase Guard
   pulls down Side where left and right are in anti-phase per bin (correlation followed over
   200 ms, gain smoothed across 1/3 octave so it cannot ring: Side pre-ring before an anti-phase
@@ -100,8 +104,7 @@ input ─ pre-EQ (min-phase) ─┬─ long STFT (stereo, balance, mono-below, l
   than a tone of equal power).
 * **Matched Bypass** plays the dry signal at the processed signal's perceived loudness (a slow
   servo in sones), so you compare shape, not volume.
-* **Presets** (Clap, Drum bus, Bass, Master) as starting points; they set every control except
-  Output Gain, Mix, Matched Bypass and Reference Level.
+* **Presets**: Drum bus (Clip off, Meter Thru Clip on) and Master (the last clipper).
 * **Clip Stereo Link** (default 0%): per-channel clipping, like a standard hard clipper. Linked
   (100%) preserves the image but pulls the mid down by the side's share at every peak
   (measured on a mid-heavy signal: mid -0.8 dB, side +0.9 dB vs per-channel).

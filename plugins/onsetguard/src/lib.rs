@@ -53,6 +53,9 @@ pub struct Meters {
     /// Perceived loudness (sones) of the dry signal at unity and of the processed signal.
     pub dry_sone: AtomicF32,
     pub wet_sone: AtomicF32,
+    /// Mono-sum loudness: dry, processed.
+    pub mono_dry_sone: AtomicF32,
+    pub mono_wet_sone: AtomicF32,
     /// Translation readouts: phone dry/processed, laptop dry/processed.
     pub tr_sone: [AtomicF32; 4],
     /// Spectral flatness: dry, processed.
@@ -77,6 +80,8 @@ impl Default for Meters {
             wet_lufs: AtomicF32::new(-100.0),
             dry_sone: AtomicF32::new(0.0),
             wet_sone: AtomicF32::new(0.0),
+            mono_dry_sone: AtomicF32::new(0.0),
+            mono_wet_sone: AtomicF32::new(0.0),
             tr_sone: [AtomicF32::new(0.0), AtomicF32::new(0.0), AtomicF32::new(0.0), AtomicF32::new(0.0)],
             flat_dry: AtomicF32::new(0.0),
             flat_wet: AtomicF32::new(0.0),
@@ -162,6 +167,8 @@ pub struct OnsetGuardParams {
     pub zone: Arc<ZoneParams>,
     #[nested(group = "Autopilot")]
     pub autopilot: Arc<AutopilotParams>,
+    #[nested(group = "Phase Rotate")]
+    pub rotate: Arc<RotateParams>,
 }
 
 #[derive(Params)]
@@ -250,6 +257,8 @@ pub struct StereoParams {
     pub width_db: FloatParam,
     #[id = "guard"]
     pub guard: FloatParam,
+    #[id = "corr_floor"]
+    pub corr_floor: FloatParam,
 }
 
 #[derive(Params)]
@@ -372,6 +381,10 @@ pub struct ClipParams {
     pub sub_ceil_db: FloatParam,
     #[id = "band_protect"]
     pub band_protect: FloatParam,
+}
+
+#[derive(Params)]
+pub struct RotateParams {
     #[id = "rotate"]
     pub rotate: BoolParam,
     #[id = "rotate_hz"]
@@ -487,6 +500,7 @@ impl Default for OnsetGuardParams {
             .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
             width_db: db_param("Width", d.stereo.width_db, -12.0, 12.0),
             guard: pct_param("Anti-phase Guard", d.stereo.guard),
+            corr_floor: pct_param("Correlation Floor", d.stereo.floor),
             }),
             balance: Arc::new(BalanceParams {
             strength: pct_param("Balance Strength", d.balance.strength),
@@ -525,6 +539,17 @@ impl Default for OnsetGuardParams {
                 .with_unit(" phon")
                 .with_step_size(0.5),
             crest_floor_db: db_param("Crest Floor", d.autopilot.crest_floor_db, 1.0, 12.0),
+            }),
+            rotate: Arc::new(RotateParams {
+            rotate: BoolParam::new("Phase Rotate", d.rotate.on),
+            rotate_hz: FloatParam::new(
+                "Rotate Freq",
+                d.rotate.freq_hz,
+                FloatRange::Skewed { min: 50.0, max: 1000.0, factor: FloatRange::skew_factor(-1.0) },
+            )
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
+            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
+            rotate_hits: pct_param("Rotate Hits", d.rotate.hits),
             }),
             threshold: Arc::new(ThresholdParams {
             weighting: EnumParam::new("Detector Weighting", DetectorWeighting::Off),
@@ -639,15 +664,6 @@ impl Default for OnsetGuardParams {
             .with_step_size(1.0),
             sub_ceil_db: db_param("Sub Ceiling", d.sub_ceil_db, -24.0, 0.0),
             band_protect: pct_param("Protect Amount", d.band_protect),
-            rotate: BoolParam::new("Phase Rotate", d.rotate.on),
-            rotate_hz: FloatParam::new(
-                "Rotate Freq",
-                d.rotate.freq_hz,
-                FloatRange::Skewed { min: 50.0, max: 1000.0, factor: FloatRange::skew_factor(-1.0) },
-            )
-            .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
-            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
-            rotate_hits: pct_param("Rotate Hits", d.rotate.hits),
             }),
         }
     }
@@ -678,6 +694,7 @@ impl OnsetGuardParams {
         s.stereo.width_hz = self.stereo.width_hz.value();
         s.stereo.width_db = self.stereo.width_db.value();
         s.stereo.guard = self.stereo.guard.value();
+        s.stereo.floor = self.stereo.corr_floor.value();
         s.balance.strength = self.balance.strength.value();
         s.balance.speed_s = self.balance.speed_s.value();
         s.balance.range_db = self.balance.range_db.value();
@@ -717,9 +734,9 @@ impl OnsetGuardParams {
         s.hf_on_hits = self.clip.hf_on_hits.value();
         s.sub_ceil_db = self.clip.sub_ceil_db.value();
         s.band_protect = self.clip.band_protect.value();
-        s.rotate.on = self.clip.rotate.value();
-        s.rotate.freq_hz = self.clip.rotate_hz.value();
-        s.rotate.hits = self.clip.rotate_hits.value();
+        s.rotate.on = self.rotate.rotate.value();
+        s.rotate.freq_hz = self.rotate.rotate_hz.value();
+        s.rotate.hits = self.rotate.rotate_hits.value();
         s.autopilot.on = self.autopilot.on.value();
         s.autopilot.target_phon = self.autopilot.target_phon.value();
         s.autopilot.crest_floor_db = self.autopilot.crest_floor_db.value();
@@ -843,6 +860,9 @@ impl Plugin for OnsetGuard {
             let (dry_sone, wet_sone) = engine.sones();
             self.meters.dry_sone.store(dry_sone, Ordering::Relaxed);
             self.meters.wet_sone.store(wet_sone, Ordering::Relaxed);
+            let (md, mw) = engine.mono_sones();
+            self.meters.mono_dry_sone.store(md, Ordering::Relaxed);
+            self.meters.mono_wet_sone.store(mw, Ordering::Relaxed);
             for (m, v) in self.meters.tr_sone.iter().zip(engine.translation_sones()) {
                 m.store(v, Ordering::Relaxed);
             }

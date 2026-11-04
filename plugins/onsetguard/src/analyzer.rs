@@ -387,24 +387,32 @@ impl View for Analyzer {
     }
 }
 
-/// Loudness bars: dry (unity) and processed, in phon (0-120). Text is drawn by Labels in the
-/// editor, since canvas text has no font in this Vizia build.
-pub struct SoneBars {
-    meters: Arc<crate::Meters>,
+/// One loudness bar in phon (0-120), drawn from the chosen meter. Text is drawn by Labels in
+/// the editor, since canvas text has no font in this Vizia build.
+#[derive(Clone, Copy, PartialEq)]
+pub enum LoudSource {
+    Dry,
+    Wet,
+    MonoWet,
 }
 
-impl SoneBars {
-    pub fn new<L>(cx: &mut Context, meters: L) -> Handle<'_, Self>
+pub struct LoudBar {
+    meters: Arc<crate::Meters>,
+    source: LoudSource,
+}
+
+impl LoudBar {
+    pub fn new<L>(cx: &mut Context, meters: L, source: LoudSource) -> Handle<'_, Self>
     where
         L: Lens<Target = Arc<crate::Meters>>,
     {
-        Self { meters: meters.get(cx) }.build(cx, |_| ())
+        Self { meters: meters.get(cx), source }.build(cx, |_| ())
     }
 }
 
-impl View for SoneBars {
+impl View for LoudBar {
     fn element(&self) -> Option<&'static str> {
-        Some("sonebars")
+        Some("loudbar")
     }
 
     fn draw(&self, cx: &mut DrawContext, canvas: &mut Canvas) {
@@ -413,32 +421,26 @@ impl View for SoneBars {
         if b.w <= 0.0 || b.h <= 0.0 {
             return;
         }
-        let dry = self.meters.dry_sone.load(Ordering::Relaxed);
-        let wet = self.meters.wet_sone.load(Ordering::Relaxed);
-        let phon = |s: f32| if s <= 1e-3 { 0.0 } else { 40.0 + 10.0 * s.log2() };
-        let row_h = b.h / 2.0;
-        for (row, (sone, color)) in [
-            (dry, vg::Color::rgbaf(0.55, 0.60, 0.66, 0.9)),
-            (wet, vg::Color::rgbaf(0.95, 0.55, 0.25, 0.9)),
-        ]
-        .iter()
-        .enumerate()
-        {
-            let y = b.y + row as f32 * row_h;
-            let mut bg = vg::Path::new();
-            bg.rect(b.x, y + 3.0, b.w, row_h - 6.0);
-            canvas.fill_path(&bg, &vg::Paint::color(vg::Color::rgbaf(0.15, 0.15, 0.16, 1.0)));
-            let t = (phon(*sone) / 120.0).clamp(0.0, 1.0);
-            let mut bar = vg::Path::new();
-            bar.rect(b.x, y + 3.0, b.w * t, row_h - 6.0);
-            canvas.fill_path(&bar, &vg::Paint::color(*color));
-            for tick in [40.0f32, 60.0, 80.0, 100.0] {
-                let tx = b.x + b.w * tick / 120.0;
-                let mut tp = vg::Path::new();
-                tp.move_to(tx, y + 3.0);
-                tp.line_to(tx, y + row_h - 3.0);
-                canvas.stroke_path(&tp, &vg::Paint::color(vg::Color::rgbaf(0.5, 0.5, 0.5, 0.5)).with_line_width(1.0));
-            }
+        let (sone, color) = match self.source {
+            LoudSource::Dry => (self.meters.dry_sone.load(Ordering::Relaxed), vg::Color::rgbaf(0.55, 0.60, 0.66, 0.9)),
+            LoudSource::Wet => (self.meters.wet_sone.load(Ordering::Relaxed), vg::Color::rgbaf(0.95, 0.55, 0.25, 0.9)),
+            LoudSource::MonoWet => (self.meters.mono_wet_sone.load(Ordering::Relaxed), vg::Color::rgbaf(0.95, 0.75, 0.35, 0.9)),
+        };
+        let phon = if sone <= 1e-3 { 0.0 } else { 40.0 + 10.0 * sone.log2() };
+        let (y, h) = (b.y + 3.0, b.h - 6.0);
+        let mut bg = vg::Path::new();
+        bg.rect(b.x, y, b.w, h);
+        canvas.fill_path(&bg, &vg::Paint::color(vg::Color::rgbaf(0.15, 0.15, 0.16, 1.0)));
+        let t = (phon / 120.0).clamp(0.0, 1.0);
+        let mut bar = vg::Path::new();
+        bar.rect(b.x, y, b.w * t, h);
+        canvas.fill_path(&bar, &vg::Paint::color(color));
+        for tick in [40.0f32, 60.0, 80.0, 100.0] {
+            let tx = b.x + b.w * tick / 120.0;
+            let mut tp = vg::Path::new();
+            tp.move_to(tx, y);
+            tp.line_to(tx, y + h);
+            canvas.stroke_path(&tp, &vg::Paint::color(vg::Color::rgbaf(0.5, 0.5, 0.5, 0.5)).with_line_width(1.0));
         }
     }
 }

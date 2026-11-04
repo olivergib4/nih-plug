@@ -19,13 +19,19 @@ tooltip.vis {
   font-size: 12;
 }
 
-.helppanel {
+.helppanel, .panel {
   background-color: #2a2b2e;
   color: #e6e4dc;
   border-radius: 4px;
   border-width: 1px;
   border-color: #4a4b4f;
   child-space: 6px;
+  row-between: 1px;
+}
+.paneltitle {
+  font-size: 12;
+  color: #9a9a9a;
+  height: 16px;
 }
 
 /* compact rows so six columns fit a 13" screen */

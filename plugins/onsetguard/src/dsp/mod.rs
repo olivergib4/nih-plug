@@ -1245,7 +1245,7 @@ impl<'a> std::iter::FromIterator<&'a mut [f32]> for SmallRefs<'a> {
     fn from_iter<I: IntoIterator<Item = &'a mut [f32]>>(iter: I) -> Self {
         let mut s = SmallRefs { items: [None, None, None, None, None, None, None, None], len: 0 };
         for it in iter {
-            assert!(s.len < 8, "OnsetGuard supports at most 2 channels");
+            assert!(s.len < 8, "Bloater supports at most 2 channels");
             s.items[s.len] = Some(it);
             s.len += 1;
         }

@@ -1,4 +1,7 @@
-# OnsetGuard
+# Bloater
+
+Formerly OnsetGuard (the crate is still `onsetguard`; plugin IDs are unchanged, so existing
+sets keep loading).
 
 Onset-protected, zero-phase spectral dynamics with spectral clipping. Built on the
 NIH-plug framework and derived from Robbert van der Helm's Spectral Compressor (GPL-3.0).

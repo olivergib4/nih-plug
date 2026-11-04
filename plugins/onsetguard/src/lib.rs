@@ -1,6 +1,6 @@
-// OnsetGuard: onset-protected zero-phase spectral dynamics with spectral clipping.
+// Bloater (formerly OnsetGuard): onset-protected zero-phase spectral dynamics and loudness.
 // Derived from Spectral Compressor, Copyright (C) 2021-2024 Robbert van der Helm.
-// OnsetGuard additions Copyright (C) 2026 OGII.
+// Bloater additions Copyright (C) 2026 OGII.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -755,7 +755,7 @@ impl Default for OnsetGuard {
 }
 
 impl Plugin for OnsetGuard {
-    const NAME: &'static str = "OnsetGuard";
+    const NAME: &'static str = "Bloater";
     const VENDOR: &'static str = "OGII";
     const URL: &'static str = env!("CARGO_PKG_HOMEPAGE");
     const EMAIL: &'static str = "";

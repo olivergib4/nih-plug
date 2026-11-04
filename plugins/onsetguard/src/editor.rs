@@ -237,7 +237,7 @@ pub(crate) fn create(
         VStack::new(cx, |cx| {
             // --- title + presets on one line ---
             HStack::new(cx, |cx| {
-                Label::new(cx, "OnsetGuard")
+                Label::new(cx, "Bloater")
                     .font_family(vec![FamilyOwned::Name(String::from(assets::NOTO_SANS))])
                     .font_weight(FontWeightKeyword::Thin)
                     .font_size(24.0)

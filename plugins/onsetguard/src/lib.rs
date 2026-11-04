@@ -344,6 +344,8 @@ pub struct ClipParams {
     pub clip_on: BoolParam,
     #[id = "drive"]
     pub drive_db: FloatParam,
+    #[id = "hit_drive"]
+    pub hit_drive_db: FloatParam,
     #[id = "ceiling"]
     pub ceil_db: FloatParam,
     #[id = "hardness"]
@@ -603,6 +605,7 @@ impl Default for OnsetGuardParams {
             clip: Arc::new(ClipParams {
             clip_on: BoolParam::new("Clip", d.clip_on),
             drive_db: db_param("Clip Drive", d.drive_db, 0.0, 24.0),
+            hit_drive_db: db_param("Hit Drive", d.hit_drive_db, 0.0, 24.0),
             ceil_db: db_param("Output Ceiling", d.ceil_db, -12.0, 12.0),
             hardness: pct_param("Clip Hardness", d.hardness),
             trans_clip: pct_param("Transient Clip", d.trans_clip),
@@ -697,6 +700,7 @@ impl OnsetGuardParams {
         s.trans_boost_ms = self.protect.trans_boost_ms.value();
         s.clip_on = self.clip.clip_on.value();
         s.drive_db = self.clip.drive_db.value();
+        s.hit_drive_db = self.clip.hit_drive_db.value();
         s.ceil_db = self.clip.ceil_db.value();
         s.hardness = self.clip.hardness.value();
         s.trans_clip = self.clip.trans_clip.value();

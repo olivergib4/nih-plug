@@ -1201,3 +1201,56 @@ fn rotate_hits_keeps_the_transient_and_rotates_the_body() {
     assert!(n_body < n_all - 10.0, "Rotate Hits 0% must be much closer to the original than full rotation");
     assert!(crest_body(&rotated_body) < crest_body(&plain) - 1.0, "the body must still be rotated");
 }
+
+/// Hit Drive: Clip Drive moves the body only, Hit Drive moves the hit only (clip off so the
+/// gains can be read directly).
+#[test]
+fn hit_drive_is_independent_of_clip_drive() {
+    let len = (3.0 * SR) as usize;
+    let mut st = 5555u32;
+    let burst: Vec<f32> = (0..(0.012 * SR) as usize)
+        .map(|i| {
+            st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+            ((st as f32 / u32::MAX as f32) * 2.0 - 1.0) * (-(i as f32) / (0.003 * SR)).exp()
+        })
+        .collect();
+    let period = SR as usize;
+    let x: Vec<f32> = (0..len)
+        .map(|i| {
+            let t = i as f32 / SR;
+            0.1 * (2.0 * std::f32::consts::PI * 220.0 * t).sin() + burst.get(i % period).copied().unwrap_or(0.0) * 0.8
+        })
+        .collect();
+    let mut s = Settings::default();
+    s.dyn_.down_ratio = 1.0;
+    s.dyn_.up_ratio = 1.0;
+    s.dyn_.mono_below_hz = 0.0;
+    s.clip_on = false;
+    s.protect_on = false;
+    s.onset_sens = 0.6;
+    let onset = first_onset(&x[period..]) + period;
+    let win = (0.005 * SR) as usize;
+    let gain_hit = |o: &[f32]| -> f32 {
+        let e_o: f32 = o[onset..onset + win].iter().map(|v| v * v).sum();
+        let e_x: f32 = x[onset..onset + win].iter().map(|v| v * v).sum();
+        10.0 * (e_o / e_x).log10()
+    };
+    let gain_body = |o: &[f32]| -> f32 {
+        let (a, b) = (onset + (0.3 * SR) as usize, onset + (0.9 * SR) as usize);
+        let e_o: f32 = o[a..b].iter().map(|v| v * v).sum();
+        let e_x: f32 = x[a..b].iter().map(|v| v * v).sum();
+        10.0 * (e_o / e_x).log10()
+    };
+    for (drive, hit) in [(12.0f32, 0.0f32), (0.0, 12.0)] {
+        s.drive_db = drive;
+        s.hit_drive_db = hit;
+        let out = run(&[x.clone()], &s);
+        let (gh, gb) = (gain_hit(&out[0]), gain_body(&out[0]));
+        println!("clip drive {drive} / hit drive {hit}: hit {gh:+.1} dB, body {gb:+.1} dB");
+        if drive > 0.0 {
+            assert!((gb - 12.0).abs() < 0.5 && gh < 1.0, "clip drive must move the body only");
+        } else {
+            assert!((gh - 12.0).abs() < 1.0 && gb.abs() < 0.5, "hit drive must move the hit only");
+        }
+    }
+}

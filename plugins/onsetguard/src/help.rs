@@ -70,7 +70,8 @@ pub fn for_param(id: &str) -> Option<&'static str> {
 
         // --- Clip ---
         "clip" => "Clip. Turns the clip stage on: Clip Drive into an oversampled clipper with a hard output ceiling (at 1x, identical to a plain hard clipper). Off, the stage is a plain delay so latency stays constant.",
-        "drive" => "Clip Drive. Gain into the clipper: the loudness knob. More drive = more clipping = louder. The GR meter shows how much is being shaved.",
+        "drive" => "Clip Drive. Gain into the clipper for the BODY (everything that is not a detected hit): the loudness knob. More drive = more clipping = louder. Hits get Hit Drive instead, so this does not touch the transients.",
+        "hit_drive" => "Hit Drive. Gain into the clipper for detected hits (same envelope as Transient Clip: 8 ms hold, 20 ms fade), independent of Clip Drive. 0 dB = the transient reaches the clipper as it is; push it for a harder hit, pull it to keep the hit clean while the body is driven.",
         "ceiling" => "Output Ceiling. Hard maximum of the clipped signal. 0 dBFS when this is the last clipper. Above 0 dB (up to +12) on a bus: only the extreme peaks are shaped here and the drums still hit the master clipper hot, so the final clip happens once, on the whole mix.",
         "hardness" => "Clip Hardness. 100% = hard clip (default: loudest, most harmonics). Lower starts a soft knee earlier for a rounder, quieter clip.",
         "trans_clip" => "Transient Clip. How much of each detected hit goes through the oversampled clipper. 0% = hits bypass it and are only hard-clamped at the ceiling (max punch), 100% = hits clipped like everything else (max density). The ceiling holds at every setting.",

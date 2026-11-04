@@ -53,7 +53,7 @@ impl Model for ViewModel {
 
 /// Parameters shown in the Simple view.
 const SIMPLE_IDS: &[&str] = &[
-    "clip", "drive", "ceiling", "trans_clip", "hf_preserve", "hf_amount", "hf_hits", "sub_split", "band_protect", "oversample", "rotate", "rotate_hits",
+    "clip", "drive", "hit_drive", "ceiling", "trans_clip", "hf_preserve", "hf_amount", "hf_hits", "sub_split", "band_protect", "oversample", "rotate", "rotate_hits",
     "autopilot", "target", "crest_floor",
     "weighting", "threshold", "slope",
     "down_ratio", "up_ratio", "up_range", "up_depth", "attack", "release",

@@ -77,6 +77,8 @@ pub struct Settings {
 
     pub clip_on: bool,
     pub drive_db: f32,
+    /// Drive applied to detected hits instead of `drive_db` (absolute, dB).
+    pub hit_drive_db: f32,
     pub ceil_db: f32,
     pub hardness: f32,
     pub trans_clip: f32,
@@ -147,6 +149,7 @@ impl Default for Settings {
             trans_boost_ms: 15.0,
             clip_on: true,
             drive_db: 0.0,
+            hit_drive_db: 0.0,
             ceil_db: 0.0,
             hardness: 1.0,
             trans_clip: 1.0,
@@ -779,6 +782,9 @@ impl Engine {
 
         // --- align, protect, boost; then drive ---
         let drive = 10f32.powf((s.drive_db + if s.autopilot.on { self.auto_drive_db } else { 0.0 }) / 20.0);
+        // Hit Drive: detected hits get their own drive (the clip-protection envelope decides
+        // what is a hit, with its 8 ms hold and 20 ms fade), so Clip Drive only moves the body
+        let hit_drive = 10f32.powf(s.hit_drive_db / 20.0);
         let base_t = self.pos; // input time of channels[..][0]
         let l_spec_total = self.long_stft.window_size() + self.short_stft.window_size() + self.extra_delay;
         let mut prot_count = 0usize;
@@ -811,14 +817,16 @@ impl Engine {
             if p < 0.999 {
                 prot_count += 1;
             }
+            let pc_here = if base_t + i >= l_spec_total { self.pc_ring.peek(t) } else { 0.0 };
+            let drive_t = drive + (hit_drive - drive) * pc_here;
             for ch in 0..nc {
                 let r = self.tmp_out[ch];
                 let y = r + (self.a[ch][i] - r) * p + r * tb;
-                self.driven[ch][i] = y * drive;
-                self.cl[ch][i] = y * drive;
+                self.driven[ch][i] = y * drive_t;
+                self.cl[ch][i] = y * drive_t;
                 let sr_ = self.tmp_out[nc + ch];
                 let ys = sr_ + (self.sub_a[ch][i] - sr_) * p + sr_ * tb;
-                self.clsub[ch][i] = ys * drive;
+                self.clsub[ch][i] = ys * drive_t;
             }
         }
 

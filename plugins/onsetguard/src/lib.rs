@@ -319,6 +319,8 @@ pub struct DynamicsParams {
     pub up_range_db: FloatParam,
     #[id = "up_depth"]
     pub up_depth_db: FloatParam,
+    #[id = "body"]
+    pub body_ms: FloatParam,
     #[id = "attack"]
     pub attack_ms: FloatParam,
     #[id = "release"]
@@ -607,6 +609,14 @@ impl Default for OnsetGuardParams {
             .with_string_to_value(formatters::s2v_compression_ratio()),
             up_range_db: db_param("Upward Range", d.dyn_.up_range_db, 0.0, 40.0),
             up_depth_db: db_param("Upward Depth", d.dyn_.up_depth_db, 6.0, 60.0),
+            body_ms: FloatParam::new(
+                "Body",
+                d.dyn_.body_ms,
+                FloatRange::Skewed { min: 0.0, max: 1000.0, factor: FloatRange::skew_factor(-1.2) },
+            )
+            .with_unit(" ms")
+            .with_step_size(1.0)
+            .with_value_to_string(std::sync::Arc::new(|v| if v < 0.5 { "Off".to_string() } else { format!("{v:.0}") })),
             attack_ms: ms_param("Attack", d.dyn_.attack_ms, 0.1, 500.0),
             release_ms: ms_param("Release", d.dyn_.release_ms, 5.0, 3000.0),
             smooth_oct: FloatParam::new(
@@ -685,6 +695,7 @@ impl OnsetGuardParams {
         s.dyn_.up_ratio = self.dynamics.up_ratio.value();
         s.dyn_.up_range_db = self.dynamics.up_range_db.value();
         s.dyn_.up_depth_db = self.dynamics.up_depth_db.value();
+        s.dyn_.body_ms = self.dynamics.body_ms.value();
         s.dyn_.attack_ms = self.dynamics.attack_ms.value();
         s.dyn_.release_ms = self.dynamics.release_ms.value();
         s.dyn_.smooth_oct = self.dynamics.smooth_oct.value();

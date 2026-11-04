@@ -58,7 +58,7 @@ const SIMPLE_IDS: &[&str] = &[
     "clip", "drive", "hit_drive", "ceiling", "trans_clip", "hf_preserve", "hf_amount", "hf_hits", "sub_split", "band_protect", "oversample", "rotate", "rotate_hits",
     "autopilot", "target", "crest_floor",
     "weighting", "threshold", "slope",
-    "down_ratio", "up_ratio", "up_range", "up_depth", "attack", "release",
+    "down_ratio", "up_ratio", "up_range", "up_depth", "body", "attack", "release",
     "protect", "sens", "trans_boost",
     "mono_below", "width", "guard", "corr_floor",
     "balance",

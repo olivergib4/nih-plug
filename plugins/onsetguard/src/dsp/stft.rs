@@ -130,7 +130,7 @@ impl StftStage {
     /// Note: `frame_fn` may be called zero or several times per call.
     pub fn process<F>(&mut self, channels: &mut [&mut [f32]], len: usize, mut frame_fn: F)
     where
-        F: FnMut(&mut [Vec<Complex32>], usize, f32),
+        F: FnMut(&mut [Vec<Complex32>], usize, f32, usize),
     {
         debug_assert_eq!(channels.len(), self.num_channels);
         let n = self.window_size;
@@ -156,7 +156,7 @@ impl StftStage {
 
     fn run_frame<F>(&mut self, frame_fn: &mut F)
     where
-        F: FnMut(&mut [Vec<Complex32>], usize, f32),
+        F: FnMut(&mut [Vec<Complex32>], usize, f32, usize),
     {
         let n = self.window_size;
         let nb = n / 2 + 1;
@@ -183,7 +183,8 @@ impl StftStage {
                     .expect("forward FFT");
             }
         }
-        frame_fn(&mut self.spectra, nb, mag_scale);
+        // the frame's last input sample is `pos - 1`; pass `pos` as the frame end
+        frame_fn(&mut self.spectra, nb, mag_scale, self.pos);
         {
             let plan = &self.plans[self.window_size.trailing_zeros() as usize - self.min_order];
             for ch in 0..self.num_channels {

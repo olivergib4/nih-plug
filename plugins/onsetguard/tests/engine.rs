@@ -1340,3 +1340,62 @@ fn drive_changes_are_ramped() {
     println!("drive jump: max sample step {max_step:.4} vs the sine's own max slope {sine_slope:.4} (a hard step would be ~{:.3})", 0.2 * (10f32.powf(12.0 / 20.0) - 1.0));
     assert!(max_step < sine_slope * 1.5, "a drive change must ramp, not step");
 }
+
+/// Body: the upward lift follows the hits. Clap bursts every 500 ms over a steady floor
+/// 10 dB under the threshold (so a level-only upward compressor lifts the floor everywhere).
+/// With Body 100 ms the floor is lifted in the 100 ms after each hit and not in the gap
+/// 300 ms after it; without Body the gap is lifted too.
+#[test]
+fn body_lifts_the_tail_of_each_hit_and_leaves_the_gaps() {
+    let len = (3.0 * SR) as usize;
+    let mut st = 777u32;
+    let mut x: Vec<f32> = (0..len)
+        .map(|_| {
+            st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+            ((st as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.02 // floor ~ -40 dBFS
+        })
+        .collect();
+    let hits: Vec<usize> = (0..5).map(|k| ((0.5 + 0.5 * k as f32) * SR) as usize).collect();
+    for &h in &hits {
+        for i in 0..(0.006 * SR) as usize {
+            st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+            let w = (st as f32 / u32::MAX as f32) * 2.0 - 1.0;
+            x[h + i] += w * (-(i as f32) / (0.0015 * SR)).exp() * 0.9;
+        }
+    }
+    let rms = |v: &[f32], from: usize, ms: f32| -> f32 {
+        let n = (ms / 1000.0 * SR) as usize;
+        db((v[from..from + n].iter().map(|a| a * a).sum::<f32>() / n as f32).sqrt())
+    };
+    let mut s = Settings::default();
+    s.clip_on = false;
+    s.protect_on = true;
+    s.dyn_.mono_below_hz = 0.0;
+    s.dyn_.weighting = onsetguard::dsp::dynamics::Weighting::Off;
+    s.dyn_.threshold_db = -30.0;
+    s.dyn_.slope_db_oct = 0.0;
+    s.dyn_.down_ratio = 1.0;
+    s.dyn_.up_ratio = 3.0;
+    s.dyn_.up_range_db = 12.0;
+    s.dyn_.up_depth_db = 30.0;
+    let mut rows = Vec::new();
+    for body in [0.0f32, 100.0] {
+        s.dyn_.body_ms = body;
+        let out = run(&[x.clone()], &s);
+        // average over the last three hits (the engine's envelopes are settled by then)
+        let (mut tail, mut gap) = (0.0, 0.0);
+        for &h in &hits[2..] {
+            let t0 = h + (0.030 * SR) as usize; // 30..80 ms after the hit: the tail window
+            let g0 = h + (0.300 * SR) as usize; // 300..350 ms after: the gap
+            tail += rms(&out[0], t0, 50.0) - rms(&x, t0, 50.0);
+            gap += rms(&out[0], g0, 50.0) - rms(&x, g0, 50.0);
+        }
+        tail /= 3.0;
+        gap /= 3.0;
+        println!("body {body} ms: tail +{tail:.1} dB, gap +{gap:.1} dB");
+        rows.push((tail, gap));
+    }
+    assert!(rows[0].1 > 3.0, "without Body the gap is lifted (level-only upward)");
+    assert!(rows[1].0 > 3.0, "with Body the tail after each hit is lifted");
+    assert!(rows[1].1.abs() < 0.5, "with Body the gap is left alone");
+}

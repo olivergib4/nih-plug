@@ -38,6 +38,12 @@ input ─ pre-EQ (min-phase) ─┬─ long STFT (stereo, balance, mono-below, l
 * **Upward Depth.** The upward compressor only lifts bins within this many dB of the
   threshold (fading out over the next 12 dB), so the body is lifted and the noise floor is not
   (measured: tone 6 dB under +5.3 dB, floor 58 dB under +0.0 dB; without it the floor rises +8).
+* **Body.** Ties the upward lift to the hits: full lift for Body ms after each detected
+  onset, fading over half as long again, none between hits. Depth alone is not enough on a
+  drum bus - measured on a real drum bounce with upward 2:1, the level-only lift put +0 dB on
+  the hit, +0.4 dB on its tail and +4 to +6 dB on the gaps between hits above 1 kHz, which is
+  the "it sounds like white noise" complaint. With Body 150 ms the tail keeps its +0.4 dB
+  and the gaps get 0.0 dB in every band above 300 Hz.
 * **Frequency smoothing** of the gain curve removes the watery per-bin swirl.
 * **Clip.** Clip Drive into an oversampled clipper with a hard output ceiling. Transient Clip
   decides how much of each hit goes through the oversampled clipper; the ceiling holds at every

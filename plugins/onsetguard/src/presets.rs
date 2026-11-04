@@ -26,6 +26,7 @@ pub const PRESETS: &[Preset] = &[
             ("up_ratio", 3.0),
             ("up_range", 8.0),
             ("up_depth", 24.0),
+            ("body", 150.0),
             ("attack", 10.0),
             ("release", 120.0),
             ("smooth", 0.17),

@@ -42,6 +42,11 @@ pub struct DynamicsSettings {
     /// nearest node's amount holds. All at 1 = the zone does nothing.
     pub up_zone_hz: [f32; 4],
     pub up_zone_amt: [f32; 4],
+    /// Body: the upward boost is tied to detected hits. It holds for this long after each
+    /// onset, then fades out over half as long again, so the lift fattens the tail of every
+    /// hit and never reaches the gaps between them (where a fixed threshold would lift the
+    /// floor). 0 = off: the boost follows level alone, wherever it is.
+    pub body_ms: f32,
     pub attack_ms: f32,
     pub release_ms: f32,
     pub smooth_oct: f32,
@@ -179,6 +184,7 @@ impl Dynamics {
         mag_scale: f32,
         s: &DynamicsSettings,
         timing_scale: f32,
+        body: f32,
     ) {
         debug_assert_eq!(num_bins, self.num_bins);
         let needs = match &self.cached {
@@ -221,7 +227,9 @@ impl Dynamics {
         let a_c = (-frame_dt / atk).exp();
         let r_c = (-frame_dt / rel).exp();
         let down_k = 1.0 - 1.0 / s.down_ratio.max(1.0);
-        let up_k = 1.0 - 1.0 / s.up_ratio.max(1.0);
+        // Body: with a body time set, the upward boost only exists inside the body window
+        // after a hit (`body` is 0..1 for this frame)
+        let up_k = (1.0 - 1.0 / s.up_ratio.max(1.0)) * if s.body_ms > 0.0 { body.clamp(0.0, 1.0) } else { 1.0 };
 
         // envelopes
         for ch in 0..self.num_channels {

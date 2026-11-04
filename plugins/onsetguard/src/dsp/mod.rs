@@ -131,6 +131,7 @@ impl Default for Settings {
                 up_depth_db: 24.0,
                 up_zone_hz: [60.0, 300.0, 2000.0, 10000.0],
                 up_zone_amt: [1.0; 4],
+                body_ms: 0.0,
                 attack_ms: 10.0,
                 release_ms: 120.0,
                 smooth_oct: 0.17,
@@ -169,6 +170,22 @@ impl Default for Settings {
             ref_spl: 100.0,
         }
     }
+}
+
+/// Hann-weighted mean of the body envelope over a frame whose last input sample is
+/// `frame_end - 1` and which spans `n` samples. Sampled at 16 points; the window is smooth, so
+/// that is plenty.
+fn frame_body(ring: &EnvRing, frame_end: usize, n: usize) -> f32 {
+    const PTS: usize = 16;
+    let (mut acc, mut wsum) = (0.0f32, 0.0f32);
+    for j in 0..PTS {
+        let u = (j as f32 + 0.5) / PTS as f32;
+        let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * u).cos();
+        let t = frame_end.wrapping_sub(n).wrapping_add((u * n as f32) as usize);
+        acc += ring.peek(t) * w;
+        wsum += w;
+    }
+    acc / wsum
 }
 
 /// Multi-channel delay line with a fixed maximum and a settable current delay.
@@ -338,6 +355,7 @@ pub struct Engine {
     p_ring: EnvRing,  // protection (1 = processed, 0 = reference)
     t_ring: EnvRing,  // transient boost (0 = none)
     pc_ring: EnvRing, // clip protection (1 = clip fully, 0 = per trans_clip)
+    body_ring: EnvRing, // Body window after each hit (1 = full upward boost, 0 = none)
 
     /// Absolute input sample counter.
     pos: usize,
@@ -435,6 +453,7 @@ impl Engine {
             p_ring: EnvRing::new(ring_len, 1.0),
             t_ring: EnvRing::new(ring_len, 0.0),
             pc_ring: EnvRing::new(ring_len, 0.0),
+            body_ring: EnvRing::new(ring_len, 0.0),
             pos: 0,
             extra_delay: 0,
             latency: 0,
@@ -548,6 +567,7 @@ impl Engine {
         self.p_ring.clear();
         self.t_ring.clear();
         self.pc_ring.clear();
+        self.body_ring.clear();
         self.pos = 0;
         self.timing_scale = 0.0;
         self.k_dry.reset();
@@ -643,6 +663,8 @@ impl Engine {
         let tb_tau = (s.trans_boost_ms.max(0.5) / 1000.0 * sr).max(1.0);
         let pc_hold = (0.008 * sr) as usize;
         let pc_post = (0.020 * sr) as usize;
+        let body_hold = (s.dyn_.body_ms.clamp(0.0, 2000.0) / 1000.0 * sr) as usize;
+        let body_fade = (body_hold / 2).max((0.020 * sr) as usize);
         for i in 0..len {
             let mut mono = 0.0;
             for ch in 0..nc {
@@ -685,6 +707,15 @@ impl Engine {
                     let u = j as f32 / pc_post.max(1) as f32;
                     self.pc_ring.max_at(t_on + pc_hold + j, 0.5 + 0.5 * (std::f32::consts::PI * u).cos());
                 }
+                if body_hold > 0 {
+                    for j in 0..body_hold {
+                        self.body_ring.max_at(t_on + j, 1.0);
+                    }
+                    for j in 0..body_fade {
+                        let u = j as f32 / body_fade as f32;
+                        self.body_ring.max_at(t_on + body_hold + j, 0.5 + 0.5 * (std::f32::consts::PI * u).cos());
+                    }
+                }
             }
         }
 
@@ -715,8 +746,13 @@ impl Engine {
             let unrot = &mut self.unrot;
             let unrot_key = &mut self.unrot_key;
             let ref_spl = s.ref_spl;
+            let body_ring = &self.body_ring;
+            let body_on = s.dyn_.body_ms > 0.0;
             let mut refs = self.wide.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
-            self.long_stft.process(refs.as_mut(), len, |spectra, nb, mag| {
+            self.long_stft.process(refs.as_mut(), len, |spectra, nb, mag, frame_end| {
+                // Body for this frame: the window-weighted mean of the body envelope over the
+                // frame's input span (the long stage sees the input timeline directly)
+                let body = if body_on { frame_body(body_ring, frame_end, n_l as usize) } else { 1.0 };
                 let (proc_ref, subs) = spectra.split_at_mut(2 * nc);
                 let (first, second) = proc_ref.split_at_mut(nc);
                 // stereo stage (width, anti-phase guard) on both pairs, before anything else
@@ -759,7 +795,7 @@ impl Engine {
                 if dyn_s.mono_below_hz > 0.0 && nc == 2 {
                     mono_below(second, nb, sr, dyn_s.mono_below_hz);
                 }
-                low.process_frame(first, nb, mag, &dyn_s, *ts);
+                low.process_frame(first, nb, mag, &dyn_s, *ts, body);
                 *ts = (*ts + frame_dt / TIMING_FADE_S).min(1.0);
                 if sub_on {
                     let (sub_p, sub_r) = subs.split_at_mut(nc);
@@ -790,9 +826,16 @@ impl Engine {
             let dyn_s = s.dyn_;
             let high = &mut self.high_dyn;
             let ts = self.timing_scale;
+            let body_ring = &self.body_ring;
+            let body_on = s.dyn_.body_ms > 0.0;
+            let n_long = self.long_stft.window_size();
+            let n_s = self.short_stft.window_size();
             let mut refs = self.a.iter_mut().map(|v| &mut v[..]).collect::<SmallRefs>();
-            self.short_stft.process(refs.as_mut(), len, |spectra, nb, mag| {
-                high.process_frame(spectra, nb, mag, &dyn_s, ts);
+            self.short_stft.process(refs.as_mut(), len, |spectra, nb, mag, frame_end| {
+                // the short stage is fed the long stage's output, which is N_long behind the
+                // input timeline
+                let body = if body_on { frame_body(body_ring, frame_end.wrapping_sub(n_long), n_s) } else { 1.0 };
+                high.process_frame(spectra, nb, mag, &dyn_s, ts, body);
             });
         }
 
@@ -828,6 +871,7 @@ impl Engine {
             // input time of the sample now emerging from the spectral path
             let t = (base_t + i).wrapping_sub(l_spec_total);
             let (p, tb) = if base_t + i >= l_spec_total {
+                self.body_ring.take(t);
                 (self.p_ring.take(t), self.t_ring.take(t))
             } else {
                 (1.0, 0.0)
@@ -901,7 +945,7 @@ impl Engine {
                 let hf_hz = s.hf_hz.max(1000.0);
                 let hf_amt = s.hf_amount.clamp(0.0, 1.0);
                 let n_clip = self.clip_stft.window_size() as f32;
-                self.clip_stft.process(refs.as_mut(), len, |spectra, nb, _mag| {
+                self.clip_stft.process(refs.as_mut(), len, |spectra, nb, _mag, _end| {
                     let (rest, hf) = spectra.split_at_mut(nc);
                     for k in 0..nb {
                         let f = (k as f32 * sr / n_clip).max(1.0);

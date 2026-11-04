@@ -1,6 +1,6 @@
 [package]
 name = "onsetguard"
-version = "0.9.13"
+version = "0.9.14"
 edition = "2021"
 authors = ["OGII"]
 license = "GPL-3.0-or-later"

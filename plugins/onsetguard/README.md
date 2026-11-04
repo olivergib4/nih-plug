@@ -102,8 +102,9 @@ input ─ pre-EQ (min-phase) ─┬─ long STFT (stereo, balance, mono-below, l
   servo in sones), so you compare shape, not volume.
 * **Presets** (Clap, Drum bus, Bass, Master) as starting points; they set every control except
   Output Gain, Mix, Matched Bypass and Reference Level.
-* **Clip Stereo Link** (default 100%) gives both channels the same clip gain, driven by the
-  louder one, so the clipper cannot move the stereo image.
+* **Clip Stereo Link** (default 0%): per-channel clipping, like a standard hard clipper. Linked
+  (100%) preserves the image but pulls the mid down by the side's share at every peak
+  (measured on a mid-heavy signal: mid -0.8 dB, side +0.9 dB vs per-channel).
 * **Detector Weighting** (Flat / K-weighted / Equal loudness) shapes what the compressor hears:
   weighted, it controls the lows harder and leaves presence alone.
 * **Analyzer** shows the detector spectrum, the threshold curve, the per-frequency cut/boost

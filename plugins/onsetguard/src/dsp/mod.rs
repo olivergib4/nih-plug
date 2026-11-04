@@ -153,7 +153,7 @@ impl Default for Settings {
             ceil_db: 0.0,
             hardness: 1.0,
             trans_clip: 1.0,
-            clip_link: 1.0,
+            clip_link: 0.0,
             oversample: 4,
             hf_preserve: false,
             hf_hz: 8000.0,

@@ -16,6 +16,11 @@ fn main() {
         let n = bytes.len() / 8;
         let mut st = SoneMeter::new(sr, 2, refl);
         let mut mo = SoneMeter::new(sr, 1, refl);
+        let mut ph = SoneMeter::new(sr, 2, refl);
+        ph.set_band(300.0, 8000.0);
+        let mut lp = SoneMeter::new(sr, 2, refl);
+        lp.set_band(120.0, 15000.0);
+        let (mut sum_p, mut sum_l) = (0.0f64, 0.0f64);
         let (mut sum_s, mut sum_m, mut cnt) = (0.0f64, 0.0f64, 0usize);
         let mut spec = [0.0f64; BANDS];
         let mut peak = 0.0f32;
@@ -34,6 +39,8 @@ fn main() {
             }
             st.push(&[l, r]);
             mo.push(&[(l + r) * 0.5]);
+            ph.push(&[l, r]);
+            lp.push(&[l, r]);
             if i % HOP == 0 {
                 trace.push(st.sone);
                 trace_m.push(mo.sone);
@@ -41,6 +48,8 @@ fn main() {
             if i % HOP == 0 && i > sr as usize / 2 {
                 sum_s += st.sone as f64;
                 sum_m += mo.sone as f64;
+                sum_p += ph.sone as f64;
+                sum_l += lp.sone as f64;
                 cnt += 1;
                 for b in 0..BANDS {
                     spec[b] += st.specific[b] as f64;
@@ -82,6 +91,11 @@ fn main() {
                 40.0 + 10.0 * med(&gap).log2()
             );
         }
+        println!(
+            "  translation: phone(300-8k) {:.1} phon  laptop(120-15k) {:.1} phon",
+            40.0 + 10.0 * (sum_p / cnt as f64).log2(),
+            40.0 + 10.0 * (sum_l / cnt as f64).log2()
+        );
         let s: Vec<String> = spec.iter().map(|v| format!("{:.2}", v / bands_ok as f64)).collect();
         println!("  specific: {}", s.join(" "));
     }

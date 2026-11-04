@@ -34,6 +34,8 @@ fn main() {
             "protect" => s.protect_on = f > 0.5,
             "attack" => s.dyn_.attack_ms = f,
             "body" => s.dyn_.body_ms = f,
+            "tboost" => s.trans_boost_db = f,
+            "tboost_ms" => s.trans_boost_ms = f,
             "release" => s.dyn_.release_ms = f,
             _ => panic!("unknown key {k}"),
         }

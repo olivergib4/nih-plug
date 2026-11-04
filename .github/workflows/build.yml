@@ -16,6 +16,9 @@ defaults:
     # This otherwise gets run under dash which does not support brace expansion
     shell: bash
 
+permissions:
+  contents: write
+
 jobs:
   # We'll only package the plugins with an entry in bundler.toml
   package:
@@ -98,3 +101,15 @@ jobs:
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: ${{ env.ARCHIVE_NAME }}
+      - name: Publish to the rolling "builds" release
+        # Release assets are downloadable without a browser session; the artifacts above are
+        # not. One asset per platform, replaced on every master build.
+        if: github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd "$ARCHIVE_NAME" && 7z a -tzip "../bloater-latest-${{ matrix.name }}.zip" "$ARCHIVE_NAME" > /dev/null)
+          gh release view builds > /dev/null 2>&1 || gh release create builds --title "Rolling builds" --notes "Latest master builds, replaced on every push." --prerelease
+          gh release upload builds "bloater-latest-${{ matrix.name }}.zip" --clobber
+          echo "version: $(grep '^version' plugins/onsetguard/Cargo.toml) commit: $GITHUB_SHA" > "build-info-${{ matrix.name }}.txt"
+          gh release upload builds "build-info-${{ matrix.name }}.txt" --clobber

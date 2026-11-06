@@ -87,6 +87,10 @@ fn rows(live: &Report, reference: Option<&Report>) -> Vec<Row> {
         push(&format!("rest level {}", BANDS[b].0), &move |r| r.band_rest_db[b], 1, " dB");
     }
     push("500-6k spread (p90-p10)", &|r| r.spread_db, 1, " dB");
+    push("250-1k peakiness (p99-med)", &|r| r.lowmid_peak_db, 1, " dB");
+    for b in 2..BANDS.len() {
+        push(&format!("level {}", BANDS[b].0), &move |r| r.band_all_db[b], 1, " dB");
+    }
     push("clap 5-10k at 25-60 ms", &|r| r.tail_db, 1, " dB");
     out
 }

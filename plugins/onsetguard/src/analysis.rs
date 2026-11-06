@@ -93,6 +93,10 @@ pub struct Report {
     pub band_hits_db: [f32; NBANDS],
     pub band_rest_db: [f32; NBANDS],
     pub spread_db: f32,
+    /// 250-1k band, mid: p99 - median of 100 ms window levels (low-mid peakiness; growl bumps).
+    pub lowmid_peak_db: f32,
+    /// Mean power per band over hits and rest together.
+    pub band_all_db: [f32; NBANDS],
     pub pinned_pct: f32,
     pub pinned_hits_pct: f32,
     pub pinned_rest_pct: f32,
@@ -188,6 +192,9 @@ pub struct Analyzer {
     spread_sum: f64,
     spread_win: usize,
     spread_levels: VecDeque<f32>,
+    lm_sum: f64,
+    lm_win: usize,
+    lm_levels: VecDeque<f32>,
     // loudness
     sone: SoneMeter,
     sone_trace: Vec<f32>,
@@ -298,6 +305,9 @@ impl Analyzer {
             spread_sum: 0.0,
             spread_win: sil_len,
             spread_levels: VecDeque::with_capacity(MAX_SPREAD),
+            lm_sum: 0.0,
+            lm_win: ms(100.0),
+            lm_levels: VecDeque::with_capacity(MAX_SPREAD),
             sone: SoneMeter::new(sample_rate, 2, 100.0),
             sone_trace: vec![0.0; sone_len],
             sone_sum: 0.0,
@@ -365,6 +375,8 @@ impl Analyzer {
         self.rest_rail = 0;
         self.spread_sum = 0.0;
         self.spread_levels.clear();
+        self.lm_sum = 0.0;
+        self.lm_levels.clear();
         self.sone_sum = 0.0;
         self.sone_n = 0;
     }
@@ -572,6 +584,19 @@ impl Analyzer {
             }
             self.spread_sum -= old;
         }
+        // low-mid peakiness: 100 ms windows every 50 ms of the 250-1k band
+        let lm = self.band_sq[i][2] as f64;
+        self.lm_sum += lm;
+        if rel >= self.lm_win {
+            let old = self.band_sq[(a + 1).wrapping_sub(self.lm_win) & self.mask][2] as f64;
+            if (rel - self.lm_win) % (self.lm_win / 2) == 0 {
+                if self.lm_levels.len() >= MAX_SPREAD {
+                    self.lm_levels.pop_front();
+                }
+                self.lm_levels.push_back(db_pow(self.lm_sum / self.lm_win as f64));
+            }
+            self.lm_sum -= old;
+        }
         if self.silent[i] != 0 {
             return;
         }
@@ -652,7 +677,16 @@ impl Analyzer {
             k += 1;
         }
         r.spread_db = if k >= 4 { percentile(&mut sp[..k], 90.0) - percentile(&mut sp[..k], 10.0) } else { f32::NAN };
+        let mut k = 0;
+        for &v in self.lm_levels.iter() {
+            sp[k] = v;
+            k += 1;
+        }
+        r.lowmid_peak_db = if k >= 8 { percentile(&mut sp[..k], 99.0) - percentile(&mut sp[..k], 50.0) } else { f32::NAN };
         let tot = self.hits_n + self.rest_n;
+        for b in 0..NBANDS {
+            r.band_all_db[b] = db_pow((self.hits_pow[b] + self.rest_pow[b]) / tot.max(1) as f64);
+        }
         r.pinned_pct = 100.0 * (self.hits_rail + self.rest_rail) as f32 / tot.max(1) as f32;
         r.pinned_hits_pct = 100.0 * self.hits_rail as f32 / self.hits_n.max(1) as f32;
         r.pinned_rest_pct = 100.0 * self.rest_rail as f32 / self.rest_n.max(1) as f32;

@@ -55,7 +55,11 @@ pub fn print_report(label: &str, r: &Report) {
         "  rest level     : {}",
         (0..BANDS.len()).map(|b| format!("{}:{:.1}", BANDS[b].0, r.band_rest_db[b])).collect::<Vec<_>>().join(" ")
     );
-    println!("  500-6k spread  : {:.1} dB (p90-p10 of 50 ms windows)", r.spread_db);
+    println!("  500-6k spread  : {:.1} dB (p90-p10 of 50 ms windows)   250-1k peakiness {:.1} dB (p99-median of 100 ms windows)", r.spread_db, r.lowmid_peak_db);
+    println!(
+        "  level (all)    : {}",
+        (0..BANDS.len()).map(|b| format!("{}:{:.1}", BANDS[b].0, r.band_all_db[b])).collect::<Vec<_>>().join(" ")
+    );
     println!(
         "  pinned         : {:.1}% total   {:.1}% inside hits   {:.1}% between",
         r.pinned_pct, r.pinned_hits_pct, r.pinned_rest_pct

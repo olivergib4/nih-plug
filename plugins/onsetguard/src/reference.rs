@@ -9,7 +9,7 @@
 //! (1.2-2.4 s) and phase that collect the most hits, keeping hits within 30 ms of that grid.
 
 use crate::analysis::{analyze_buffer, HitKind, Report};
-use crate::dsp::butter::{butter_bandpass, SosChain};
+use crate::dsp::butter::{butter_bandpass, filtfilt};
 use realfft::num_complex::Complex32;
 use realfft::RealFftPlanner;
 use serde::{Deserialize, Serialize};
@@ -123,10 +123,11 @@ pub fn loudest_window(l: &[f32], r: &[f32], sr: f32, secs: f32) -> usize {
     bi
 }
 
-/// Flux hits in seconds (relative to `mono`), kicks excluded.
-pub fn flux_hits(mono: &[f32], sr: f32) -> Vec<f32> {
-    const WIN: usize = 1024;
-    const HOP: usize = 256;
+const WIN: usize = 1024;
+const HOP: usize = 256;
+
+/// Positive spectral flux over 2-8 kHz per STFT hop (frame k vs k+1), scipy-compatible framing.
+pub fn flux_curve(mono: &[f32], sr: f32) -> Vec<f32> {
     let nb = WIN / 2 + 1;
     let mut planner = RealFftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(WIN);
@@ -168,6 +169,12 @@ pub fn flux_hits(mono: &[f32], sr: f32) -> Vec<f32> {
         }
         std::mem::swap(&mut prev, &mut cur);
     }
+    flux
+}
+
+/// Flux hits in seconds (relative to `mono`), kicks excluded.
+pub fn flux_hits(mono: &[f32], sr: f32) -> Vec<f32> {
+    let flux = flux_curve(mono, sr);
     if flux.len() < 3 {
         return Vec::new();
     }
@@ -194,12 +201,11 @@ pub fn flux_hits(mono: &[f32], sr: f32) -> Vec<f32> {
     out.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let dur = mono.len() as f32 / sr;
     out.retain(|&t| t > 0.1 && t < dur - 0.5);
-    // kick exclusion: 30-90 Hz band energy 0-60 ms vs -60..-10 ms (zero-phase shape: filter twice)
-    let mut secs = butter_bandpass(4, 30.0, 90.0, sr as f64);
-    let twice = secs.clone();
-    secs.extend(twice);
-    let mut ch = SosChain::new(secs);
-    let sub: Vec<f32> = mono.iter().map(|&x| ch.process(x as f64) as f32).collect();
+    // kick exclusion: 30-90 Hz band energy 0-60 ms vs -60..-10 ms, zero-phase like the offline
+    // script (a causal filter at 30 Hz delays the band by tens of ms and would move a level step
+    // at the hit into the "after" window)
+    let secs = butter_bandpass(4, 30.0, 90.0, sr as f64);
+    let sub = filtfilt(&secs, mono, (0.5 * sr) as usize);
     let e = |a: usize, b: usize| -> f32 {
         if b <= a || b > sub.len() {
             return 0.0;

@@ -135,6 +135,35 @@ pub fn butter_bandpass(order: usize, lo: f64, hi: f64, sr: f64) -> Vec<Sos> {
     secs
 }
 
+/// Zero-phase filtering (forward, then backward), like `scipy.signal.sosfiltfilt` with an odd
+/// extension of `pad` samples at both ends to settle the transients. Offline use only.
+pub fn filtfilt(secs: &[Sos], x: &[f32], pad: usize) -> Vec<f32> {
+    let n = x.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let pad = pad.min(n - 1);
+    let mut ext: Vec<f64> = Vec::with_capacity(n + 2 * pad);
+    let x0 = x[0] as f64;
+    let xn = x[n - 1] as f64;
+    for i in (1..=pad).rev() {
+        ext.push(2.0 * x0 - x[i] as f64);
+    }
+    ext.extend(x.iter().map(|&v| v as f64));
+    for i in 1..=pad {
+        ext.push(2.0 * xn - x[n - 1 - i] as f64);
+    }
+    let mut ch = SosChain::new(secs.to_vec());
+    for v in ext.iter_mut() {
+        *v = ch.process(*v);
+    }
+    ch.reset();
+    for v in ext.iter_mut().rev() {
+        *v = ch.process(*v);
+    }
+    ext[pad..pad + n].iter().map(|&v| v as f32).collect()
+}
+
 /// Magnitude response of a cascade at `f` Hz.
 pub fn magnitude(secs: &[Sos], f: f64, sr: f64) -> f64 {
     let w = 2.0 * std::f64::consts::PI * f / sr;

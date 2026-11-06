@@ -49,9 +49,15 @@ All measured on the clipped output, mid channel unless noted, silence excluded.
 * Header line: pre-clip peak (how hard the clip is hit), pinned share of the last block,
   leveler gain reduction.
 
-**Load reference…** decodes a WAV/MP3/FLAC/M4A, takes its loudest 24 s, finds the backbeat
-claps (2–8 kHz flux hits on a regular half-bar grid), runs the same analysis and stores it with
-the project; the table shows live − reference.
+Which hits are claps: the analyser finds the half-bar grid (period 1.2–2.4 s) that collects the
+most bright hits in the last 20 s and, among the grid phases, takes the brightest one (the
+clap/snare, not the kick on the other beat); until it locks (4 hits) the loudest-HF rule is
+used. The opposite-beat hit is the loudest other hit between two claps. The drums-vs-rest
+statistics run ~2 s behind the input so those decisions are known.
+
+**Load reference…** decodes a WAV/MP3/FLAC/M4A, takes its loudest 24 s, runs exactly the live
+analysis on it (same detector, same grid) and stores it with the project; the table shows
+live − reference.
 
 The analysis matches the offline Python measurements the method was developed with to within
 0.1 dB (see `examples/report.rs` and `examples/refcheck.rs`).

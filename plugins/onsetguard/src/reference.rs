@@ -8,7 +8,11 @@
 //! whose 30-90 Hz band jumps by >= 3 dB are kicks and dropped; then the half-bar period
 //! (1.2-2.4 s) and phase that collect the most hits, keeping hits within 30 ms of that grid.
 
-use crate::analysis::{analyze_buffer, HitKind, Report};
+use crate::analysis::{Analyzer, HitKind, Report};
+use crate::dsp::onset::OnsetDetector;
+
+/// Onset detector sensitivity used for references (the plugin default).
+pub const DETECT_SENS: f32 = 0.5;
 use crate::dsp::butter::{butter_bandpass, filtfilt};
 use realfft::num_complex::Complex32;
 use realfft::RealFftPlanner;
@@ -260,34 +264,32 @@ pub fn grid_claps(hits: &[f32]) -> (Vec<f32>, f32) {
     (on, period)
 }
 
-/// Full reference analysis of a decoded stereo buffer.
+/// Full reference analysis of a decoded stereo buffer: the loudest 24 s, analysed exactly like
+/// the live signal (plugin onset detector, automatic clap grid), so live and reference numbers
+/// share one definition.
 pub fn analyze(name: &str, l: &[f32], r: &[f32], sr: f32) -> Result<ReferenceData, String> {
     let n = (WINDOW_S * sr) as usize;
     let start = loudest_window(l, r, sr, WINDOW_S);
     let end = (start + n).min(l.len());
-    // pre-roll so the filters are settled at the window start
-    let pre = (0.5 * sr) as usize;
+    // pre-roll so the filters and the detector are settled at the window start
+    let pre = (1.0 * sr) as usize;
     let a = start.saturating_sub(pre);
-    let lw: Vec<f32> = l[a..end].iter().map(|v| v.clamp(-1.0, 1.0)).collect();
-    let rw: Vec<f32> = r[a..end].iter().map(|v| v.clamp(-1.0, 1.0)).collect();
-    let off = start - a;
-    let mono: Vec<f32> = lw[off..].iter().zip(&rw[off..]).map(|(a, b)| 0.5 * (a + b)).collect();
-    let hits = flux_hits(&mono, sr);
-    let (claps, period) = grid_claps(&hits);
-    if claps.len() < 2 {
-        return Err(format!("found only {} backbeat hits in the loudest {WINDOW_S:.0} s", claps.len()));
+    let mut an = Analyzer::new(sr);
+    an.set_span(start - a, end - a);
+    let mut det = OnsetDetector::new(sr);
+    for i in a..end {
+        let (x, y) = (l[i].clamp(-1.0, 1.0), r[i].clamp(-1.0, 1.0));
+        an.push(x, y);
+        if let Some(t) = det.push(0.5 * (x + y), DETECT_SENS) {
+            an.onset(t, HitKind::Auto);
+        }
     }
-    let mut list: Vec<(usize, HitKind)> = Vec::new();
-    for &t in &claps {
-        list.push((off + (t * sr) as usize, HitKind::Clap));
+    an.finish();
+    let report = an.report();
+    if report.claps < 2 {
+        return Err(format!("found only {} backbeat hits in the loudest {WINDOW_S:.0} s", report.claps));
     }
-    for w in claps.windows(2) {
-        list.push((off + ((w[0] + w[1]) * 0.5 * sr) as usize, HitKind::Other));
-    }
-    list.sort_by_key(|h| h.0);
-    let span = (list.iter().filter(|h| h.1 == HitKind::Clap).map(|h| h.0).min().unwrap(), list.iter().filter(|h| h.1 == HitKind::Clap).map(|h| h.0).max().unwrap());
-    let report = analyze_buffer(&lw, &rw, sr, &list, Some(span));
-    Ok(ReferenceData { name: name.to_string(), sample_rate: sr, window_start_s: start as f32 / sr, claps: claps.len(), period_s: period, report })
+    Ok(ReferenceData { name: name.to_string(), sample_rate: sr, window_start_s: start as f32 / sr, claps: report.claps, period_s: report.period_s, report })
 }
 
 pub fn analyze_file(path: &std::path::Path) -> Result<ReferenceData, String> {

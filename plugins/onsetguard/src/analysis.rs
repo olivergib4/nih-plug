@@ -7,22 +7,28 @@
 //!   (0-3 / 3-10 / 10-25 / 25-60 / 60-120 / 120-200 ms) and the share of samples at the rail
 //!   (either channel >= 0.999) in windows 0-10 … 120-150 ms; 5-10 kHz level at 25-60 ms;
 //! - **drums vs rest**: mean power per band (full, <250, 250-1k, 1-4k, 4-10k; mid channel)
-//!   inside the 150 ms after every hit versus everywhere else, silence excluded;
+//!   inside the 150 ms after the claps and the opposite-beat hits versus everywhere else,
+//!   silence excluded;
 //! - **500-6 kHz spread**: p90 - p10 of 50 ms window levels (stereo), the "bricked" readout;
+//! - **250-1k peakiness**: p99 - median of 100 ms window levels of the low mids;
 //! - **pinned share**: samples at the rail overall, inside hits, between hits;
-//! - **loudness**: mean sone/phon (stereo), at hits (30 ms after the clap) and between hits.
+//! - **loudness**: mean sone/phon (stereo), at claps (30 ms after) and between claps.
+//!
+//! Which hits are *claps*: with `HitKind::Auto` the analyser finds the half-bar grid (period
+//! 1.2-2.4 s, the phase that collects the most hits in the last 20 s) and flags the hits on it,
+//! like the offline detector; until a grid locks (4 hits) the loudest-2-8 kHz rule is used.
+//! The *opposite-beat hit* is the loudest other hit between two consecutive claps. The
+//! drums/rest accumulation runs ~2.2 s behind the input so those decisions are known in time.
 //!
 //! Definitions follow the offline Python scripts the targets were measured with (bite.py,
-//! dom.py, measure_bounce.py); band filters are the same 4th-order Butterworth designs.
-//! Band filters are applied twice (|H|^2) to match the zero-phase offline filtering.
-//! Onset alignment: the first sample in [onset - 40 ms, onset + 60 ms] where the 1 ms RMS
-//! envelope of the 2-8 kHz band reaches -6 dB of its peak in that range (500-8 kHz for hits
-//! that are not claps).
+//! dom.py, measure_bounce.py); band filters are the same 4th-order Butterworth designs, applied
+//! twice (|H|^2) to match the zero-phase offline filtering. Onset alignment: the first sample in
+//! [onset - 40 ms, onset + 60 ms] where the 1 ms RMS envelope of the 2-8 kHz band reaches -6 dB
+//! of its peak in that range (500-8 kHz for hits that are not claps).
 
 use crate::dsp::butter::{butter_bandpass, SosChain};
 use crate::dsp::sone::{SoneMeter, HOP as SONE_HOP};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 
 pub const LEVEL_WINS_MS: [(f32, f32); 6] =
     [(0.0, 3.0), (3.0, 10.0), (10.0, 25.0), (25.0, 60.0), (60.0, 120.0), (120.0, 200.0)];
@@ -47,24 +53,36 @@ pub const NBANDS: usize = BANDS.len();
 pub const HIT_MS: f32 = 150.0;
 pub const TAIL_WIN_MS: (f32, f32) = (25.0, 60.0);
 pub const SPREAD_WIN_MS: f32 = 50.0;
+pub const LOWMID_WIN_MS: f32 = 100.0;
 pub const RAIL: f32 = 0.999;
 /// 50 ms mean power below this (-50 dBFS) is silence and excluded from the masks.
 pub const SILENCE_POW: f32 = 1e-5;
+pub const MAX_HITS: usize = 256;
 const ALIGN_PRE_MS: f32 = 40.0;
 const ALIGN_POST_MS: f32 = 60.0;
+/// Alignment and the 0-25 ms levels need this much audio after the onset.
+const ALIGN_WAIT_MS: f32 = 90.0;
 const PROFILE_MS: f32 = 200.0;
+const ACC_DELAY_S: f32 = 2.2;
+const GRID_WINDOW_S: f32 = 20.0;
+const GRID_MIN_HITS: usize = 4;
+const GRID_P_LO: f32 = 1.2;
+const GRID_P_HI: f32 = 2.4;
+const GRID_BIN_S: f32 = 0.02;
+const GRID_TOL_S: f32 = 0.03;
+const CLASSIFY_EVERY_S: f32 = 0.5;
+/// Hits dimmer than this below the brightest recent hit are not clap candidates.
+const GRID_HF_RANGE_DB: f32 = 10.0;
 const MAX_PENDING: usize = 32;
-const MAX_PROFILES: usize = 64;
 const MAX_SPREAD: usize = 4096;
-const HF_RECENT: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HitKind {
     /// Profile this hit (clap / snare).
     Clap,
-    /// Counts for the drums mask only.
+    /// Only a candidate for the opposite-beat mask.
     Other,
-    /// Decide from the 2-8 kHz level: within 6 dB of the loudest recent hit → clap.
+    /// Decide from the half-bar grid (fallback: within 6 dB of the loudest recent 2-8 kHz hit).
     Auto,
 }
 
@@ -72,31 +90,36 @@ pub enum HitKind {
 pub struct HitProfile {
     /// Aligned onset, absolute sample index.
     pub at: usize,
+    pub kind_auto: bool,
     pub is_clap: bool,
+    pub is_opp: bool,
+    pub evaluated: bool,
     pub level_db: [f32; 6],
     pub rail_pct: [f32; 7],
     pub tail_db: f32,
     /// 2-8 kHz RMS over 0-25 ms, dBFS.
     pub hf_db: f32,
+    /// Full-band mid RMS over 0-25 ms, dBFS.
+    pub lvl_db: f32,
     pub sone_at: f32,
-    /// Sone at the midpoint between this clap and the previous one (0 if none).
-    pub sone_between: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct Report {
     pub hits: usize,
     pub claps: usize,
+    /// Half-bar period the clap grid locked to, seconds (0 = not locked).
+    pub period_s: f32,
     pub level_db: [f32; 6],
     pub rail_pct: [f32; 7],
     pub tail_db: f32,
     pub band_hits_db: [f32; NBANDS],
     pub band_rest_db: [f32; NBANDS],
+    /// Mean power per band over hits and rest together.
+    pub band_all_db: [f32; NBANDS],
     pub spread_db: f32,
     /// 250-1k band, mid: p99 - median of 100 ms window levels (low-mid peakiness; growl bumps).
     pub lowmid_peak_db: f32,
-    /// Mean power per band over hits and rest together.
-    pub band_all_db: [f32; NBANDS],
     pub pinned_pct: f32,
     pub pinned_hits_pct: f32,
     pub pinned_rest_pct: f32,
@@ -115,10 +138,9 @@ impl Report {
 struct Pending {
     onset: usize,
     kind: HitKind,
-    aligned: Option<usize>,
 }
 
-/// 1 ms RMS envelope, centred (stored half a window late to match a centred moving average).
+/// Moving RMS envelope over `len` samples.
 struct Env {
     ring: Vec<f32>,
     sum: f64,
@@ -147,21 +169,21 @@ impl Env {
 
 pub struct Analyzer {
     sr: f32,
-    ring: usize,
-    mask: usize,
     pos: usize,
-    /// Accumulation runs this many samples behind `pos` so hit masks are known in time.
     delay: usize,
     span: (usize, usize),
-    // per-sample rings
+    // short rings (0.5 s): profile evaluation
+    smask: usize,
     mid: Vec<f32>,
-    rail: Vec<u8>,
     hf_env: Vec<f32>,
     mf_env: Vec<f32>,
-    band_sq: Vec<[f32; NBANDS]>,
     tail_sq: Vec<f32>,
-    spread_pow: Vec<f32>,
+    // long rings (> delay): accumulation
+    lmask: usize,
+    rail: Vec<u8>,
     silent: Vec<u8>,
+    band_sq: Vec<[f32; NBANDS]>,
+    spread_pow: Vec<f32>,
     // filters (mid channel unless noted)
     hf: SosChain,
     mf: SosChain,
@@ -174,14 +196,16 @@ pub struct Analyzer {
     sil_e: Env,
     env_half: usize,
     sil_half: usize,
-    // hit bookkeeping
+    // hits
     pending: Vec<Pending>,
-    masks: VecDeque<(usize, usize)>,
+    hits: Vec<HitProfile>,
+    hit_count: u64,
+    eval_k: u64,
+    acc_k: u64,
     mask_until: usize,
-    profiles: VecDeque<HitProfile>,
-    recent_hf: VecDeque<f32>,
-    last_clap_at: Option<usize>,
     onsets_seen: usize,
+    period_s: f32,
+    last_classify: usize,
     // accumulators
     hits_pow: [f64; NBANDS],
     rest_pow: [f64; NBANDS],
@@ -191,10 +215,14 @@ pub struct Analyzer {
     rest_rail: u64,
     spread_sum: f64,
     spread_win: usize,
-    spread_levels: VecDeque<f32>,
+    spread_levels: Vec<f32>,
+    spread_n: usize,
+    spread_head: usize,
     lm_sum: f64,
     lm_win: usize,
-    lm_levels: VecDeque<f32>,
+    lm_levels: Vec<f32>,
+    lm_n: usize,
+    lm_head: usize,
     // loudness
     sone: SoneMeter,
     sone_trace: Vec<f32>,
@@ -241,11 +269,75 @@ fn percentile(v: &mut [f32], p: f32) -> f32 {
     }
 }
 
+fn phon_of(sone: f32) -> f32 {
+    if sone > 1e-4 {
+        40.0 + 10.0 * sone.log2()
+    } else {
+        0.0
+    }
+}
+
+/// Half-bar grid over hit times (seconds): period in [1.2, 2.4) s (1 ms steps) and phase (20 ms
+/// bins) that collect the most hits. Returns (count, period, phase). Allocation-free.
+pub fn grid_fit(times: &[f32]) -> (usize, f32, f32) {
+    let mut best = (0usize, 0.0f32, 0.0f32);
+    let mut hist = [0u16; 128];
+    let mut p = GRID_P_LO;
+    while p < GRID_P_HI {
+        let nbins = ((p / GRID_BIN_S) as usize + 1).min(hist.len());
+        hist[..nbins].fill(0);
+        for &t in times {
+            let ph = t.rem_euclid(p);
+            let k = ((ph / p) * nbins as f32) as usize;
+            hist[k.min(nbins - 1)] += 1;
+        }
+        let (k, &c) = hist[..nbins].iter().enumerate().max_by_key(|(_, &c)| c).unwrap();
+        if c as usize > best.0 {
+            best = (c as usize, p, (k as f32 + 0.5) * p / nbins as f32);
+        }
+        p += 0.001;
+    }
+    best
+}
+
+#[inline]
+pub fn on_grid(t: f32, period: f32, phase: f32) -> bool {
+    let d = (t - phase + period / 2.0).rem_euclid(period) - period / 2.0;
+    d.abs() < GRID_TOL_S
+}
+
+/// For a locked period, the phase bin (20 ms) whose hits are brightest among the bins that
+/// collect at least 60 % of the best count. Returns the chosen phase.
+pub fn brightest_phase(times: &[f32], hfs: &[f32], period: f32, best_count: usize, best_phase: f32) -> f32 {
+    let nbins = ((period / GRID_BIN_S) as usize + 1).min(128);
+    let mut count = [0u16; 128];
+    let mut hf_sum = [0.0f32; 128];
+    for (&t, &h) in times.iter().zip(hfs) {
+        let k = (((t.rem_euclid(period)) / period) * nbins as f32) as usize;
+        let k = k.min(nbins - 1);
+        count[k] += 1;
+        hf_sum[k] += h;
+    }
+    let min_count = ((best_count as f32) * 0.6).ceil().max(GRID_MIN_HITS as f32) as u16;
+    let mut best = (f32::NEG_INFINITY, best_phase);
+    for k in 0..nbins {
+        if count[k] >= min_count {
+            let mean = hf_sum[k] / count[k] as f32;
+            if mean > best.0 {
+                best = (mean, (k as f32 + 0.5) * period / nbins as f32);
+            }
+        }
+    }
+    best.1
+}
+
 impl Analyzer {
     pub fn new(sample_rate: f32) -> Self {
         let sr = sample_rate as f64;
-        let ring = ((0.5 * sample_rate) as usize).next_power_of_two();
         let ms = |m: f32| (m * sample_rate / 1000.0) as usize;
+        let sring = ((0.5 * sample_rate) as usize).next_power_of_two();
+        let delay = (ACC_DELAY_S * sample_rate) as usize;
+        let lring = (delay + ms(300.0)).next_power_of_two();
         let env_len = (0.001 * sample_rate).round().max(4.0) as usize;
         let sil_len = ms(SPREAD_WIN_MS);
         // the offline scripts filter forward and backward (zero phase), i.e. the band shape is
@@ -262,22 +354,22 @@ impl Analyzer {
             bp(BANDS[3].1, BANDS[3].2),
             bp(BANDS[4].1, BANDS[4].2),
         ];
-        let sone_len = (4.0 * sample_rate) as usize / SONE_HOP + 1;
+        let sone_len = (GRID_WINDOW_S * sample_rate) as usize / SONE_HOP + 2;
         Analyzer {
             sr: sample_rate,
-            ring,
-            mask: ring - 1,
             pos: 0,
-            delay: ms(ALIGN_POST_MS + ALIGN_PRE_MS) + env_len + 64,
+            delay,
             span: (0, usize::MAX),
-            mid: vec![0.0; ring],
-            rail: vec![0; ring],
-            hf_env: vec![0.0; ring],
-            mf_env: vec![0.0; ring],
-            band_sq: vec![[0.0; NBANDS]; ring],
-            tail_sq: vec![0.0; ring],
-            spread_pow: vec![0.0; ring],
-            silent: vec![1; ring],
+            smask: sring - 1,
+            mid: vec![0.0; sring],
+            hf_env: vec![0.0; sring],
+            mf_env: vec![0.0; sring],
+            tail_sq: vec![0.0; sring],
+            lmask: lring - 1,
+            rail: vec![0; lring],
+            silent: vec![1; lring],
+            band_sq: vec![[0.0; NBANDS]; lring],
+            spread_pow: vec![0.0; lring],
             hf: bp(2000.0, 8000.0),
             mf: bp(500.0, 8000.0),
             bands,
@@ -290,12 +382,14 @@ impl Analyzer {
             env_half: env_len / 2,
             sil_half: sil_len / 2,
             pending: Vec::with_capacity(MAX_PENDING),
-            masks: VecDeque::with_capacity(MAX_PENDING),
+            hits: vec![HitProfile::default(); MAX_HITS],
+            hit_count: 0,
+            eval_k: 0,
+            acc_k: 0,
             mask_until: 0,
-            profiles: VecDeque::with_capacity(MAX_PROFILES),
-            recent_hf: VecDeque::with_capacity(HF_RECENT),
-            last_clap_at: None,
             onsets_seen: 0,
+            period_s: 0.0,
+            last_classify: 0,
             hits_pow: [0.0; NBANDS],
             rest_pow: [0.0; NBANDS],
             hits_n: 0,
@@ -304,10 +398,14 @@ impl Analyzer {
             rest_rail: 0,
             spread_sum: 0.0,
             spread_win: sil_len,
-            spread_levels: VecDeque::with_capacity(MAX_SPREAD),
+            spread_levels: vec![0.0; MAX_SPREAD],
+            spread_n: 0,
+            spread_head: 0,
             lm_sum: 0.0,
-            lm_win: ms(100.0),
-            lm_levels: VecDeque::with_capacity(MAX_SPREAD),
+            lm_win: ms(LOWMID_WIN_MS),
+            lm_levels: vec![0.0; MAX_SPREAD],
+            lm_n: 0,
+            lm_head: 0,
             sone: SoneMeter::new(sample_rate, 2, 100.0),
             sone_trace: vec![0.0; sone_len],
             sone_sum: 0.0,
@@ -332,15 +430,15 @@ impl Analyzer {
     pub fn reset(&mut self) {
         self.pos = 0;
         self.mid.fill(0.0);
-        self.rail.fill(0);
         self.hf_env.fill(0.0);
         self.mf_env.fill(0.0);
+        self.tail_sq.fill(0.0);
+        self.rail.fill(0);
+        self.silent.fill(1);
         for b in &mut self.band_sq {
             *b = [0.0; NBANDS];
         }
-        self.tail_sq.fill(0.0);
         self.spread_pow.fill(0.0);
-        self.silent.fill(1);
         self.hf.reset();
         self.mf.reset();
         for b in &mut self.bands {
@@ -353,20 +451,21 @@ impl Analyzer {
         self.mf_e.reset();
         self.sil_e.reset();
         self.pending.clear();
-        self.masks.clear();
-        self.mask_until = 0;
-        self.profiles.clear();
-        self.recent_hf.clear();
-        self.last_clap_at = None;
-        self.onsets_seen = 0;
         self.clear_accumulators();
         self.sone.reset();
         self.sone_trace.fill(0.0);
+        self.last_classify = 0;
     }
 
-    /// Restart the long-term accumulators (drums/rest, pinned, spread, loudness) keeping the
-    /// signal state; the per-hit profiles are kept too.
+    /// Restart the statistics (hits, drums/rest, pinned, spread, loudness), keeping the signal
+    /// state.
     pub fn clear_accumulators(&mut self) {
+        self.hit_count = 0;
+        self.eval_k = 0;
+        self.acc_k = 0;
+        self.mask_until = 0;
+        self.onsets_seen = 0;
+        self.period_s = 0.0;
         self.hits_pow = [0.0; NBANDS];
         self.rest_pow = [0.0; NBANDS];
         self.hits_n = 0;
@@ -374,9 +473,11 @@ impl Analyzer {
         self.hits_rail = 0;
         self.rest_rail = 0;
         self.spread_sum = 0.0;
-        self.spread_levels.clear();
+        self.spread_n = 0;
+        self.spread_head = 0;
         self.lm_sum = 0.0;
-        self.lm_levels.clear();
+        self.lm_n = 0;
+        self.lm_head = 0;
         self.sone_sum = 0.0;
         self.sone_n = 0;
     }
@@ -386,16 +487,30 @@ impl Analyzer {
         if self.pending.len() >= MAX_PENDING {
             self.pending.remove(0);
         }
-        if self.pos.saturating_sub(at) + (ALIGN_PRE_MS * self.sr / 1000.0) as usize + 8 >= self.ring {
+        if self.pos.saturating_sub(at) + self.ms(ALIGN_PRE_MS) + 8 >= self.smask {
             return; // too old for the ring
         }
         self.onsets_seen += 1;
-        self.pending.push(Pending { onset: at, kind, aligned: None });
+        self.pending.push(Pending { onset: at, kind });
     }
 
     #[inline]
     fn ms(&self, m: f32) -> usize {
         (m * self.sr / 1000.0) as usize
+    }
+
+    #[inline]
+    fn hit(&self, k: u64) -> &HitProfile {
+        &self.hits[(k % MAX_HITS as u64) as usize]
+    }
+
+    #[inline]
+    fn hit_mut(&mut self, k: u64) -> &mut HitProfile {
+        &mut self.hits[(k % MAX_HITS as u64) as usize]
+    }
+
+    fn oldest_k(&self) -> u64 {
+        self.hit_count.saturating_sub(MAX_HITS as u64)
     }
 
     /// Push one stereo sample.
@@ -404,15 +519,16 @@ impl Analyzer {
         let l = l.clamp(-1.0, 1.0);
         let r = r.clamp(-1.0, 1.0);
         let m = 0.5 * (l + r);
-        let i = self.pos & self.mask;
-        self.mid[i] = m;
-        self.rail[i] = (l.abs() >= RAIL || r.abs() >= RAIL) as u8;
+        let si = self.pos & self.smask;
+        let li = self.pos & self.lmask;
+        self.mid[si] = m;
+        self.rail[li] = (l.abs() >= RAIL || r.abs() >= RAIL) as u8;
         let md = m as f64;
         let hf = self.hf.process(md) as f32;
         let mf = self.mf.process(md) as f32;
         let he = self.hf_e.push(hf * hf);
         let me = self.mf_e.push(mf * mf);
-        let ci = self.pos.wrapping_sub(self.env_half) & self.mask;
+        let ci = self.pos.wrapping_sub(self.env_half) & self.smask;
         self.hf_env[ci] = he;
         self.mf_env[ci] = me;
         let mut sq = [0.0f32; NBANDS];
@@ -421,15 +537,15 @@ impl Analyzer {
             let y = b.process(md) as f32;
             sq[k + 1] = y * y;
         }
-        self.band_sq[i] = sq;
+        self.band_sq[li] = sq;
         let t = self.tail.process(md) as f32;
-        self.tail_sq[i] = t * t;
+        self.tail_sq[si] = t * t;
         let sl = self.spread_l.process(l as f64) as f32;
         let sr_ = self.spread_r.process(r as f64) as f32;
-        self.spread_pow[i] = 0.5 * (sl * sl + sr_ * sr_);
+        self.spread_pow[li] = 0.5 * (sl * sl + sr_ * sr_);
         let se = self.sil_e.push(m * m);
-        let si = self.pos.wrapping_sub(self.sil_half) & self.mask;
-        self.silent[si] = (se * se < SILENCE_POW) as u8;
+        let sili = self.pos.wrapping_sub(self.sil_half) & self.lmask;
+        self.silent[sili] = (se * se < SILENCE_POW) as u8;
         // loudness
         self.sone.push(&[l, r]);
         if self.pos % SONE_HOP == 0 {
@@ -442,127 +558,208 @@ impl Analyzer {
         }
         self.pos += 1;
         self.service_hits();
+        if self.pos - self.last_classify >= (CLASSIFY_EVERY_S * self.sr) as usize {
+            self.last_classify = self.pos;
+            self.classify();
+        }
         if self.pos > self.delay {
             self.accumulate(self.pos - 1 - self.delay);
         }
     }
 
     fn service_hits(&mut self) {
+        let wait = self.ms(ALIGN_WAIT_MS);
         let post = self.ms(ALIGN_POST_MS);
         let pre = self.ms(ALIGN_PRE_MS);
         let prof = self.ms(PROFILE_MS);
+        // align pending onsets
         let mut k = 0;
         while k < self.pending.len() {
             let p = self.pending[k];
-            match p.aligned {
-                None => {
-                    if self.pos > p.onset + post {
-                        let a0 = p.onset.saturating_sub(pre);
-                        let a1 = p.onset + post;
-                        let use_hf = match p.kind {
-                            HitKind::Clap => true,
-                            HitKind::Other => false,
-                            HitKind::Auto => {
-                                let mut pk = 0.0f32;
-                                for t in a0..a1 {
-                                    pk = pk.max(self.hf_env[t & self.mask]);
-                                }
-                                pk > 0.01
-                            }
-                        };
+            if self.pos > p.onset + wait {
+                let a0 = p.onset.saturating_sub(pre);
+                let a1 = p.onset + post;
+                let use_hf = match p.kind {
+                    HitKind::Clap => true,
+                    HitKind::Other => false,
+                    HitKind::Auto => {
                         let mut pk = 0.0f32;
                         for t in a0..a1 {
-                            let v = if use_hf { self.hf_env[t & self.mask] } else { self.mf_env[t & self.mask] };
-                            pk = pk.max(v);
+                            pk = pk.max(self.hf_env[t & self.smask]);
                         }
-                        let thr = pk * 0.501_187_2; // -6 dB
-                        let mut al = a0;
-                        for t in a0..a1 {
-                            let v = if use_hf { self.hf_env[t & self.mask] } else { self.mf_env[t & self.mask] };
-                            if v >= thr {
-                                al = t;
-                                break;
-                            }
-                        }
-                        self.pending[k].aligned = Some(al);
-                        if self.masks.len() >= MAX_PENDING {
-                            self.masks.pop_front();
-                        }
-                        self.masks.push_back((al, al + self.ms(HIT_MS)));
-                        if p.kind == HitKind::Other {
-                            self.pending.remove(k);
-                            continue;
-                        }
+                        pk > 0.01
                     }
-                    k += 1;
+                };
+                let mut pk = 0.0f32;
+                for t in a0..a1 {
+                    let v = if use_hf { self.hf_env[t & self.smask] } else { self.mf_env[t & self.smask] };
+                    pk = pk.max(v);
                 }
-                Some(al) => {
-                    if self.pos > al + prof {
-                        self.evaluate(al, p.kind);
-                        self.pending.remove(k);
-                    } else {
-                        k += 1;
+                let thr = pk * 0.501_187_2; // -6 dB
+                let mut al = a0;
+                for t in a0..a1 {
+                    let v = if use_hf { self.hf_env[t & self.smask] } else { self.mf_env[t & self.smask] };
+                    if v >= thr {
+                        al = t;
+                        break;
                     }
                 }
+                // 0-25 ms levels
+                let w25 = self.ms(25.0);
+                let (mut hs, mut ls) = (0.0f64, 0.0f64);
+                for t in al..al + w25 {
+                    let e = self.hf_env[t & self.smask];
+                    hs += (e * e) as f64;
+                    let m = self.mid[t & self.smask];
+                    ls += (m * m) as f64;
+                }
+                let hf_db = db_amp((hs / w25.max(1) as f64).sqrt());
+                let lvl_db = db_amp((ls / w25.max(1) as f64).sqrt());
+                let n = self.sone_trace.len();
+                let sone_at = self.sone_trace[((al + self.ms(30.0)) / SONE_HOP) % n];
+                let rec = HitProfile {
+                    at: al,
+                    kind_auto: p.kind == HitKind::Auto,
+                    is_clap: p.kind == HitKind::Clap,
+                    is_opp: false,
+                    evaluated: false,
+                    hf_db,
+                    lvl_db,
+                    sone_at,
+                    ..Default::default()
+                };
+                let kk = self.hit_count;
+                *self.hit_mut(kk) = rec;
+                self.hit_count += 1;
+                self.pending.remove(k);
+            } else {
+                k += 1;
+            }
+        }
+        // evaluate profiles once 200 ms of audio is in
+        while self.eval_k < self.hit_count {
+            let al = self.hit(self.eval_k).at;
+            if self.pos > al + prof {
+                self.evaluate(self.eval_k);
+                self.eval_k += 1;
+            } else {
+                break;
             }
         }
     }
 
-    fn evaluate(&mut self, al: usize, kind: HitKind) {
+    fn evaluate(&mut self, k: u64) {
+        let al = self.hit(k).at;
         let w = |s: &Self, a: f32, b: f32, f: &dyn Fn(usize) -> f32| -> f64 {
             let (i0, i1) = (al + s.ms(a), al + s.ms(b));
             let mut acc = 0.0f64;
             for t in i0..i1 {
-                acc += f(t & s.mask) as f64;
+                acc += f(t) as f64;
             }
             acc / (i1 - i0).max(1) as f64
         };
         let mut level = [0.0f32; 6];
-        for (k, (a, b)) in LEVEL_WINS_MS.iter().enumerate() {
-            let p = w(self, *a, *b, &|i| self.mid[i] * self.mid[i]);
-            level[k] = db_amp(p.sqrt());
+        for (q, (a, b)) in LEVEL_WINS_MS.iter().enumerate() {
+            let p = w(self, *a, *b, &|t| {
+                let v = self.mid[t & self.smask];
+                v * v
+            });
+            level[q] = db_amp(p.sqrt());
         }
         let mut rail = [0.0f32; 7];
-        for (k, (a, b)) in RAIL_WINS_MS.iter().enumerate() {
-            rail[k] = 100.0 * w(self, *a, *b, &|i| self.rail[i] as f32) as f32;
+        for (q, (a, b)) in RAIL_WINS_MS.iter().enumerate() {
+            rail[q] = 100.0 * w(self, *a, *b, &|t| self.rail[t & self.lmask] as f32) as f32;
         }
-        let tail_db = db_amp(w(self, TAIL_WIN_MS.0, TAIL_WIN_MS.1, &|i| self.tail_sq[i]).sqrt());
-        // 2-8 kHz 0-25 ms from the (centred) envelope: mean of env^2
-        let hf_db = db_amp(w(self, 0.0, 25.0, &|i| self.hf_env[i] * self.hf_env[i]).sqrt());
-        let is_clap = match kind {
-            HitKind::Clap => true,
-            HitKind::Other => false,
-            HitKind::Auto => {
-                let mx = self.recent_hf.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let c = !mx.is_finite() || hf_db >= mx - 6.0;
-                if self.recent_hf.len() >= HF_RECENT {
-                    self.recent_hf.pop_front();
-                }
-                self.recent_hf.push_back(hf_db);
-                c
+        let tail_db = db_amp(w(self, TAIL_WIN_MS.0, TAIL_WIN_MS.1, &|t| self.tail_sq[t & self.smask]).sqrt());
+        let h = self.hit_mut(k);
+        h.level_db = level;
+        h.rail_pct = rail;
+        h.tail_db = tail_db;
+        h.evaluated = true;
+    }
+
+    /// Clap / opposite-beat flags over the stored hits: half-bar grid over the last 20 s of
+    /// Auto hits (fallback: loudest-HF rule), then the loudest other hit between claps.
+    fn classify(&mut self) {
+        let lo = self.oldest_k();
+        let hi = self.hit_count;
+        if hi == lo {
+            return;
+        }
+        let win = (GRID_WINDOW_S * self.sr) as usize;
+        let t0 = self.pos.saturating_sub(win);
+        // grid over the bright Auto hits in the window (within 10 dB of the brightest 2-8 kHz
+        // hit: claps/snares, not hats or kicks)
+        let mut hf_max = f32::NEG_INFINITY;
+        for k in lo..hi {
+            let h = self.hit(k);
+            if h.kind_auto && h.at >= t0 {
+                hf_max = hf_max.max(h.hf_db);
             }
-        };
-        let n = self.sone_trace.len();
-        let tr = |s: &Self, t: usize| s.sone_trace[(t / SONE_HOP) % n];
-        let sone_at = tr(self, al + self.ms(30.0));
-        let sone_between = match self.last_clap_at {
-            Some(prev) if is_clap && al > prev && al - prev < (3.0 * self.sr) as usize => tr(self, (prev + al) / 2),
-            _ => 0.0,
-        };
-        if is_clap {
-            self.last_clap_at = Some(al);
         }
-        if self.profiles.len() >= MAX_PROFILES {
-            self.profiles.pop_front();
+        let mut times = [0.0f32; MAX_HITS];
+        let mut hfs = [0.0f32; MAX_HITS];
+        let mut n = 0;
+        for k in lo..hi {
+            let h = self.hit(k);
+            if h.kind_auto && h.at >= t0 && h.hf_db >= hf_max - GRID_HF_RANGE_DB {
+                times[n] = h.at as f32 / self.sr;
+                hfs[n] = h.hf_db;
+                n += 1;
+            }
         }
-        self.profiles.push_back(HitProfile { at: al, is_clap, level_db: level, rail_pct: rail, tail_db, hf_db, sone_at, sone_between });
+        if hf_max.is_finite() {
+            let (count, period, phase) = if n >= GRID_MIN_HITS { grid_fit(&times[..n]) } else { (0, 0.0, 0.0) };
+            let locked = count >= GRID_MIN_HITS;
+            // among the phases of that period that collect nearly as many hits, take the
+            // brightest (the clap/snare, not the kick/zap on the other beat)
+            let phase = if locked { brightest_phase(&times[..n], &hfs[..n], period, count, phase) } else { phase };
+            self.period_s = if locked { period } else { 0.0 };
+            for k in lo..hi {
+                let sr = self.sr;
+                let h = self.hit_mut(k);
+                if h.kind_auto {
+                    h.is_clap = if locked {
+                        h.hf_db >= hf_max - GRID_HF_RANGE_DB && on_grid(h.at as f32 / sr, period, phase)
+                    } else {
+                        h.hf_db >= hf_max - 6.0
+                    };
+                }
+            }
+        }
+        // opposite: loudest non-clap hit strictly between consecutive claps
+        for k in lo..hi {
+            self.hit_mut(k).is_opp = false;
+        }
+        let mut prev_clap: Option<u64> = None;
+        for k in lo..hi {
+            if self.hit(k).is_clap {
+                if let Some(pc) = prev_clap {
+                    let mut best: Option<u64> = None;
+                    for j in pc + 1..k {
+                        let h = self.hit(j);
+                        if best.map_or(true, |b| h.lvl_db > self.hit(b).lvl_db) {
+                            best = Some(j);
+                        }
+                    }
+                    if let Some(b) = best {
+                        self.hit_mut(b).is_opp = true;
+                    }
+                }
+                prev_clap = Some(k);
+            }
+        }
     }
 
     fn accumulate(&mut self, a: usize) {
-        while let Some(&(s, e)) = self.masks.front() {
-            if s <= a {
-                self.mask_until = self.mask_until.max(e);
-                self.masks.pop_front();
+        let hit_len = self.ms(HIT_MS);
+        while self.acc_k < self.hit_count {
+            let h = *self.hit(self.acc_k);
+            if h.at <= a {
+                if h.is_clap || h.is_opp {
+                    self.mask_until = self.mask_until.max(h.at + hit_len);
+                }
+                self.acc_k += 1;
             } else {
                 break;
             }
@@ -570,30 +767,29 @@ impl Analyzer {
         if a < self.span.0 || a >= self.span.1 {
             return;
         }
-        let i = a & self.mask;
+        let i = a & self.lmask;
+        let rel = a - self.span.0 + 1;
         // spread: 50 ms windows every 25 ms from the span start, stereo 500-6k power
         self.spread_sum += self.spread_pow[i] as f64;
-        let rel = a - self.span.0 + 1;
         if rel >= self.spread_win {
-            let old = self.spread_pow[(a + 1).wrapping_sub(self.spread_win) & self.mask] as f64;
+            let old = self.spread_pow[(a + 1).wrapping_sub(self.spread_win) & self.lmask] as f64;
             if (rel - self.spread_win) % (self.spread_win / 2) == 0 {
-                if self.spread_levels.len() >= MAX_SPREAD {
-                    self.spread_levels.pop_front();
-                }
-                self.spread_levels.push_back(db_pow(self.spread_sum / self.spread_win as f64));
+                let v = db_pow(self.spread_sum / self.spread_win as f64);
+                self.spread_levels[self.spread_head] = v;
+                self.spread_head = (self.spread_head + 1) % MAX_SPREAD;
+                self.spread_n = (self.spread_n + 1).min(MAX_SPREAD);
             }
             self.spread_sum -= old;
         }
         // low-mid peakiness: 100 ms windows every 50 ms of the 250-1k band
-        let lm = self.band_sq[i][2] as f64;
-        self.lm_sum += lm;
+        self.lm_sum += self.band_sq[i][2] as f64;
         if rel >= self.lm_win {
-            let old = self.band_sq[(a + 1).wrapping_sub(self.lm_win) & self.mask][2] as f64;
+            let old = self.band_sq[(a + 1).wrapping_sub(self.lm_win) & self.lmask][2] as f64;
             if (rel - self.lm_win) % (self.lm_win / 2) == 0 {
-                if self.lm_levels.len() >= MAX_SPREAD {
-                    self.lm_levels.pop_front();
-                }
-                self.lm_levels.push_back(db_pow(self.lm_sum / self.lm_win as f64));
+                let v = db_pow(self.lm_sum / self.lm_win as f64);
+                self.lm_levels[self.lm_head] = v;
+                self.lm_head = (self.lm_head + 1) % MAX_SPREAD;
+                self.lm_n = (self.lm_n + 1).min(MAX_SPREAD);
             }
             self.lm_sum -= old;
         }
@@ -618,75 +814,103 @@ impl Analyzer {
         }
     }
 
-    /// Evaluate what can still be evaluated at the end of a stream (offline use).
+    /// End of a stream (offline use): classify what is stored and run the accumulation up to
+    /// the last complete sample.
     pub fn finish(&mut self) {
-        // nothing more arrives; hits whose profile window is incomplete are dropped
         self.pending.clear();
+        self.classify();
+        let end = self.pos;
+        let mut a = if self.pos > self.delay { self.pos - self.delay } else { 0 };
+        while a < end {
+            self.accumulate(a);
+            a += 1;
+        }
+        // keep the delay consistent for any further pushes
+        self.delay = 0;
     }
 
-    pub fn profiles(&self) -> impl Iterator<Item = &HitProfile> {
-        self.profiles.iter()
+    /// Stored hits, oldest first.
+    pub fn hits(&self) -> impl Iterator<Item = &HitProfile> {
+        (self.oldest_k()..self.hit_count).map(move |k| self.hit(k))
     }
 
     pub fn last_profile(&self) -> Option<&HitProfile> {
-        self.profiles.back()
+        if self.hit_count == 0 {
+            return None;
+        }
+        let mut k = self.hit_count;
+        while k > self.oldest_k() {
+            k -= 1;
+            let h = self.hit(k);
+            if h.evaluated && h.is_clap {
+                return Some(h);
+            }
+        }
+        None
     }
 
     /// Medians over the stored clap profiles plus the accumulators. Allocation-free (stack
     /// buffers), fine to call from the audio thread every few blocks.
     pub fn report(&self) -> Report {
-        let any_clap = self.profiles.iter().any(|p| p.is_clap);
-        let sel = |p: &&HitProfile| !any_clap || p.is_clap;
-        let n = self.profiles.iter().filter(sel).count();
-        let mut r = Report { hits: self.onsets_seen, claps: n, ..Default::default() };
-        let mut buf = [0.0f32; MAX_PROFILES];
-        let fill = |f: &dyn Fn(&HitProfile) -> Option<f32>, buf: &mut [f32; MAX_PROFILES]| -> usize {
-            let mut k = 0;
-            for p in self.profiles.iter().filter(sel) {
-                if let Some(v) = f(p) {
-                    buf[k] = v;
-                    k += 1;
+        let lo = self.oldest_k();
+        let hi = self.hit_count;
+        let mut r = Report { hits: self.onsets_seen, period_s: self.period_s, ..Default::default() };
+        let mut buf = [0.0f32; MAX_HITS];
+        let fill = |f: &dyn Fn(&HitProfile) -> Option<f32>, buf: &mut [f32; MAX_HITS]| -> usize {
+            let mut n = 0;
+            for k in lo..hi {
+                let h = self.hit(k);
+                if h.evaluated && h.is_clap {
+                    if let Some(v) = f(h) {
+                        buf[n] = v;
+                        n += 1;
+                    }
                 }
             }
-            k
+            n
         };
+        r.claps = fill(&|_| Some(0.0), &mut buf);
         for w in 0..6 {
-            let k = fill(&|p| Some(p.level_db[w]), &mut buf);
-            r.level_db[w] = median(&mut buf[..k]);
+            let n = fill(&|p| Some(p.level_db[w]), &mut buf);
+            r.level_db[w] = median(&mut buf[..n]);
         }
         for w in 0..7 {
-            let k = fill(&|p| Some(p.rail_pct[w]), &mut buf);
-            r.rail_pct[w] = median(&mut buf[..k]);
+            let n = fill(&|p| Some(p.rail_pct[w]), &mut buf);
+            r.rail_pct[w] = median(&mut buf[..n]);
         }
-        let k = fill(&|p| Some(p.tail_db), &mut buf);
-        r.tail_db = median(&mut buf[..k]);
-        let k = fill(&|p| Some(p.sone_at), &mut buf);
-        let s = median(&mut buf[..k]);
-        r.phon_hits = if s > 1e-4 { 40.0 + 10.0 * s.log2() } else { 0.0 };
-        let k = fill(&|p| if p.sone_between > 0.0 { Some(p.sone_between) } else { None }, &mut buf);
-        let s = median(&mut buf[..k]);
-        r.phon_between = if s > 1e-4 { 40.0 + 10.0 * s.log2() } else { 0.0 };
+        let n = fill(&|p| Some(p.tail_db), &mut buf);
+        r.tail_db = median(&mut buf[..n]);
+        let n = fill(&|p| Some(p.sone_at), &mut buf);
+        r.phon_hits = phon_of(median(&mut buf[..n]));
+        // between: sone at the midpoint of consecutive claps (within the trace ring)
+        let tn = self.sone_trace.len();
+        let mut n = 0;
+        let mut prev: Option<usize> = None;
+        for k in lo..hi {
+            let h = self.hit(k);
+            if h.evaluated && h.is_clap {
+                if let Some(p) = prev {
+                    let mid = (p + h.at) / 2;
+                    if self.pos.saturating_sub(mid) < tn * SONE_HOP && h.at - p < (3.0 * self.sr) as usize {
+                        buf[n] = self.sone_trace[(mid / SONE_HOP) % tn];
+                        n += 1;
+                    }
+                }
+                prev = Some(h.at);
+            }
+        }
+        r.phon_between = phon_of(median(&mut buf[..n]));
+        let tot = self.hits_n + self.rest_n;
         for b in 0..NBANDS {
             r.band_hits_db[b] = db_pow(self.hits_pow[b] / self.hits_n.max(1) as f64);
             r.band_rest_db[b] = db_pow(self.rest_pow[b] / self.rest_n.max(1) as f64);
-        }
-        let mut sp = [0.0f32; MAX_SPREAD];
-        let mut k = 0;
-        for &v in self.spread_levels.iter() {
-            sp[k] = v;
-            k += 1;
-        }
-        r.spread_db = if k >= 4 { percentile(&mut sp[..k], 90.0) - percentile(&mut sp[..k], 10.0) } else { f32::NAN };
-        let mut k = 0;
-        for &v in self.lm_levels.iter() {
-            sp[k] = v;
-            k += 1;
-        }
-        r.lowmid_peak_db = if k >= 8 { percentile(&mut sp[..k], 99.0) - percentile(&mut sp[..k], 50.0) } else { f32::NAN };
-        let tot = self.hits_n + self.rest_n;
-        for b in 0..NBANDS {
             r.band_all_db[b] = db_pow((self.hits_pow[b] + self.rest_pow[b]) / tot.max(1) as f64);
         }
+        let mut sp = [0.0f32; MAX_SPREAD];
+        sp[..self.spread_n].copy_from_slice(&self.spread_levels[..self.spread_n]);
+        r.spread_db = if self.spread_n >= 4 { percentile(&mut sp[..self.spread_n], 90.0) - percentile(&mut sp[..self.spread_n], 10.0) } else { f32::NAN };
+        sp[..self.lm_n].copy_from_slice(&self.lm_levels[..self.lm_n]);
+        r.lowmid_peak_db = if self.lm_n >= 8 { percentile(&mut sp[..self.lm_n], 99.0) - percentile(&mut sp[..self.lm_n], 50.0) } else { f32::NAN };
         r.pinned_pct = 100.0 * (self.hits_rail + self.rest_rail) as f32 / tot.max(1) as f32;
         r.pinned_hits_pct = 100.0 * self.hits_rail as f32 / self.hits_n.max(1) as f32;
         r.pinned_rest_pct = 100.0 * self.rest_rail as f32 / self.rest_n.max(1) as f32;
@@ -697,11 +921,11 @@ impl Analyzer {
 }
 
 /// Offline analysis of a whole buffer with known hits `(sample, kind)`, sorted by sample.
-/// `span` limits the accumulators (default: first hit to last hit, like the offline scripts).
+/// `span` limits the accumulators (default: first clap to last clap, like the offline scripts).
 pub fn analyze_buffer(l: &[f32], r: &[f32], sr: f32, hits: &[(usize, HitKind)], span: Option<(usize, usize)>) -> Report {
     let mut an = Analyzer::new(sr);
     let (lo, hi) = span.unwrap_or_else(|| {
-        let claps: Vec<usize> = hits.iter().filter(|h| h.1 != HitKind::Other).map(|h| h.0).collect();
+        let claps: Vec<usize> = hits.iter().filter(|h| h.1 == HitKind::Clap).map(|h| h.0).collect();
         match (claps.first(), claps.last()) {
             (Some(&a), Some(&b)) if b > a => (a, b),
             _ => (0, usize::MAX),
@@ -727,9 +951,9 @@ mod tests {
 
     #[test]
     fn synthetic_hits_profile() {
-        // 1 s of -40 dB noise bed with a 150 ms burst at 0 dB every 500 ms
+        // -40 dB noise bed with a 150 ms burst at 0 dB every 500 ms
         let sr = 44100.0;
-        let n = 3 * 44100;
+        let n = 4 * 44100;
         let mut l = vec![0.0f32; n];
         let mut r = vec![0.0f32; n];
         let mut seed = 1u32;
@@ -737,7 +961,7 @@ mod tests {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
             (seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
         };
-        let hits: Vec<(usize, HitKind)> = (1..5).map(|k| (k * 22050, HitKind::Clap)).collect();
+        let hits: Vec<(usize, HitKind)> = (1..6).map(|k| (k * 22050, HitKind::Clap)).collect();
         for i in 0..n {
             let mut g = 0.01;
             for h in &hits {
@@ -748,13 +972,25 @@ mod tests {
             l[i] = (rnd() * g).clamp(-1.0, 1.0);
             r[i] = (rnd() * g).clamp(-1.0, 1.0);
         }
-        let rep = analyze_buffer(&l, &r, sr, &hits, Some((22050, 3 * 44100)));
-        assert_eq!(rep.claps, 4, "{rep:?}");
+        let rep = analyze_buffer(&l, &r, sr, &hits, Some((22050, 4 * 44100)));
+        assert_eq!(rep.claps, 5, "{rep:?}");
         // uniform noise burst, mid channel RMS = sqrt(1/6) → -7.8 dBFS
         assert!((rep.level_db[1] + 7.8).abs() < 1.0, "{:?}", rep.level_db);
         // 120-200 ms window: 30 ms of burst + 50 ms of bed → -7.8 - 10log10(80/30) ≈ -12.0
         assert!((rep.level_db[5] + 12.0).abs() < 1.0, "{:?}", rep.level_db);
         assert!(rep.band_delta(0) > 25.0, "{rep:?}");
         assert!(rep.pinned_pct < 1.0);
+    }
+
+    #[test]
+    fn grid_fit_finds_period() {
+        let times: Vec<f32> = (0..12).map(|k| 1.0 + k as f32 * 1.714).collect();
+        let (c, p, ph) = grid_fit(&times);
+        assert_eq!(c, 12);
+        assert!((p - 1.714).abs() < 0.002, "{p}");
+        for &t in &times {
+            assert!(on_grid(t, p, ph));
+        }
+        assert!(!on_grid(1.0 + 0.857, p, ph));
     }
 }

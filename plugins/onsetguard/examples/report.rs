@@ -126,4 +126,20 @@ fn main() {
     let span = span.map(|(a, b)| ((a * sr) as usize, (b * sr) as usize));
     let rep = analyze_buffer(&l, &r, sr, &hits, span);
     print_report(&file, &rep);
+    if std::env::var("DUMP_HITS").is_ok() {
+        // re-run keeping the analyser to list the stored hits
+        let mut an = onsetguard::analysis::Analyzer::new(sr);
+        let mut next = 0;
+        for i in 0..l.len() {
+            an.push(l[i], r[i]);
+            while next < hits.len() && hits[next].0 < i + 1 {
+                an.onset(hits[next].0, hits[next].1);
+                next += 1;
+            }
+        }
+        an.finish();
+        for h in an.hits() {
+            println!("  hit {:8.3} s  hf {:6.1}  lvl {:6.1}  {}{}", h.at as f32 / sr, h.hf_db, h.lvl_db, if h.is_clap { "CLAP" } else { "    " }, if h.is_opp { " opp" } else { "" });
+        }
+    }
 }

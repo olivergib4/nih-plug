@@ -37,6 +37,7 @@ pub struct Data {
     pub ref_status: String,
     pub rows: Vec<Row>,
     pub busy: bool,
+    pub tick: u64,
 }
 
 pub enum Msg {
@@ -101,6 +102,7 @@ impl Model for Data {
             Msg::Tick => {
                 let s = { *self.snap.lock().unwrap().read() };
                 self.live = s;
+                self.tick = self.tick.wrapping_add(1);
                 self.rows = rows(&s.report, self.reference.as_ref().map(|r| &r.report));
             }
             Msg::ResetStats => {
@@ -168,8 +170,11 @@ fn pick_file() -> Option<std::path::PathBuf> {
 pub struct ProfileGraph;
 
 impl ProfileGraph {
-    pub fn new(cx: &mut Context) -> Handle<Self> {
-        Self.build(cx, |_| {})
+    pub fn new(cx: &mut Context) -> Handle<'_, Self> {
+        Self.build(cx, |cx| {
+            // redraw on every analysis tick
+            Binding::new(cx, Data::tick, |cx, _| cx.needs_redraw());
+        })
     }
 }
 
@@ -315,6 +320,7 @@ pub(crate) fn create(
             reference,
             ref_status,
             busy: false,
+            tick: 0,
         }
         .build(cx);
 
@@ -418,7 +424,7 @@ pub(crate) fn create(
                         HStack::new(cx, |cx| {
                             Label::new(cx, item.map(|r| r.name.clone())).class("td").width(Pixels(210.0));
                             Label::new(cx, item.map(|r| r.live.clone())).class("td").width(Pixels(110.0));
-                            Label::new(cx, item.map(|r| r.reference.clone())).class("td ref").width(Pixels(110.0));
+                            Label::new(cx, item.map(|r| r.reference.clone())).class("td").class("ref").width(Pixels(110.0));
                             Label::new(cx, item.map(|r| r.delta.clone())).class("td").width(Pixels(110.0));
                         })
                         .height(Pixels(17.0));

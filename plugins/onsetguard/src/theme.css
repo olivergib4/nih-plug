@@ -1,50 +1,50 @@
-tooltip {
-  child-space: 8px;
-  background-color: #f4f1ea;
-  color: #15171a;
-  border-radius: 4px;
-  border-width: 1px;
-  border-color: #8a8a8a;
-  opacity: 0;
-  transition: opacity 120ms 450ms;
-}
-
-tooltip.vis {
-  opacity: 1;
-  transition: opacity 120ms 450ms;
-}
-
-.help {
-  width: 340px;
-  font-size: 12;
-}
-
-.helppanel, .panel {
+.panel {
   background-color: #2a2b2e;
   color: #e6e4dc;
   border-radius: 4px;
   border-width: 1px;
   border-color: #4a4b4f;
-  child-space: 6px;
-  row-between: 1px;
+  child-space: 8px;
 }
-.paneltitle {
+.section {
   font-size: 12;
   color: #9a9a9a;
-  height: 16px;
+  height: 18px;
+  top: 6px;
 }
-
-/* compact rows so six columns fit a 13" screen */
-generic-ui {
-  child-space: 6px;
-  row-between: 2px;
+.sub {
+  font-size: 11;
+  color: #9a9a9a;
 }
-generic-ui .row {
-  height: 24px;
+.plabel {
+  font-size: 12;
+  top: 1s;
+  bottom: 1s;
+}
+.tick {
+  font-size: 10;
+  color: #9a9a9a;
+  text-align: center;
+}
+.legend {
+  font-size: 11;
+}
+.th {
+  font-size: 11;
+  color: #9a9a9a;
+}
+.td {
+  font-size: 12;
+}
+.ref {
+  color: #ffb840;
 }
 param-slider {
   height: 22px;
 }
-param-button {
-  height: 22px;
+button {
+  height: 26px;
+  child-space: 1s;
+  child-left: 8px;
+  child-right: 8px;
 }

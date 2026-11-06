@@ -1,6 +1,6 @@
 use nih_plug::prelude::*;
-use onsetguard::OnsetGuard;
+use onsetguard::Bloater;
 
 fn main() {
-    nih_export_standalone::<OnsetGuard>();
+    nih_export_standalone::<Bloater>();
 }

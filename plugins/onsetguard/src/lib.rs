@@ -1,6 +1,5 @@
-// Bloater (formerly OnsetGuard): onset-protected zero-phase spectral dynamics and loudness.
-// Derived from Spectral Compressor, Copyright (C) 2021-2024 Robbert van der Helm.
-// Bloater additions Copyright (C) 2026 OGII.
+// Bloater 1.0: bus clipper with hit analysis and reference comparison.
+// Copyright (C) 2026 OGII. Derived from the nih-plug examples (Robbert van der Helm).
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -15,774 +14,232 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use atomic_float::AtomicF32;
+//! The plugin is a fixed 1x hard clipper at 0 dBFS with a pre-stage (drive, tilt/bell EQ, band
+//! leveler, optional sub split) and an analyser that measures the clipped output the way the
+//! reference tracks were measured: clap level and rail profile over the first 200 ms of each hit,
+//! drums-vs-rest per band, 500-6 kHz spread, pinned share inside/between hits, phon. A reference
+//! file dropped on the editor is analysed with the same code and shown as deltas.
+
 use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use triple_buffer::TripleBuffer;
 
-pub mod analyzer;
+pub mod analysis;
 pub mod dsp;
 mod editor;
-pub mod help;
-pub mod presets;
+pub mod reference;
 
-use dsp::dynamics::Weighting;
-use dsp::{Engine, Settings, SubMode};
+use analysis::{Analyzer, HitKind, HitProfile, Report};
+use dsp::busclip::{BusClip, BusSettings};
+use dsp::onset::OnsetDetector;
 
-pub struct OnsetGuard {
-    params: Arc<OnsetGuardParams>,
-    engine: Option<Engine>,
-    meters: Arc<Meters>,
-    analyzer_in: triple_buffer::Input<analyzer::AnalyzerData>,
-    analyzer_out: Arc<Mutex<triple_buffer::Output<analyzer::AnalyzerData>>>,
-    sample_rate: f32,
-    max_block: usize,
-    num_channels: usize,
-}
-
-/// Values shared with the editor for metering.
-pub struct Meters {
-    /// Gain reduction of the spectral (per-bin ceiling) stage, dB <= 0.
-    /// Gain reduction of the post soft clipper, dB <= 0.
-    pub gr_post_db: AtomicF32,
-    /// K-weighted level of the dry and processed signals (LUFS-style, 3 s window).
-    pub dry_lufs: AtomicF32,
-    pub wet_lufs: AtomicF32,
-    /// Perceived loudness (sones) of the dry signal at unity and of the processed signal.
-    pub dry_sone: AtomicF32,
-    pub wet_sone: AtomicF32,
-    /// Mono-sum loudness: dry, processed.
-    pub mono_dry_sone: AtomicF32,
-    pub mono_wet_sone: AtomicF32,
-    /// Translation readouts: phone dry/processed, laptop dry/processed.
-    pub tr_sone: [AtomicF32; 4],
-    /// Spectral flatness: dry, processed.
-    pub flat_dry: AtomicF32,
-    pub flat_wet: AtomicF32,
-    /// Distortion readout: crest dry, crest processed (dB), share of samples at the ceiling (%).
-    pub crest_dry: AtomicF32,
-    pub crest_wet: AtomicF32,
-    pub rail_pct: AtomicF32,
-    /// Autopilot's extra drive, dB, and whether it has locked.
-    pub auto_drive_db: AtomicF32,
-    pub auto_locked: std::sync::atomic::AtomicBool,
-    /// Current matched-bypass gain, dB.
-    pub match_db: AtomicF32,
-}
-
-impl Default for Meters {
-    fn default() -> Self {
-        Meters {
-            gr_post_db: AtomicF32::new(0.0),
-            dry_lufs: AtomicF32::new(-100.0),
-            wet_lufs: AtomicF32::new(-100.0),
-            dry_sone: AtomicF32::new(0.0),
-            wet_sone: AtomicF32::new(0.0),
-            mono_dry_sone: AtomicF32::new(0.0),
-            mono_wet_sone: AtomicF32::new(0.0),
-            tr_sone: [AtomicF32::new(0.0), AtomicF32::new(0.0), AtomicF32::new(0.0), AtomicF32::new(0.0)],
-            flat_dry: AtomicF32::new(0.0),
-            flat_wet: AtomicF32::new(0.0),
-            crest_dry: AtomicF32::new(0.0),
-            crest_wet: AtomicF32::new(0.0),
-            rail_pct: AtomicF32::new(0.0),
-            auto_drive_db: AtomicF32::new(0.0),
-            auto_locked: std::sync::atomic::AtomicBool::new(false),
-            match_db: AtomicF32::new(0.0),
-        }
-    }
+/// Snapshot of the live analysis for the editor.
+#[derive(Clone, Copy, Default)]
+pub struct Snapshot {
+    pub report: Report,
+    pub last: HitProfile,
+    pub has_last: bool,
+    /// Pre-clip peak of the last block, dBFS (how hard the clipper is being hit).
+    pub in_peak_db: f32,
+    /// Share of output samples at the rail in the last block, 0..1.
+    pub block_pinned: f32,
+    pub lev_gr_db: f32,
+    pub hits: u32,
 }
 
 #[derive(Enum, Debug, PartialEq, Eq, Clone, Copy)]
-pub enum DetectorWeighting {
-    #[id = "off"]
-    #[name = "Flat"]
-    Off,
-    #[id = "k"]
-    #[name = "K-weighted"]
-    K,
-    #[id = "equal_loudness"]
-    #[name = "Equal loudness"]
-    EqualLoudness,
+pub enum Mode {
+    /// On a bus: the readouts describe this bus on its own.
+    Bus,
+    /// Last on the master: the readouts describe the finished mix, where the reference applies.
+    Master,
 }
 
 #[derive(Enum, Debug, PartialEq, Eq, Clone, Copy)]
-pub enum SubSplit {
-    #[id = "off"]
-    #[name = "Off"]
-    Off,
-    #[id = "protect"]
-    #[name = "Protect (clean sub)"]
-    Protect,
-    #[id = "separate"]
-    #[name = "Clip separately"]
-    Separate,
-}
-
-#[derive(Enum, Debug, PartialEq, Eq, Clone, Copy)]
-pub enum Oversample {
-    #[id = "1x"]
-    #[name = "Off"]
-    X1,
-    #[id = "2x"]
-    #[name = "2x"]
-    X2,
-    #[id = "4x"]
-    #[name = "4x"]
-    X4,
-    #[id = "8x"]
-    #[name = "8x"]
-    X8,
+pub enum HitPick {
+    /// Profile the hits with the most 2-8 kHz energy (claps/snares); the rest only count as
+    /// hits for the drums-vs-rest mask.
+    #[name = "Loud HF hits"]
+    LoudHf,
+    /// Profile every detected hit.
+    #[name = "All hits"]
+    All,
 }
 
 #[derive(Params)]
-pub struct OnsetGuardParams {
+pub struct BloaterParams {
     #[persist = "editor-state"]
     pub editor_state: Arc<ViziaState>,
-    /// Editor view: false = Simple (the controls you touch per track), true = Advanced (all).
-    #[persist = "advanced"]
-    pub advanced: Arc<std::sync::atomic::AtomicBool>,
+    /// JSON of the last analysed reference (`reference::ReferenceData`), kept with the project.
+    #[persist = "reference"]
+    pub reference_json: Arc<Mutex<String>>,
 
-    #[nested(group = "Global")]
-    pub global: Arc<GlobalParams>,
-    #[nested(group = "Resolution")]
-    pub resolution: Arc<ResolutionParams>,
-    #[nested(group = "Threshold")]
-    pub threshold: Arc<ThresholdParams>,
-    #[nested(group = "Dynamics")]
-    pub dynamics: Arc<DynamicsParams>,
-    #[nested(group = "Onset Protection")]
-    pub protect: Arc<ProtectParams>,
-    #[nested(group = "Clip")]
-    pub clip: Arc<ClipParams>,
-    #[nested(group = "Stereo")]
-    pub stereo: Arc<StereoParams>,
-    #[nested(group = "Loudness Balance")]
-    pub balance: Arc<BalanceParams>,
-    #[nested(group = "Pre EQ")]
-    pub eq: Arc<EqParams>,
-    #[nested(group = "Upward Zone")]
-    pub zone: Arc<ZoneParams>,
-    #[nested(group = "Autopilot")]
-    pub autopilot: Arc<AutopilotParams>,
-    #[nested(group = "Phase Rotate")]
-    pub rotate: Arc<RotateParams>,
-}
-
-#[derive(Params)]
-pub struct AutopilotParams {
-    #[id = "autopilot"]
-    pub on: BoolParam,
-    #[id = "target"]
-    pub target_phon: FloatParam,
-    #[id = "crest_floor"]
-    pub crest_floor_db: FloatParam,
-}
-
-/// Four nodes drawn on the analyzer: where (and how much) the upward compressor may lift.
-#[derive(Params)]
-pub struct ZoneParams {
-    #[id = "uz1_hz"]
-    pub f1: FloatParam,
-    #[id = "uz1_amt"]
-    pub a1: FloatParam,
-    #[id = "uz2_hz"]
-    pub f2: FloatParam,
-    #[id = "uz2_amt"]
-    pub a2: FloatParam,
-    #[id = "uz3_hz"]
-    pub f3: FloatParam,
-    #[id = "uz3_amt"]
-    pub a3: FloatParam,
-    #[id = "uz4_hz"]
-    pub f4: FloatParam,
-    #[id = "uz4_amt"]
-    pub a4: FloatParam,
-}
-
-impl ZoneParams {
-    pub fn freq(&self, n: usize) -> &FloatParam {
-        [&self.f1, &self.f2, &self.f3, &self.f4][n]
-    }
-    pub fn amount(&self, n: usize) -> &FloatParam {
-        [&self.a1, &self.a2, &self.a3, &self.a4][n]
-    }
-}
-
-/// Four nodes drawn on the analyzer: low shelf, two bells (one octave wide), high shelf.
-#[derive(Params)]
-pub struct EqParams {
-    #[id = "eq1_hz"]
-    pub f1: FloatParam,
-    #[id = "eq1_db"]
-    pub g1: FloatParam,
-    #[id = "eq2_hz"]
-    pub f2: FloatParam,
-    #[id = "eq2_db"]
-    pub g2: FloatParam,
-    #[id = "eq3_hz"]
-    pub f3: FloatParam,
-    #[id = "eq3_db"]
-    pub g3: FloatParam,
-    #[id = "eq4_hz"]
-    pub f4: FloatParam,
-    #[id = "eq4_db"]
-    pub g4: FloatParam,
-}
-
-impl EqParams {
-    pub fn freq(&self, n: usize) -> &FloatParam {
-        [&self.f1, &self.f2, &self.f3, &self.f4][n]
-    }
-    pub fn gain(&self, n: usize) -> &FloatParam {
-        [&self.g1, &self.g2, &self.g3, &self.g4][n]
-    }
-}
-
-fn eq_hz_param(name: &str, default: f32) -> FloatParam {
-    FloatParam::new(name, default, FloatRange::Skewed { min: 20.0, max: 20000.0, factor: FloatRange::skew_factor(-2.0) })
-        .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
-        .with_string_to_value(formatters::s2v_f32_hz_then_khz())
-}
-
-#[derive(Params)]
-pub struct StereoParams {
-    #[id = "mono_below"]
-    pub mono_below_hz: FloatParam,
-    #[id = "width_hz"]
-    pub width_hz: FloatParam,
-    #[id = "width"]
-    pub width_db: FloatParam,
-    #[id = "guard"]
-    pub guard: FloatParam,
-    #[id = "corr_floor"]
-    pub corr_floor: FloatParam,
-}
-
-#[derive(Params)]
-pub struct BalanceParams {
-    #[id = "balance"]
-    pub strength: FloatParam,
-    #[id = "balance_speed"]
-    pub speed_s: FloatParam,
-    #[id = "balance_range"]
-    pub range_db: FloatParam,
-}
-
-#[derive(Params)]
-pub struct GlobalParams {
-    #[id = "output"]
-    pub output_gain: FloatParam,
-    #[id = "mix"]
-    pub mix: FloatParam,
-    #[id = "matched_bypass"]
-    pub matched_bypass: BoolParam,
-    #[id = "ref_level"]
-    pub ref_spl: FloatParam,
-    #[id = "meter_thru_clip"]
-    pub meter_thru_clip: BoolParam,
-}
-
-#[derive(Params)]
-pub struct ResolutionParams {
-    #[id = "long_window"]
-    pub long_order: IntParam,
-    #[id = "short_window"]
-    pub short_order: IntParam,
-    #[id = "crossover"]
-    pub crossover_hz: FloatParam,
-}
-
-#[derive(Params)]
-pub struct ThresholdParams {
-    #[id = "weighting"]
-    pub weighting: EnumParam<DetectorWeighting>,
-    #[id = "threshold"]
-    pub threshold_db: FloatParam,
-    #[id = "center"]
-    pub center_hz: FloatParam,
-    #[id = "slope"]
-    pub slope_db_oct: FloatParam,
-    #[id = "curve"]
-    pub curve_db_oct2: FloatParam,
-}
-
-#[derive(Params)]
-pub struct DynamicsParams {
-    #[id = "down_ratio"]
-    pub down_ratio: FloatParam,
-    #[id = "up_ratio"]
-    pub up_ratio: FloatParam,
-    #[id = "up_range"]
-    pub up_range_db: FloatParam,
-    #[id = "up_depth"]
-    pub up_depth_db: FloatParam,
-    #[id = "body"]
-    pub body_ms: FloatParam,
-    #[id = "attack"]
-    pub attack_ms: FloatParam,
-    #[id = "release"]
-    pub release_ms: FloatParam,
-    #[id = "smooth"]
-    pub smooth_oct: FloatParam,
-    #[id = "stereo_link"]
-    pub stereo_link: FloatParam,
-}
-
-#[derive(Params)]
-pub struct ProtectParams {
-    #[id = "protect"]
-    pub protect_on: BoolParam,
-    #[id = "sens"]
-    pub onset_sens: FloatParam,
-    #[id = "pre"]
-    pub pre_ms: FloatParam,
-    #[id = "hold"]
-    pub hold_ms: FloatParam,
-    #[id = "post"]
-    pub post_ms: FloatParam,
-    #[id = "trans_boost"]
-    pub trans_boost_db: FloatParam,
-    #[id = "trans_len"]
-    pub trans_boost_ms: FloatParam,
-}
-
-#[derive(Params)]
-pub struct ClipParams {
-    #[id = "clip"]
-    pub clip_on: BoolParam,
+    #[id = "mode"]
+    pub mode: EnumParam<Mode>,
     #[id = "drive"]
-    pub drive_db: FloatParam,
-    #[id = "hit_drive"]
-    pub hit_drive_db: FloatParam,
-    #[id = "ceiling"]
-    pub ceil_db: FloatParam,
-    #[id = "hardness"]
-    pub hardness: FloatParam,
-    #[id = "trans_clip"]
-    pub trans_clip: FloatParam,
-    #[id = "clip_link"]
-    pub clip_link: FloatParam,
-    #[id = "oversample"]
-    pub oversample: EnumParam<Oversample>,
-    #[id = "hf_preserve"]
-    pub hf_preserve: BoolParam,
-    #[id = "hf_hz"]
-    pub hf_hz: FloatParam,
-    #[id = "hf_amount"]
-    pub hf_amount: FloatParam,
-    #[id = "hf_hits"]
-    pub hf_on_hits: FloatParam,
-    #[id = "sub_split"]
-    pub sub_split: EnumParam<SubSplit>,
+    pub drive: FloatParam,
+    #[id = "clip"]
+    pub clip: BoolParam,
+
+    #[id = "tilt"]
+    pub tilt: FloatParam,
+    #[id = "bell"]
+    pub bell: BoolParam,
+    #[id = "bell_hz"]
+    pub bell_hz: FloatParam,
+    #[id = "bell_db"]
+    pub bell_db: FloatParam,
+
+    #[id = "lev"]
+    pub lev: BoolParam,
+    #[id = "lev_lo"]
+    pub lev_lo: FloatParam,
+    #[id = "lev_hi"]
+    pub lev_hi: FloatParam,
+    #[id = "lev_thr"]
+    pub lev_thr: FloatParam,
+    #[id = "lev_ratio"]
+    pub lev_ratio: FloatParam,
+    #[id = "lev_att"]
+    pub lev_att: FloatParam,
+    #[id = "lev_rel"]
+    pub lev_rel: FloatParam,
+
+    #[id = "sub"]
+    pub sub: BoolParam,
     #[id = "sub_hz"]
     pub sub_hz: FloatParam,
     #[id = "sub_ceil"]
-    pub sub_ceil_db: FloatParam,
-    #[id = "band_protect"]
-    pub band_protect: FloatParam,
-}
+    pub sub_ceil: FloatParam,
 
-#[derive(Params)]
-pub struct RotateParams {
-    #[id = "rotate"]
-    pub rotate: BoolParam,
-    #[id = "rotate_hz"]
-    pub rotate_hz: FloatParam,
-    #[id = "rotate_hits"]
-    pub rotate_hits: FloatParam,
+    #[id = "sens"]
+    pub sens: FloatParam,
+    #[id = "pick"]
+    pub pick: EnumParam<HitPick>,
 }
 
 fn db_param(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
     FloatParam::new(name, default, FloatRange::Linear { min, max })
         .with_unit(" dB")
         .with_step_size(0.1)
+        .with_value_to_string(formatters::v2s_f32_rounded(1))
+}
+
+fn hz_param(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
+    FloatParam::new(name, default, FloatRange::Skewed { min, max, factor: FloatRange::skew_factor(-2.0) })
+        .with_unit(" Hz")
+        .with_step_size(1.0)
+        .with_value_to_string(formatters::v2s_f32_rounded(0))
 }
 
 fn ms_param(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
-    FloatParam::new(
-        name,
-        default,
-        FloatRange::Skewed {
-            min,
-            max,
-            factor: FloatRange::skew_factor(-1.5),
-        },
-    )
-    .with_unit(" ms")
-    .with_step_size(0.1)
+    FloatParam::new(name, default, FloatRange::Skewed { min, max, factor: FloatRange::skew_factor(-1.5) })
+        .with_unit(" ms")
+        .with_step_size(0.1)
+        .with_value_to_string(formatters::v2s_f32_rounded(1))
 }
 
-fn pct_param(name: &str, default: f32) -> FloatParam {
-    FloatParam::new(name, default, FloatRange::Linear { min: 0.0, max: 1.0 })
-        .with_unit("%")
-        .with_value_to_string(formatters::v2s_f32_percentage(0))
-        .with_string_to_value(formatters::s2v_f32_percentage())
-}
-
-impl Default for OnsetGuardParams {
+impl Default for BloaterParams {
     fn default() -> Self {
-        let d = Settings::default();
-        OnsetGuardParams {
+        BloaterParams {
             editor_state: editor::default_state(),
-            advanced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            global: Arc::new(GlobalParams {
-            output_gain: FloatParam::new(
-                "Output Gain",
-                util::db_to_gain(0.0),
-                FloatRange::Skewed {
-                    min: util::db_to_gain(-30.0),
-                    max: util::db_to_gain(30.0),
-                    factor: FloatRange::gain_skew_factor(-30.0, 30.0),
-                },
-            )
-            .with_unit(" dB")
-            .with_value_to_string(formatters::v2s_f32_gain_to_db(2))
-            .with_string_to_value(formatters::s2v_f32_gain_to_db()),
-            mix: pct_param("Mix", 1.0),
-            matched_bypass: BoolParam::new("Matched Bypass", false),
-            ref_spl: FloatParam::new(
-                "Ref Level (0 dBFS)",
-                d.ref_spl,
-                FloatRange::Linear { min: 70.0, max: 115.0 },
-            )
-            .with_unit(" dB SPL")
-            .with_step_size(1.0),
-            meter_thru_clip: BoolParam::new("Meter Thru Clip", d.meter_thru_clip),
-            }),
-            resolution: Arc::new(ResolutionParams {
-            long_order: IntParam::new(
-                "Long Window (lows)",
-                d.long_order as i32,
-                IntRange::Linear {
-                    min: dsp::MIN_LONG_ORDER as i32,
-                    max: dsp::MAX_LONG_ORDER as i32,
-                },
-            )
-            .with_value_to_string(formatters::v2s_i32_power_of_two())
-            .with_string_to_value(formatters::s2v_i32_power_of_two()),
-            short_order: IntParam::new(
-                "Short Window (highs)",
-                d.short_order as i32,
-                IntRange::Linear {
-                    min: dsp::MIN_SHORT_ORDER as i32,
-                    max: dsp::MAX_SHORT_ORDER as i32,
-                },
-            )
-            .with_value_to_string(formatters::v2s_i32_power_of_two())
-            .with_string_to_value(formatters::s2v_i32_power_of_two()),
-            crossover_hz: FloatParam::new(
-                "Crossover",
-                d.dyn_.crossover_hz,
-                FloatRange::Skewed {
-                    min: 60.0,
-                    max: 4000.0,
-                    factor: FloatRange::skew_factor(-1.5),
-                },
-            )
-            .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
-            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
-            }),
-            stereo: Arc::new(StereoParams {
-            mono_below_hz: FloatParam::new(
-                "Mono Below",
-                d.dyn_.mono_below_hz,
-                FloatRange::Linear { min: 0.0, max: 300.0 },
-            )
-            .with_unit(" Hz")
-            .with_step_size(1.0),
-            width_hz: FloatParam::new(
-                "Width Above",
-                d.stereo.width_hz,
-                FloatRange::Skewed { min: 100.0, max: 8000.0, factor: FloatRange::skew_factor(-1.5) },
-            )
-            .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
-            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
-            width_db: db_param("Width", d.stereo.width_db, -12.0, 12.0),
-            guard: pct_param("Anti-phase Guard", d.stereo.guard),
-            corr_floor: pct_param("Correlation Floor", d.stereo.floor),
-            }),
-            balance: Arc::new(BalanceParams {
-            strength: pct_param("Balance Strength", d.balance.strength),
-            speed_s: FloatParam::new(
-                "Balance Speed",
-                d.balance.speed_s,
-                FloatRange::Skewed { min: 0.5, max: 10.0, factor: FloatRange::skew_factor(-1.0) },
-            )
-            .with_unit(" s")
-            .with_step_size(0.1),
-            range_db: db_param("Balance Range", d.balance.range_db, 0.0, 6.0),
-            }),
-            eq: Arc::new(EqParams {
-            f1: eq_hz_param("EQ Low Shelf Freq", d.eq.freq_hz[0]),
-            g1: db_param("EQ Low Shelf Gain", d.eq.gain_db[0], -12.0, 12.0),
-            f2: eq_hz_param("EQ Bell 1 Freq", d.eq.freq_hz[1]),
-            g2: db_param("EQ Bell 1 Gain", d.eq.gain_db[1], -12.0, 12.0),
-            f3: eq_hz_param("EQ Bell 2 Freq", d.eq.freq_hz[2]),
-            g3: db_param("EQ Bell 2 Gain", d.eq.gain_db[2], -12.0, 12.0),
-            f4: eq_hz_param("EQ High Shelf Freq", d.eq.freq_hz[3]),
-            g4: db_param("EQ High Shelf Gain", d.eq.gain_db[3], -12.0, 12.0),
-            }),
-            zone: Arc::new(ZoneParams {
-            f1: eq_hz_param("Upward Zone 1 Freq", d.dyn_.up_zone_hz[0]),
-            a1: pct_param("Upward Zone 1 Amount", d.dyn_.up_zone_amt[0]),
-            f2: eq_hz_param("Upward Zone 2 Freq", d.dyn_.up_zone_hz[1]),
-            a2: pct_param("Upward Zone 2 Amount", d.dyn_.up_zone_amt[1]),
-            f3: eq_hz_param("Upward Zone 3 Freq", d.dyn_.up_zone_hz[2]),
-            a3: pct_param("Upward Zone 3 Amount", d.dyn_.up_zone_amt[2]),
-            f4: eq_hz_param("Upward Zone 4 Freq", d.dyn_.up_zone_hz[3]),
-            a4: pct_param("Upward Zone 4 Amount", d.dyn_.up_zone_amt[3]),
-            }),
-            autopilot: Arc::new(AutopilotParams {
-            on: BoolParam::new("Autopilot", d.autopilot.on),
-            target_phon: FloatParam::new("Target Loudness", d.autopilot.target_phon, FloatRange::Linear { min: 60.0, max: 130.0 })
-                .with_unit(" phon")
-                .with_step_size(0.5),
-            crest_floor_db: db_param("Crest Floor", d.autopilot.crest_floor_db, 1.0, 12.0),
-            }),
-            rotate: Arc::new(RotateParams {
-            rotate: BoolParam::new("Phase Rotate", d.rotate.on),
-            rotate_hz: FloatParam::new(
-                "Rotate Freq",
-                d.rotate.freq_hz,
-                FloatRange::Skewed { min: 50.0, max: 1000.0, factor: FloatRange::skew_factor(-1.0) },
-            )
-            .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
-            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
-            rotate_hits: pct_param("Rotate Hits", d.rotate.hits),
-            }),
-            threshold: Arc::new(ThresholdParams {
-            weighting: EnumParam::new("Detector Weighting", DetectorWeighting::Off),
-            threshold_db: db_param("Threshold", d.dyn_.threshold_db, -80.0, 0.0),
-            center_hz: FloatParam::new(
-                "Threshold Center",
-                d.dyn_.center_hz,
-                FloatRange::Skewed {
-                    min: 20.0,
-                    max: 20_000.0,
-                    factor: FloatRange::skew_factor(-2.0),
-                },
-            )
-            .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
-            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
-            slope_db_oct: FloatParam::new(
-                "Threshold Slope",
-                d.dyn_.slope_db_oct,
-                FloatRange::Linear { min: -12.0, max: 6.0 },
-            )
-            .with_unit(" dB/oct")
-            .with_step_size(0.1),
-            curve_db_oct2: FloatParam::new(
-                "Threshold Curve",
-                d.dyn_.curve_db_oct2,
-                FloatRange::Linear { min: -6.0, max: 6.0 },
-            )
-            .with_unit(" dB/oct²")
-            .with_step_size(0.1),
-            }),
-            dynamics: Arc::new(DynamicsParams {
-            down_ratio: FloatParam::new(
-                "Downward Ratio",
-                d.dyn_.down_ratio,
-                FloatRange::Skewed {
-                    min: 1.0,
-                    max: 50.0,
-                    factor: FloatRange::skew_factor(-1.5),
-                },
-            )
-            .with_step_size(0.1)
-            .with_value_to_string(formatters::v2s_compression_ratio(1))
-            .with_string_to_value(formatters::s2v_compression_ratio()),
-            up_ratio: FloatParam::new(
-                "Upward Ratio",
-                d.dyn_.up_ratio,
-                FloatRange::Skewed {
-                    min: 1.0,
-                    max: 20.0,
-                    factor: FloatRange::skew_factor(-1.5),
-                },
-            )
-            .with_step_size(0.1)
-            .with_value_to_string(formatters::v2s_compression_ratio(1))
-            .with_string_to_value(formatters::s2v_compression_ratio()),
-            up_range_db: db_param("Upward Range", d.dyn_.up_range_db, 0.0, 40.0),
-            up_depth_db: db_param("Upward Depth", d.dyn_.up_depth_db, 6.0, 60.0),
-            body_ms: FloatParam::new(
-                "Body",
-                d.dyn_.body_ms,
-                FloatRange::Skewed { min: 0.0, max: 1000.0, factor: FloatRange::skew_factor(-1.2) },
-            )
-            .with_unit(" ms")
-            .with_step_size(1.0)
-            .with_value_to_string(std::sync::Arc::new(|v| if v < 0.5 { "Off".to_string() } else { format!("{v:.0}") })),
-            attack_ms: ms_param("Attack", d.dyn_.attack_ms, 0.1, 500.0),
-            release_ms: ms_param("Release", d.dyn_.release_ms, 5.0, 3000.0),
-            smooth_oct: FloatParam::new(
-                "Frequency Smoothing",
-                d.dyn_.smooth_oct,
-                FloatRange::Linear { min: 0.0, max: 1.0 },
-            )
-            .with_unit(" oct")
-            .with_step_size(0.01),
-            stereo_link: pct_param("Stereo Link", d.dyn_.stereo_link),
-            }),
-            protect: Arc::new(ProtectParams {
-            protect_on: BoolParam::new("Onset Protection", d.protect_on),
-            onset_sens: pct_param("Onset Sensitivity", d.onset_sens),
-            pre_ms: ms_param("Protect Pre", d.pre_ms, 0.0, dsp::MAX_PRE_MS),
-            hold_ms: ms_param("Protect Hold", d.hold_ms, 0.0, 30.0),
-            post_ms: ms_param("Protect Post", d.post_ms, 0.0, 120.0),
-            trans_boost_db: db_param("Transient Boost", d.trans_boost_db, 0.0, 12.0),
-            trans_boost_ms: ms_param("Boost Length", d.trans_boost_ms, 2.0, 60.0),
-            }),
-            clip: Arc::new(ClipParams {
-            clip_on: BoolParam::new("Clip", d.clip_on),
-            drive_db: db_param("Clip Drive", d.drive_db, 0.0, 24.0),
-            hit_drive_db: db_param("Hit Drive", d.hit_drive_db, 0.0, 24.0),
-            ceil_db: db_param("Output Ceiling", d.ceil_db, -12.0, 12.0),
-            hardness: pct_param("Clip Hardness", d.hardness),
-            trans_clip: pct_param("Transient Clip", d.trans_clip),
-            clip_link: pct_param("Clip Stereo Link", d.clip_link),
-            oversample: EnumParam::new("Oversample", Oversample::X4),
-            hf_preserve: BoolParam::new("Preserve Highs", d.hf_preserve),
-            hf_hz: FloatParam::new(
-                "Preserve Above",
-                d.hf_hz,
-                FloatRange::Skewed {
-                    min: 2000.0,
-                    max: 16000.0,
-                    factor: FloatRange::skew_factor(-1.0),
-                },
-            )
-            .with_value_to_string(formatters::v2s_f32_hz_then_khz(1))
-            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
-            hf_amount: pct_param("Highs Amount", d.hf_amount),
-            hf_on_hits: pct_param("Highs on Hits", d.hf_on_hits),
-            sub_split: EnumParam::new("Sub Split", SubSplit::Off),
-            sub_hz: FloatParam::new(
-                "Sub Split Freq",
-                d.sub_hz,
-                FloatRange::Skewed {
-                    min: 30.0,
-                    max: 250.0,
-                    factor: FloatRange::skew_factor(-1.0),
-                },
-            )
-            .with_unit(" Hz")
-            .with_step_size(1.0),
-            sub_ceil_db: db_param("Sub Ceiling", d.sub_ceil_db, -24.0, 0.0),
-            band_protect: pct_param("Protect Amount", d.band_protect),
-            }),
+            reference_json: Arc::new(Mutex::new(String::new())),
+            mode: EnumParam::new("Mode", Mode::Bus),
+            drive: db_param("Drive", 0.0, -12.0, 24.0),
+            clip: BoolParam::new("Clip", true),
+            tilt: db_param("Tilt", 0.0, -6.0, 6.0),
+            bell: BoolParam::new("Bell", false),
+            bell_hz: hz_param("Bell Freq", 2000.0, 100.0, 12000.0),
+            bell_db: db_param("Bell Gain", 3.0, -12.0, 12.0),
+            lev: BoolParam::new("Leveler", false),
+            lev_lo: hz_param("Leveler Low", 250.0, 40.0, 2000.0),
+            lev_hi: hz_param("Leveler High", 1000.0, 100.0, 8000.0),
+            lev_thr: db_param("Leveler Threshold", -22.0, -50.0, 0.0),
+            lev_ratio: FloatParam::new("Leveler Ratio", 3.0, FloatRange::Linear { min: 1.0, max: 10.0 })
+                .with_unit(":1")
+                .with_step_size(0.1)
+                .with_value_to_string(formatters::v2s_f32_rounded(1)),
+            lev_att: ms_param("Leveler Attack", 3.0, 0.1, 50.0),
+            lev_rel: ms_param("Leveler Release", 80.0, 5.0, 1000.0),
+            sub: BoolParam::new("Sub Split", false),
+            sub_hz: hz_param("Sub Freq", 90.0, 40.0, 300.0),
+            sub_ceil: db_param("Sub Ceiling", -3.0, -12.0, 0.0),
+            sens: FloatParam::new("Hit Sensitivity", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_step_size(0.01)
+                .with_value_to_string(formatters::v2s_f32_rounded(2)),
+            pick: EnumParam::new("Profile", HitPick::LoudHf),
         }
     }
 }
 
-impl OnsetGuardParams {
-    fn settings(&self) -> Settings {
-        let mut s = Settings::default();
-        s.dyn_.weighting = match self.threshold.weighting.value() {
-            DetectorWeighting::Off => Weighting::Off,
-            DetectorWeighting::K => Weighting::K,
-            DetectorWeighting::EqualLoudness => Weighting::EqualLoudness,
-        };
-        s.dyn_.threshold_db = self.threshold.threshold_db.value();
-        s.dyn_.center_hz = self.threshold.center_hz.value();
-        s.dyn_.slope_db_oct = self.threshold.slope_db_oct.value();
-        s.dyn_.curve_db_oct2 = self.threshold.curve_db_oct2.value();
-        s.dyn_.down_ratio = self.dynamics.down_ratio.value();
-        s.dyn_.up_ratio = self.dynamics.up_ratio.value();
-        s.dyn_.up_range_db = self.dynamics.up_range_db.value();
-        s.dyn_.up_depth_db = self.dynamics.up_depth_db.value();
-        s.dyn_.body_ms = self.dynamics.body_ms.value();
-        s.dyn_.attack_ms = self.dynamics.attack_ms.value();
-        s.dyn_.release_ms = self.dynamics.release_ms.value();
-        s.dyn_.smooth_oct = self.dynamics.smooth_oct.value();
-        s.dyn_.stereo_link = self.dynamics.stereo_link.value();
-        s.dyn_.crossover_hz = self.resolution.crossover_hz.value();
-        s.dyn_.mono_below_hz = self.stereo.mono_below_hz.value();
-        s.stereo.width_hz = self.stereo.width_hz.value();
-        s.stereo.width_db = self.stereo.width_db.value();
-        s.stereo.guard = self.stereo.guard.value();
-        s.stereo.floor = self.stereo.corr_floor.value();
-        s.balance.strength = self.balance.strength.value();
-        s.balance.speed_s = self.balance.speed_s.value();
-        s.balance.range_db = self.balance.range_db.value();
-        for n in 0..dsp::eq::NODES {
-            s.eq.freq_hz[n] = self.eq.freq(n).value();
-            s.eq.gain_db[n] = self.eq.gain(n).value();
+impl BloaterParams {
+    pub fn bus_settings(&self) -> BusSettings {
+        BusSettings {
+            drive_db: self.drive.value(),
+            tilt_db: self.tilt.value(),
+            tilt_hz: 1000.0,
+            bell_on: self.bell.value(),
+            bell_hz: self.bell_hz.value(),
+            bell_db: self.bell_db.value(),
+            lev_on: self.lev.value(),
+            lev_lo_hz: self.lev_lo.value(),
+            lev_hi_hz: self.lev_hi.value().max(self.lev_lo.value() * 1.2),
+            lev_thr_db: self.lev_thr.value(),
+            lev_ratio: self.lev_ratio.value(),
+            lev_attack_ms: self.lev_att.value(),
+            lev_release_ms: self.lev_rel.value(),
+            sub_on: self.sub.value(),
+            sub_hz: self.sub_hz.value(),
+            sub_ceil_db: self.sub_ceil.value(),
+            clip_on: self.clip.value(),
         }
-        for n in 0..4 {
-            s.dyn_.up_zone_hz[n] = self.zone.freq(n).value();
-            s.dyn_.up_zone_amt[n] = self.zone.amount(n).value();
-        }
-        s.long_order = self.resolution.long_order.value() as usize;
-        s.short_order = self.resolution.short_order.value() as usize;
-        s.protect_on = self.protect.protect_on.value();
-        s.onset_sens = self.protect.onset_sens.value();
-        s.pre_ms = self.protect.pre_ms.value();
-        s.hold_ms = self.protect.hold_ms.value();
-        s.post_ms = self.protect.post_ms.value();
-        s.trans_boost_db = self.protect.trans_boost_db.value();
-        s.trans_boost_ms = self.protect.trans_boost_ms.value();
-        s.clip_on = self.clip.clip_on.value();
-        s.drive_db = self.clip.drive_db.value();
-        s.hit_drive_db = self.clip.hit_drive_db.value();
-        s.ceil_db = self.clip.ceil_db.value();
-        s.hardness = self.clip.hardness.value();
-        s.trans_clip = self.clip.trans_clip.value();
-        s.clip_link = self.clip.clip_link.value();
-        s.sub_mode = match self.clip.sub_split.value() {
-            SubSplit::Off => SubMode::Off,
-            SubSplit::Protect => SubMode::Protect,
-            SubSplit::Separate => SubMode::Separate,
-        };
-        s.sub_hz = self.clip.sub_hz.value();
-        s.hf_preserve = self.clip.hf_preserve.value();
-        s.hf_hz = self.clip.hf_hz.value();
-        s.hf_amount = self.clip.hf_amount.value();
-        s.hf_on_hits = self.clip.hf_on_hits.value();
-        s.sub_ceil_db = self.clip.sub_ceil_db.value();
-        s.band_protect = self.clip.band_protect.value();
-        s.rotate.on = self.rotate.rotate.value();
-        s.rotate.freq_hz = self.rotate.rotate_hz.value();
-        s.rotate.hits = self.rotate.rotate_hits.value();
-        s.autopilot.on = self.autopilot.on.value();
-        s.autopilot.target_phon = self.autopilot.target_phon.value();
-        s.autopilot.crest_floor_db = self.autopilot.crest_floor_db.value();
-        s.oversample = match self.clip.oversample.value() {
-            Oversample::X1 => 1,
-            Oversample::X2 => 2,
-            Oversample::X4 => 4,
-            Oversample::X8 => 8,
-        };
-        s.mix = self.global.mix.value();
-        s.output_gain = self.global.output_gain.value();
-        s.matched_bypass = self.global.matched_bypass.value();
-        s.ref_spl = self.global.ref_spl.value();
-        s.meter_thru_clip = self.global.meter_thru_clip.value();
-        s
     }
 }
 
-impl Default for OnsetGuard {
+/// Requests from the editor to the audio thread.
+#[derive(Default)]
+pub struct Control {
+    pub reset_stats: AtomicBool,
+    /// Bumped by the editor when a new reference has been stored in `reference_json`.
+    pub reference_version: AtomicU32,
+}
+
+pub struct Bloater {
+    params: Arc<BloaterParams>,
+    control: Arc<Control>,
+    bus: Option<BusClip>,
+    onset: Option<OnsetDetector>,
+    analyzer: Option<Analyzer>,
+    snap_in: triple_buffer::Input<Snapshot>,
+    snap_out: Arc<Mutex<triple_buffer::Output<Snapshot>>>,
+    sample_rate: f32,
+    since_report: usize,
+    hits: u32,
+    snapshot: Snapshot,
+}
+
+impl Default for Bloater {
     fn default() -> Self {
-        let (analyzer_in, analyzer_out) = TripleBuffer::default().split();
-        OnsetGuard {
-            params: Arc::new(OnsetGuardParams::default()),
-            engine: None,
-            meters: Arc::new(Meters::default()),
-            analyzer_in,
-            analyzer_out: Arc::new(Mutex::new(analyzer_out)),
-            sample_rate: 48000.0,
-            max_block: 0,
-            num_channels: 2,
+        let (snap_in, snap_out) = TripleBuffer::new(&Snapshot::default()).split();
+        Bloater {
+            params: Arc::new(BloaterParams::default()),
+            control: Arc::new(Control::default()),
+            bus: None,
+            onset: None,
+            analyzer: None,
+            snap_in,
+            snap_out: Arc::new(Mutex::new(snap_out)),
+            sample_rate: 44100.0,
+            since_report: 0,
+            hits: 0,
+            snapshot: Snapshot::default(),
         }
     }
 }
 
-impl Plugin for OnsetGuard {
+impl Plugin for Bloater {
     const NAME: &'static str = "Bloater";
     const VENDOR: &'static str = "OGII";
     const URL: &'static str = env!("CARGO_PKG_HOMEPAGE");
@@ -812,12 +269,7 @@ impl Plugin for OnsetGuard {
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        editor::create(
-            self.params.clone(),
-            self.meters.clone(),
-            self.analyzer_out.clone(),
-            self.params.editor_state.clone(),
-        )
+        editor::create(self.params.clone(), self.control.clone(), self.snap_out.clone(), self.params.editor_state.clone())
     }
 
     fn initialize(
@@ -827,101 +279,98 @@ impl Plugin for OnsetGuard {
         context: &mut impl InitContext<Self>,
     ) -> bool {
         self.sample_rate = buffer_config.sample_rate;
-        self.max_block = buffer_config.max_buffer_size as usize;
-        self.num_channels = audio_io_layout
-            .main_output_channels
-            .map(|c| c.get() as usize)
-            .unwrap_or(2);
-        let mut engine = Engine::new(self.num_channels, self.sample_rate, self.max_block.max(1));
-        let s = self.params.settings();
-        engine.set_windows(s.long_order, s.short_order, s.oversample);
-        context.set_latency_samples(engine.latency() as u32);
-        self.engine = Some(engine);
+        let nch = audio_io_layout.main_output_channels.map(|c| c.get() as usize).unwrap_or(2);
+        let mut bus = BusClip::new(self.sample_rate, nch);
+        bus.update(&self.params.bus_settings());
+        self.bus = Some(bus);
+        self.onset = Some(OnsetDetector::new(self.sample_rate));
+        self.analyzer = Some(Analyzer::new(self.sample_rate));
+        context.set_latency_samples(0);
         true
     }
 
     fn reset(&mut self) {
-        if let Some(e) = &mut self.engine {
-            e.reset();
+        if let Some(b) = &mut self.bus {
+            b.reset();
         }
+        if let Some(o) = &mut self.onset {
+            o.reset();
+        }
+        if let Some(a) = &mut self.analyzer {
+            a.reset();
+        }
+        self.hits = 0;
     }
 
     fn process(
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        context: &mut impl ProcessContext<Self>,
+        _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let Some(engine) = &mut self.engine else {
+        let (Some(bus), Some(onset), Some(an)) = (&mut self.bus, &mut self.onset, &mut self.analyzer) else {
             return ProcessStatus::Normal;
         };
-        let s = self.params.settings();
-        let before = engine.latency();
+        if self.control.reset_stats.swap(false, Ordering::Relaxed) {
+            an.clear_accumulators();
+            self.hits = 0;
+        }
+        bus.update(&self.params.bus_settings());
         let len = buffer.samples();
-        if len == 0 || buffer.channels() == 0 {
-            return ProcessStatus::Normal;
-        }
-        engine.process(buffer.as_slice(), len, &s);
-        if engine.latency() != before {
-            context.set_latency_samples(engine.latency() as u32);
-        }
-        if self.params.editor_state.is_open() {
-            let gr_post = engine.gain_reduction();
-            let (match_gain, dry, wet) = engine.meters();
-            let (dry_sone, wet_sone) = engine.sones();
-            self.meters.dry_sone.store(dry_sone, Ordering::Relaxed);
-            self.meters.wet_sone.store(wet_sone, Ordering::Relaxed);
-            let (md, mw) = engine.mono_sones();
-            self.meters.mono_dry_sone.store(md, Ordering::Relaxed);
-            self.meters.mono_wet_sone.store(mw, Ordering::Relaxed);
-            for (m, v) in self.meters.tr_sone.iter().zip(engine.translation_sones()) {
-                m.store(v, Ordering::Relaxed);
+        let slices = buffer.as_slice();
+        bus.process(slices, len);
+        // analysis on the clipped output
+        let sens = self.params.sens.value();
+        let kind = match self.params.pick.value() {
+            HitPick::LoudHf => HitKind::Auto,
+            HitPick::All => HitKind::Clap,
+        };
+        let nch = slices.len();
+        for i in 0..len {
+            let l = slices[0][i];
+            let r = if nch > 1 { slices[1][i] } else { l };
+            an.push(l, r);
+            if let Some(t) = onset.push(0.5 * (l + r), sens) {
+                an.onset(t, kind);
+                self.hits = self.hits.wrapping_add(1);
             }
-            let (fd, fw) = engine.flatness();
-            self.meters.flat_dry.store(fd, Ordering::Relaxed);
-            self.meters.flat_wet.store(fw, Ordering::Relaxed);
-            let d = engine.dist;
-            self.meters.crest_dry.store(d.crest_dry_db, Ordering::Relaxed);
-            self.meters.crest_wet.store(d.crest_wet_db, Ordering::Relaxed);
-            self.meters.rail_pct.store(d.rail_pct, Ordering::Relaxed);
-            self.meters.auto_drive_db.store(engine.auto_drive_db, Ordering::Relaxed);
-            self.meters.auto_locked.store(engine.auto_locked, Ordering::Relaxed);
-            self.meters.match_db.store(20.0 * match_gain.max(1e-4).log10(), Ordering::Relaxed);
-            self.meters.gr_post_db.store(gr_post, Ordering::Relaxed);
-            self.meters.dry_lufs.store(dry, Ordering::Relaxed);
-            self.meters.wet_lufs.store(wet, Ordering::Relaxed);
-            let a = self.analyzer_in.input_buffer();
-            engine.analyzer(analyzer::F_LO, analyzer::F_HI, &mut a.env_db, &mut a.gain_db, &mut a.thr_db);
-            a.protect = engine.protect_activity();
-            self.analyzer_in.publish();
+        }
+        self.since_report += len;
+        if self.since_report >= 4096 {
+            self.since_report = 0;
+            self.snapshot.report = an.report();
+            if let Some(p) = an.last_profile() {
+                self.snapshot.last = *p;
+                self.snapshot.has_last = true;
+            }
+            self.snapshot.in_peak_db = 20.0 * bus.in_peak.max(1e-6).log10();
+            self.snapshot.block_pinned = bus.out_pinned;
+            self.snapshot.lev_gr_db = bus.lev_gr_db;
+            self.snapshot.hits = self.hits;
+            self.snap_in.write(self.snapshot);
         }
         ProcessStatus::Normal
     }
 }
 
-impl ClapPlugin for OnsetGuard {
+impl ClapPlugin for Bloater {
     const CLAP_ID: &'static str = "com.ogii.onsetguard";
-    const CLAP_DESCRIPTION: Option<&'static str> =
-        Some("Onset-protected zero-phase spectral dynamics with spectral clipping");
+    const CLAP_DESCRIPTION: Option<&'static str> = Some("Bus clipper with hit analysis and reference comparison");
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
     const CLAP_FEATURES: &'static [ClapFeature] = &[
         ClapFeature::AudioEffect,
         ClapFeature::Stereo,
         ClapFeature::Mono,
-        ClapFeature::Compressor,
-        ClapFeature::Custom("nih:spectral"),
+        ClapFeature::Distortion,
+        ClapFeature::Analyzer,
     ];
 }
 
-impl Vst3Plugin for OnsetGuard {
+impl Vst3Plugin for Bloater {
     const VST3_CLASS_ID: [u8; 16] = *b"OGIIOnsetGuard01";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
-        Vst3SubCategory::Fx,
-        Vst3SubCategory::Dynamics,
-        Vst3SubCategory::Custom("Spectral"),
-    ];
+    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx, Vst3SubCategory::Distortion, Vst3SubCategory::Analyzer];
 }
 
-nih_export_clap!(OnsetGuard);
-nih_export_vst3!(OnsetGuard);
+nih_export_clap!(Bloater);
+nih_export_vst3!(Bloater);

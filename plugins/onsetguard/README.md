@@ -1,149 +1,62 @@
-# Bloater
+# Bloater 1.0 — bus clipper with hit analysis
 
-Formerly OnsetGuard (the crate is still `onsetguard`; plugin IDs are unchanged, so existing
-sets keep loading).
+Crate `onsetguard` (plugin IDs unchanged from the earlier spectral Bloater, so old sets still
+find the plugin; their settings do not carry over). Built on NIH-plug (GPL-3.0).
 
-Onset-protected, zero-phase spectral dynamics with spectral clipping. Built on the
-NIH-plug framework and derived from Robbert van der Helm's Spectral Compressor (GPL-3.0).
+## What it is
 
-## What it does
+A fixed **1x hard clip at 0 dBFS** with no output trim, plus a pre-stage that shapes what goes
+into the clip, plus an analyser that measures the clipped output the way reference tracks were
+measured and shows a loaded reference as deltas. Zero latency.
 
 ```
-input ─ pre-EQ (min-phase) ─┬─ long STFT (stereo, balance, mono-below, low dynamics) ─ short STFT (high dynamics) ─┐
-                            ├─ long STFT (stereo, balance, mono-below; reference)      ─ delay ───────────────────┤
-                            ├─ onset detector ─ protection / transient-boost envelopes ───────────────────────── blend
-                            │                                                                                      │
-                            │   drive ─ [sub / highs split] ─ oversampled clip ─ transient blend ──────────────────┤
-                            └─ dry delay ──────────────────────────────────────────────── mix / loudness-matched bypass
+in ─ Drive ─ Tilt / Bell EQ ─ Band leveler ─ [Sub split] ─ hard clip 0 dBFS ─ out
+                                                              └─ onset detector + hit analyser → editor
 ```
 
-* **Zero-phase everywhere.** Every stage is sample-aligned with the dry signal, so parallel
-  blending and the Mix control never comb-filter.
-* **Two resolutions.** A long window (default 8192) handles the lows, a short one (default
-  1024) the highs, crossfaded over one octave around the Crossover. Lots of bands in the lows,
-  tight timing in the highs.
-* **Onset protection.** A spectral-flux detector finds hits; the processed signal fades to the
-  untouched reference just before each hit (Pre), holds through it (Hold) and fades back
-  (Post). This is what removes pre-ring smear while keeping the transient's exact phase.
-* **Transient boost.** Optional upward expansion on detected hits only.
-* **Upward Zone.** Four green nodes on the analyzer set how much of the upward boost is
-  allowed per frequency (0-100%), so you choose where the lift happens instead of steering
-  it with the threshold shape. Measured: zone 0% around a 300 Hz tone leaves it at +0.0 dB
-  while a 3 kHz tone at 100% is lifted +4.9 dB, both 6 dB under the threshold.
-* **Noise-likeness readout.** Spectral flatness (100 Hz-16 kHz, 0% = tones, 100% = white
-  noise) of dry vs processed. Measured at equal peak, dense noise reads louder in sones than
-  clean peaky content (bandwidth effect: 77 vs 69 sones for a growl with/without a noise
-  bed), but peaky content stays defined; the readout shows when processing is filling
-  valleys and turning definition into wall.
-* **Upward Depth.** The upward compressor only lifts bins within this many dB of the
-  threshold (fading out over the next 12 dB), so the body is lifted and the noise floor is not
-  (measured: tone 6 dB under +5.3 dB, floor 58 dB under +0.0 dB; without it the floor rises +8).
-* **Body.** Ties the upward lift to the hits: full lift for Body ms after each detected
-  onset, fading over half as long again, none between hits. Depth alone is not enough on a
-  drum bus - measured on a real drum bounce with upward 2:1, the level-only lift put +0 dB on
-  the hit, +0.4 dB on its tail and +4 to +6 dB on the gaps between hits above 1 kHz, which is
-  the "it sounds like white noise" complaint. With Body 150 ms the tail keeps its +0.4 dB
-  and the gaps get 0.0 dB in every band above 300 Hz.
-* **Frequency smoothing** of the gain curve removes the watery per-bin swirl.
-* **Clip.** Clip Drive into an oversampled clipper with a hard output ceiling. Transient Clip
-  decides how much of each hit goes through the oversampled clipper; the ceiling holds at every
-  setting. At 1x the clip stage is bit-identical to a plain sample-level hard clip; at 2-8x it
-  matches one within 0.1 dB in every band except the alias energy it removes. (A per-bin
-  "spectral ceiling" was measured and removed: it gave no loudness.)
-* **Phase Rotate** (off by default). Four first-order all-pass stages at 200 Hz: the spectrum
-  is untouched, only the phase between harmonics changes, so one-sided waveforms get a lower
-  peak at the same loudness and take more drive before the clipper bites. Measured on a
-  cosine-phase pulse train: crest 11.6 -> 6.2 dB, every harmonic magnitude within 0.02 dB.
-  The one stage that changes phase on purpose, hence off by default. Rotate Hits (default 0%)
-  hands detected hits out with their original phase through the onset protection (transient
-  nulls against the un-rotated signal at -55 dB) while the body stays rotated.
-* **Meter Thru Clip** (Output, on by default). With Clip off, the processed-side readouts and
-  the Autopilot measure the output through a simulated 1x hard clip at Output Ceiling: what a
-  hard clipper on the master will make of these drums. For the bus workflow where the plugin
-  makes the drums dense and the master clips once, on the sum. Output Ceiling now goes to
-  +12 dB so a bus instance can shape only the extreme peaks and still hit the master hot.
-* **Autopilot.** Learns an extra drive toward Target Loudness (phon at Reference Level), never
-  past Crest Floor, on 3-second statistics; once steady it holds until switched off and on, and
-  Freeze writes the result into Clip Drive. Measured: a 96-phon target lands at 95.7; an unreachable
-  130-phon target stops at the 6 dB floor (crest 6.1) with +12 dB of extra drive.
-* **Pre-EQ.** Four minimum-phase nodes drawn on the analyzer (low shelf, two one-octave bells,
-  high shelf), applied at the input before every path. No pre-ringing by construction; the
-  compressor sees the shaped signal.
-* **Stereo.** Zero-phase, in the long STFT. Correlation Floor extends the anti-phase guard to
-  weakly-correlated "fake wide" content; the narrowing is energy-preserving (what the Side
-  loses the Mid gains, capped at +6 dB), measured: uncorrelated bed at floor 0.5 -> side
-  -2.2 dB, mono sum +0.9 dB, panned in-phase tone untouched. Drive changes ramp over 20 ms.
-  Original stereo stage: Width scales the Side above a frequency (the mono
-  sum is the Mid, untouched, so it is mono-compatible by construction); the Anti-phase Guard
-  pulls down Side where left and right are in anti-phase per bin (correlation followed over
-  200 ms, gain smoothed across 1/3 octave so it cannot ring: Side pre-ring before an anti-phase
-  onset measures -73 dB), which vanishes on a mono sum and wastes clipper headroom. Measured: mono-sum error below -119 dB with Width at +6 dB; an
-  anti-phase tone's Side removed by 77 dB while panned in-phase material is untouched.
-* **Loudness Balance.** A slow, zero-phase per-band gain toward equal specific loudness across
-  the Bark bands (Zwicker). For a fixed energy, that balance reads loudest (the loudness sum is
-  concave). Energy-preserving, limited to Balance Range per band, measured before the pre-EQ.
-  Measured on a dull noise at equal energy: 35.8 -> 40.0 sones.
-* **Translation readouts.** Sones of dry vs processed through full range, laptop (120 Hz-15 kHz)
-  and phone (300 Hz-8 kHz) bands, plus a distortion line the sone numbers cannot see: crest
-  factor (peak/RMS over the last second; drums at a ceiling ~4-6 dB, a square ~1 dB) and the
-  share of output samples pinned at the ceiling.
-* **Mono below** a set frequency, done in the long STFT (zero-phase).
-* **Sub Split.** The band below Sub Split Freq is separated at the long resolution (sharp,
-  zero-phase) and carried through the same onset protection as the full signal, so
-  `full - sub` is an exact remainder. *Protect*: the sub passes clean (clipped only if it alone
-  exceeds the ceiling); *Clip separately*: the sub is clipped on its own at Sub Ceiling first.
-  Either way the rest is clipped, sample by sample, into the room the sub leaves at that
-  instant, so the sum never exceeds the ceiling and the sub keeps its shape (harmonics -62 dB
-  vs -34 dB for a plain clip on a 50 Hz + 2 kHz test, same overall rms within 0.2 dB). Protect
-  Amount blends this with the plain clip-everything output.
-* **Preserve Highs.** The band above Preserve Above bypasses the clipper and is summed back;
-  Highs Amount sets how much of it, Highs on Hits how much of it during a detected hit (0% =
-  a hit's highs are clipped with everything else, so zaps keep their clipped snap and only the
-  air between hits is preserved).
-* **Simple / Advanced view.** Simple shows the controls you touch per track; Advanced shows
-  everything. The choice is saved with the set.
-* **Perceived loudness in sones.** A Zwicker-style model (outer/middle-ear transfer, 24 Bark
-  bands, level-dependent masking spread, threshold in quiet, Zwicker specific loudness) runs
-  on the processed output and on the dry signal. It needs Reference Level: what 0 dBFS plays
-  at on your system, in dB SPL. Validated against the textbook anchors (1 kHz at 40 dB SPL ≈
-  1 sone, doubling per 10 dB, 60 Hz a third as loud as 1 kHz at equal SPL, broadband louder
-  than a tone of equal power).
-* **Matched Bypass** plays the dry signal at the processed signal's perceived loudness (a slow
-  servo in sones), so you compare shape, not volume.
-* **Presets**: Drum bus (Clip off, Meter Thru Clip on) and Master (the last clipper).
-* **Clip Stereo Link** (default 0%): per-channel clipping, like a standard hard clipper. Linked
-  (100%) preserves the image but pulls the mid down by the side's share at every peak
-  (measured on a mid-heavy signal: mid -0.8 dB, side +0.9 dB vs per-channel).
-* **Detector Weighting** (Flat / K-weighted / Equal loudness) shapes what the compressor hears:
-  weighted, it controls the lows harder and leaves presence alone.
-* **Analyzer** shows the detector spectrum, the threshold curve, the per-frequency cut/boost
-  from both resolution stages, and a strip that lights while a hit is protected. Four meters
-  show spectral-clip vs post-clip gain reduction and dry/processed K-weighted level.
+Why no ceiling and no output gain: turning a clipped bus down just lowers a squared waveform;
+loudness comes from what is driven into the clip, and the master clipper after it sets the
+final pinned share. Put one Bloater on each bus (Bus mode, drive each to taste) and one last on
+the master (Master mode, drive set last to the pinned share you want).
 
-## Latency
+## Controls
 
-`long + short + short + 128` samples, plus a small lookahead when the windows are too short
-for the protection pre-window. At defaults and 48 kHz: 10368 samples (216 ms). Hosts
-compensate automatically; this is a bounce / mix tool, not a live one.
-
-## Ringing, measured
-
-2 ms noise burst into silence, dynamics only, hard settings (threshold -30, 6:1 / 3:1):
-
-| | pre-ring (-40..-1 ms) | post-ring (30-170 ms) |
+| Section | Control | What it does |
 |---|---|---|
-| protection off, no smoothing | -21.7 dB | -37.6 dB |
-| protection on (25 ms pre), no smoothing | -34.6 dB | -37.6 dB |
-| protection on, 1/6 oct smoothing | -36.7 dB | -43.3 dB |
-| protection on, 1/6 oct, Post 120 ms | -36.7 dB | -55.5 dB |
+| Clip | Mode | Bus / Master: same processing, labels the readouts (the reference is a master measurement). |
+| | Clip | Bypass the clip stage for A/B (pre-stage stays). |
+| | Drive | Gain into the clip, −12…+24 dB. |
+| EQ | Tilt | ±6 dB tilt around 1 kHz (low shelf down / high shelf up or the reverse), before the clip. |
+| | Bell | One bell, freq and gain (e.g. +3 dB at 2 kHz for bite). |
+| Band leveler | Leveler, Low, High, Threshold, Ratio, Attack, Release | A compressor on one band only (default 250–1 k, 1:3, 3/80 ms): flattens low-mid growl peaks so they do not eat the clip. |
+| Sub split | Sub split, Crossover, Sub ceiling | Clips the band below the crossover on its own (to its own ceiling) and the rest at 0, then sums and clips again at 0. Off by default. |
+| Hit detection | Sensitivity | Onset detector threshold for the analyser. |
+| | Profile | Loud HF hits (claps/snares: hits within 6 dB of the loudest recent 2–8 kHz level) or all hits. |
 
-Relative to the hit's own energy. Post-ringing sits 15-20 dB below pre-ringing to begin with
-and is masked by the hit; Post and Frequency Smoothing push it further down.
+## Readouts
 
-## Verification
+All measured on the clipped output, mid channel unless noted, silence excluded.
 
-`cargo test -p onsetguard --release -- --nocapture` runs offline checks: identity null when
-everything is off (error < 1e-6), zero correlation lag on a sine zap, pre-ring reduction with
-protection on (-36 dB → -73 dB on a synthetic clap), transient null against dry (-61 dB),
-clipper ceiling never exceeded at 1×/2×/4×/8× oversampling, zero allocations in the process
-path, and stable behaviour across window/oversample changes.
+* **Hit profile graph**: clap level (RMS dBFS) in 0–3 / 3–10 / 10–25 / 25–60 / 60–120 /
+  120–200 ms after the hit, and rail share (% of samples with either channel ≥ 0.999) in
+  0–10 … 120–150 ms. Live median filled, last hit as a line, reference as an orange marker.
+* **pinned**: total, inside the 150 ms after hits, between hits.
+* **loudness**: mean phon (Zwicker-style sone model), at claps (30 ms after), between claps.
+* **drums over rest** per band (250–1 k, 1–4 k, 4–10 k): mean power inside the 150 ms after
+  every hit minus the rest of the time. **rest level**: the absolute level of the rest.
+* **500–6 k spread**: p90 − p10 of 50 ms window levels, stereo. Lower = flatter ("bricked").
+* **clap 5–10 k at 25–60 ms**: the clap's top-end tail.
+* Header line: pre-clip peak (how hard the clip is hit), pinned share of the last block,
+  leveler gain reduction.
+
+**Load reference…** decodes a WAV/MP3/FLAC/M4A, takes its loudest 24 s, finds the backbeat
+claps (2–8 kHz flux hits on a regular half-bar grid), runs the same analysis and stores it with
+the project; the table shows live − reference.
+
+The analysis matches the offline Python measurements the method was developed with to within
+0.1 dB (see `examples/report.rs` and `examples/refcheck.rs`).
+
+## Building
+
+Windows VST3 / CLAP from the rolling GitHub release (`bloater-latest-windows.zip`), or
+`cargo xtask bundle onsetguard --release`.

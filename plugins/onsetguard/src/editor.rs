@@ -15,7 +15,7 @@ use crate::reference::ReferenceData;
 use crate::{BloaterParams, Control, Snapshot};
 
 const GUI_WIDTH: u32 = 1000;
-const GUI_HEIGHT: u32 = 960;
+const GUI_HEIGHT: u32 = 1000;
 const LABEL_W: f32 = 108.0;
 const SLIDER_W: f32 = 176.0;
 
@@ -432,6 +432,10 @@ pub(crate) fn create(
                     row(cx, "Mode", |p| &p.mode);
                     toggle_row(cx, "Clip", |p| &p.clip);
                     row(cx, "Drive", |p| &p.drive);
+                    section(cx, "Soft stage before the clip");
+                    toggle_row(cx, "Soft stage", |p| &p.soft);
+                    row(cx, "Knee", |p| &p.soft_knee);
+                    row(cx, "Push into clip", |p| &p.soft_push);
                     section(cx, "EQ before the clip");
                     row(cx, "Tilt @ 1 kHz", |p| &p.tilt);
                     toggle_row(cx, "Bell", |p| &p.bell);

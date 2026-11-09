@@ -102,6 +102,12 @@ pub struct BloaterParams {
     pub drive: FloatParam,
     #[id = "clip"]
     pub clip: BoolParam,
+    #[id = "soft"]
+    pub soft: BoolParam,
+    #[id = "soft_knee"]
+    pub soft_knee: FloatParam,
+    #[id = "soft_push"]
+    pub soft_push: FloatParam,
 
     #[id = "tilt"]
     pub tilt: FloatParam,
@@ -173,6 +179,16 @@ impl Default for BloaterParams {
             mode: EnumParam::new("Mode", Mode::Bus),
             drive: db_param("Drive", 0.0, -12.0, 24.0),
             clip: BoolParam::new("Clip", true),
+            soft: BoolParam::new("Soft Stage", false),
+            soft_knee: FloatParam::new("Soft Knee", 0.5, FloatRange::Linear { min: 0.1, max: 0.95 })
+                .with_step_size(0.01)
+                .with_value_to_string(formatters::v2s_f32_rounded(2)),
+            // fine steps: the pinned share moves quickly with this (the soft stage crowds samples
+            // just under the ceiling)
+            soft_push: FloatParam::new("Soft Push", 0.22, FloatRange::Skewed { min: 0.0, max: 6.0, factor: FloatRange::skew_factor(-2.0) })
+                .with_unit(" dB")
+                .with_step_size(0.01)
+                .with_value_to_string(formatters::v2s_f32_rounded(2)),
             tilt: db_param("Tilt", 0.0, -6.0, 6.0),
             bell: BoolParam::new("Bell", false),
             bell_hz: hz_param("Bell Freq", 2000.0, 100.0, 12000.0),
@@ -219,6 +235,9 @@ impl BloaterParams {
             sub_hz: self.sub_hz.value(),
             sub_ceil_db: self.sub_ceil.value(),
             clip_on: self.clip.value(),
+            soft_on: self.soft.value(),
+            soft_knee: self.soft_knee.value(),
+            soft_push_db: self.soft_push.value(),
         }
     }
 }

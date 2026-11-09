@@ -2,7 +2,7 @@
 //! ceiling control on purpose: the clip is the ceiling, and loudness is shaped by what is sent
 //! into it (drive, band leveler, tilt/bell EQ, optional sub split). Zero latency.
 //!
-//! Signal path: drive → EQ (tilt + bell) → band leveler → [sub split] → hard clip 0 dBFS.
+//! Signal path: drive → EQ (tilt + bell) → band leveler → [soft knee] → [sub split] → hard clip 0 dBFS.
 
 use crate::dsp::eq::{EqSettings, PreEq};
 
@@ -27,6 +27,11 @@ pub struct BusSettings {
     pub sub_ceil_db: f32,
     /// Bypass the clip stage (the pre-stage still runs) for A/B listening.
     pub clip_on: bool,
+    /// Soft stage before the hard clip: linear below `soft_knee` (0..1 of the ceiling), tanh into
+    /// the ceiling above it; `soft_push_db` is the gain from the soft stage into the hard clip.
+    pub soft_on: bool,
+    pub soft_knee: f32,
+    pub soft_push_db: f32,
 }
 
 impl Default for BusSettings {
@@ -49,6 +54,9 @@ impl Default for BusSettings {
             sub_hz: 90.0,
             sub_ceil_db: -3.0,
             clip_on: true,
+            soft_on: false,
+            soft_knee: 0.5,
+            soft_push_db: 0.2,
         }
     }
 }
@@ -272,10 +280,15 @@ impl BusClip {
         // sub split + clip
         let mut pinned = 0usize;
         let sub_ceil = 10f32.powf(s.sub_ceil_db.min(0.0) / 20.0);
+        let knee = s.soft_knee.clamp(0.05, 0.95);
+        let push = 10f32.powf(s.soft_push_db / 20.0);
         for i in 0..len {
             for ch in 0..nch {
-                let x = channels[ch][i];
+                let mut x = channels[ch][i];
                 peak = peak.max(x.abs());
+                if s.soft_on && s.clip_on {
+                    x = soft_knee(x, knee) * push;
+                }
                 let y = if !s.clip_on {
                     x
                 } else if s.sub_on {
@@ -294,6 +307,17 @@ impl BusClip {
         }
         self.in_peak = peak;
         self.out_pinned = if len > 0 { pinned as f32 / (len * nch.max(1)) as f32 } else { 0.0 };
+    }
+}
+
+/// Linear below `knee`, tanh from the knee into 1.0 above it (continuous value and slope).
+#[inline]
+pub fn soft_knee(x: f32, knee: f32) -> f32 {
+    let a = x.abs();
+    if a <= knee {
+        x
+    } else {
+        (knee + (1.0 - knee) * ((a - knee) / (1.0 - knee)).tanh()).copysign(x)
     }
 }
 
@@ -348,6 +372,45 @@ mod tests {
         assert!(l.iter().all(|v| v.abs() <= 1.0));
         assert!(b.out_pinned > 0.5, "{}", b.out_pinned);
         assert!(b.in_peak > 1.9, "{}", b.in_peak);
+    }
+
+    #[test]
+    fn soft_stage_is_transparent_below_knee_and_bounded() {
+        assert_eq!(soft_knee(0.3, 0.5), 0.3);
+        assert_eq!(soft_knee(-0.5, 0.5), -0.5);
+        // continuous and monotonic through the knee, never above 1
+        let mut prev = 0.0;
+        for i in 0..4000 {
+            let x = i as f32 * 0.005;
+            let y = soft_knee(x, 0.5);
+            assert!(y >= prev - 1e-6 && y <= 1.0, "{x} -> {y}");
+            assert!((y - prev).abs() < 0.006);
+            prev = y;
+        }
+        assert!(soft_knee(20.0, 0.5) > 0.9999);
+        // in the chain: +0.2 dB push makes heavily driven input reach the hard ceiling
+        let sr = 44100.0;
+        let mut b = BusClip::new(sr, 2);
+        let mut s = BusSettings::default();
+        s.soft_on = true;
+        s.drive_db = 12.0;
+        b.update(&s);
+        b.reset();
+        let n = 8192;
+        let mut l = sine(1000.0, sr, n, 0.5);
+        let mut r = l.clone();
+        b.process(&mut [&mut l, &mut r], n);
+        assert!(l.iter().all(|v| v.abs() <= 1.0));
+        assert!(b.out_pinned > 0.2, "{}", b.out_pinned);
+        // quiet material is untouched
+        s.drive_db = 0.0;
+        b.update(&s);
+        b.reset();
+        let mut l = sine(1000.0, sr, n, 0.3);
+        let mut r = l.clone();
+        let orig = l.clone();
+        b.process(&mut [&mut l, &mut r], n);
+        assert!(l.iter().zip(&orig).skip(1024).all(|(a, o)| (a - o * 10f32.powf(0.2 / 20.0)).abs() < 1e-3));
     }
 
     #[test]

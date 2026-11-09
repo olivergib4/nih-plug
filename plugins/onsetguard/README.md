@@ -10,7 +10,7 @@ into the clip, plus an analyser that measures the clipped output the way referen
 measured and shows a loaded reference as deltas. Zero latency.
 
 ```
-in ─ Drive ─ Tilt / Bell EQ ─ Band leveler ─ [Sub split] ─ hard clip 0 dBFS ─ out
+in ─ Drive ─ Tilt / Bell EQ ─ Band leveler ─ [Soft stage] ─ [Sub split] ─ hard clip 0 dBFS ─ out
                                                               └─ onset detector + hit analyser → editor
 ```
 
@@ -26,6 +26,7 @@ the master (Master mode, drive set last to the pinned share you want).
 | Clip | Mode | Bus / Master: same processing, labels the readouts (the reference is a master measurement). |
 | | Clip | Bypass the clip stage for A/B (pre-stage stays). |
 | | Drive | Gain into the clip, −12…+24 dB. |
+| Soft stage | Soft stage, Knee, Push into clip | Off by default. Linear below the knee (0.50 = half of full scale), rounding smoothly into the ceiling above it; Push is the gain from the soft stage into the hard clip and sets how much still gets pinned (fine steps: 0.20–0.25 dB covers roughly 16–22 % pinned on a dense mix). Meant for the master instance: Drive +3, knee 0.50, push 0.22 reproduced the reference fingerprint. |
 | EQ | Tilt | ±6 dB tilt around 1 kHz (low shelf down / high shelf up or the reverse), before the clip. |
 | | Bell | One bell, freq and gain (e.g. +3 dB at 2 kHz for bite). |
 | Band leveler | Leveler, Low, High, Threshold, Ratio, Attack, Release | A compressor on one band only (default 250–1 k, 1:3, 3/80 ms): flattens low-mid growl peaks so they do not eat the clip. |

@@ -15,7 +15,7 @@ use crate::reference::ReferenceData;
 use crate::{BloaterParams, Control, Snapshot};
 
 const GUI_WIDTH: u32 = 1000;
-const GUI_HEIGHT: u32 = 640;
+const GUI_HEIGHT: u32 = 780;
 const LABEL_W: f32 = 108.0;
 const SLIDER_W: f32 = 176.0;
 

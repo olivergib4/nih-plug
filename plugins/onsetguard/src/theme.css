@@ -48,3 +48,41 @@ button {
   child-left: 8px;
   child-right: 8px;
 }
+/* dark panels: the stock widget styles assume a light background */
+param-slider {
+  border-color: #4a4b4f;
+  color: #e6e4dc;
+}
+param-slider .fill {
+  background-color: #3d5f86;
+}
+param-slider:active,
+param-slider:hover {
+  background-color: #ffffff14;
+}
+param-slider .value-entry .caret {
+  background-color: #e6e4dc;
+}
+param-slider .value-entry .selection {
+  background-color: #e6e4dc40;
+}
+param-button {
+  border-color: #4a4b4f;
+  color: #e6e4dc;
+  height: 22px;
+}
+param-button:hover {
+  background-color: #ffffff14;
+}
+param-button:checked {
+  background-color: #3d5f86;
+}
+button {
+  background-color: #3a3b3f;
+  color: #e6e4dc;
+  border-color: #5a5b5f;
+  border-width: 1px;
+}
+button:hover {
+  background-color: #4a4b50;
+}

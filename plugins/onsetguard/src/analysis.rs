@@ -126,6 +126,9 @@ pub struct Report {
     pub phon: f32,
     pub phon_hits: f32,
     pub phon_between: f32,
+    /// Seconds of non-silent audio the statistics cover.
+    #[serde(default)]
+    pub measured_s: f32,
 }
 
 impl Report {
@@ -206,6 +209,8 @@ pub struct Analyzer {
     onsets_seen: usize,
     period_s: f32,
     last_classify: usize,
+    /// Next sample index the accumulation has not seen yet.
+    acc_upto: usize,
     // accumulators
     hits_pow: [f64; NBANDS],
     rest_pow: [f64; NBANDS],
@@ -390,6 +395,7 @@ impl Analyzer {
             onsets_seen: 0,
             period_s: 0.0,
             last_classify: 0,
+            acc_upto: 0,
             hits_pow: [0.0; NBANDS],
             rest_pow: [0.0; NBANDS],
             hits_n: 0,
@@ -563,7 +569,11 @@ impl Analyzer {
             self.classify();
         }
         if self.pos > self.delay {
-            self.accumulate(self.pos - 1 - self.delay);
+            let a = self.pos - 1 - self.delay;
+            if a >= self.acc_upto {
+                self.accumulate(a);
+                self.acc_upto = a + 1;
+            }
         }
     }
 
@@ -814,19 +824,27 @@ impl Analyzer {
         }
     }
 
-    /// End of a stream (offline use): classify what is stored and run the accumulation up to
-    /// the last complete sample.
-    pub fn finish(&mut self) {
+    /// Bring the statistics up to date with everything pushed so far (classify the stored hits
+    /// and accumulate the delayed tail). Used at the end of a file and when playback stops; the
+    /// analyser keeps working normally afterwards.
+    pub fn flush(&mut self) {
         self.pending.clear();
         self.classify();
-        let end = self.pos;
-        let mut a = if self.pos > self.delay { self.pos - self.delay } else { 0 };
-        while a < end {
+        while self.acc_upto < self.pos {
+            let a = self.acc_upto;
             self.accumulate(a);
-            a += 1;
+            self.acc_upto += 1;
         }
-        // keep the delay consistent for any further pushes
-        self.delay = 0;
+    }
+
+    /// End of a stream (offline use).
+    pub fn finish(&mut self) {
+        self.flush();
+    }
+
+    /// Seconds of (non-silent) audio in the current statistics.
+    pub fn measured_s(&self) -> f32 {
+        (self.hits_n + self.rest_n) as f32 / self.sr
     }
 
     /// Stored hits, oldest first.
@@ -911,6 +929,7 @@ impl Analyzer {
         r.spread_db = if self.spread_n >= 4 { percentile(&mut sp[..self.spread_n], 90.0) - percentile(&mut sp[..self.spread_n], 10.0) } else { f32::NAN };
         sp[..self.lm_n].copy_from_slice(&self.lm_levels[..self.lm_n]);
         r.lowmid_peak_db = if self.lm_n >= 8 { percentile(&mut sp[..self.lm_n], 99.0) - percentile(&mut sp[..self.lm_n], 50.0) } else { f32::NAN };
+        r.measured_s = self.measured_s();
         r.pinned_pct = 100.0 * (self.hits_rail + self.rest_rail) as f32 / tot.max(1) as f32;
         r.pinned_hits_pct = 100.0 * self.hits_rail as f32 / self.hits_n.max(1) as f32;
         r.pinned_rest_pct = 100.0 * self.rest_rail as f32 / self.rest_n.max(1) as f32;

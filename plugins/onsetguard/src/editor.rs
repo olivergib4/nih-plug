@@ -374,6 +374,7 @@ pub(crate) fn create(
                     section(cx, "Hit detection");
                     row(cx, "Sensitivity", |p| &p.sens);
                     row(cx, "Profile", |p| &p.pick);
+                    toggle_row(cx, "Per playback", |p| &p.per_play);
                 })
                 .width(Pixels(LABEL_W + SLIDER_W + 20.0))
                 .row_between(Pixels(2.0))
@@ -383,7 +384,7 @@ pub(crate) fn create(
                 VStack::new(cx, |cx| {
                     HStack::new(cx, |cx| {
                         Label::new(cx, "Hit profile — clap level (dBFS, −24…0) and rail share (0…100 %) after the hit").class("section");
-                        Label::new(cx, Data::live.map(|s| format!("{} hits, {} claps, half-bar {:.3} s", s.hits, s.report.claps, s.report.period_s))).class("sub").left(Stretch(1.0));
+                        Label::new(cx, Data::live.map(|s| format!("measured {:.1} s · {} claps · half-bar {:.3} s", s.report.measured_s, s.report.claps, s.report.period_s))).class("sub").left(Stretch(1.0));
                     })
                     .height(Pixels(20.0));
                     ProfileGraph::new(cx).height(Pixels(190.0));

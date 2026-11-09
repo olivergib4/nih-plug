@@ -118,6 +118,10 @@ pub struct BloaterParams {
     pub sens: FloatParam,
     #[id = "pick"]
     pub pick: EnumParam<HitPick>,
+    /// Measure per playback: statistics restart when the transport starts and hold when it
+    /// stops, so one pass over a section gives one stable set of numbers.
+    #[id = "per_play"]
+    pub per_play: BoolParam,
 }
 
 fn db_param(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
@@ -170,6 +174,7 @@ impl Default for BloaterParams {
                 .with_step_size(0.01)
                 .with_value_to_string(formatters::v2s_f32_rounded(2)),
             pick: EnumParam::new("Profile", HitPick::LoudHf),
+            per_play: BoolParam::new("Measure per playback", true),
         }
     }
 }
@@ -216,6 +221,7 @@ pub struct Bloater {
     snap_out: Arc<Mutex<triple_buffer::Output<Snapshot>>>,
     sample_rate: f32,
     since_report: usize,
+    was_playing: bool,
     hits: u32,
     snapshot: Snapshot,
 }
@@ -233,6 +239,7 @@ impl Default for Bloater {
             snap_out: Arc::new(Mutex::new(snap_out)),
             sample_rate: 44100.0,
             since_report: 0,
+            was_playing: false,
             hits: 0,
             snapshot: Snapshot::default(),
         }
@@ -306,7 +313,7 @@ impl Plugin for Bloater {
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let (Some(bus), Some(onset), Some(an)) = (&mut self.bus, &mut self.onset, &mut self.analyzer) else {
             return ProcessStatus::Normal;
@@ -326,7 +333,26 @@ impl Plugin for Bloater {
             HitPick::All => HitKind::Clap,
         };
         let nch = slices.len();
+        // per-playback measurement: restart on play, hold (no analysis) while stopped
+        let per_play = self.params.per_play.value();
+        let playing = context.transport().playing;
+        let mut force_report = false;
+        if per_play {
+            if playing && !self.was_playing {
+                an.clear_accumulators();
+                self.hits = 0;
+            }
+            if !playing && self.was_playing {
+                an.flush();
+                force_report = true;
+            }
+        }
+        self.was_playing = playing;
+        let analyse = !per_play || playing;
         for i in 0..len {
+            if !analyse {
+                break;
+            }
             let l = slices[0][i];
             let r = if nch > 1 { slices[1][i] } else { l };
             an.push(l, r);
@@ -336,7 +362,7 @@ impl Plugin for Bloater {
             }
         }
         self.since_report += len;
-        if self.since_report >= 4096 {
+        if force_report || (analyse && self.since_report >= 4096) {
             self.since_report = 0;
             self.snapshot.report = an.report();
             if let Some(p) = an.last_profile() {

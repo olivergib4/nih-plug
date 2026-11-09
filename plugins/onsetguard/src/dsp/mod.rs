@@ -4,3 +4,4 @@ pub mod butter;
 pub mod eq;
 pub mod onset;
 pub mod sone;
+pub mod spectrum;

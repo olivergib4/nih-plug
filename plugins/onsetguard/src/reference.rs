@@ -30,6 +30,9 @@ pub struct ReferenceData {
     /// Half-bar period found, seconds (0 if no grid).
     pub period_s: f32,
     pub report: Report,
+    /// Average spectrum of the analysed window, dBFS per 1/6-octave point (see dsp::spectrum).
+    #[serde(default)]
+    pub spectrum_db: Vec<f32>,
 }
 
 /// Decode any file symphonia understands into stereo f32 (mono duplicated).
@@ -275,11 +278,13 @@ pub fn analyze(name: &str, l: &[f32], r: &[f32], sr: f32) -> Result<ReferenceDat
     let pre = (1.0 * sr) as usize;
     let a = start.saturating_sub(pre);
     let mut an = Analyzer::new(sr);
+    let mut spec = crate::dsp::spectrum::Spectrum::new(sr);
     an.set_span(start - a, end - a);
     let mut det = OnsetDetector::new(sr);
     for i in a..end {
         let (x, y) = (l[i].clamp(-1.0, 1.0), r[i].clamp(-1.0, 1.0));
         an.push(x, y);
+        spec.push(0.5 * (x + y), i >= start);
         if let Some(t) = det.push(0.5 * (x + y), DETECT_SENS) {
             an.onset(t, HitKind::Auto);
         }
@@ -289,7 +294,9 @@ pub fn analyze(name: &str, l: &[f32], r: &[f32], sr: f32) -> Result<ReferenceDat
     if report.claps < 2 {
         return Err(format!("found only {} backbeat hits in the loudest {WINDOW_S:.0} s", report.claps));
     }
-    Ok(ReferenceData { name: name.to_string(), sample_rate: sr, window_start_s: start as f32 / sr, claps: report.claps, period_s: report.period_s, report })
+    let mut avg = [0.0f32; crate::dsp::spectrum::NPTS];
+    spec.average_db(&mut avg);
+    Ok(ReferenceData { name: name.to_string(), sample_rate: sr, window_start_s: start as f32 / sr, claps: report.claps, period_s: report.period_s, report, spectrum_db: avg.to_vec() })
 }
 
 pub fn analyze_file(path: &std::path::Path) -> Result<ReferenceData, String> {

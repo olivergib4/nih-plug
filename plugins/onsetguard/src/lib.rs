@@ -34,9 +34,10 @@ pub mod reference;
 use analysis::{Analyzer, HitKind, HitProfile, Report};
 use dsp::busclip::{BusClip, BusSettings};
 use dsp::onset::OnsetDetector;
+use dsp::spectrum::{Spectrum, NPTS};
 
 /// Snapshot of the live analysis for the editor.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct Snapshot {
     pub report: Report,
     pub last: HitProfile,
@@ -47,6 +48,25 @@ pub struct Snapshot {
     pub block_pinned: f32,
     pub lev_gr_db: f32,
     pub hits: u32,
+    /// Live spectrum (fast ballistics) and its average since play, dBFS per 1/6-octave point.
+    pub spec_fast: [f32; NPTS],
+    pub spec_avg: [f32; NPTS],
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Snapshot {
+            report: Report::default(),
+            last: HitProfile::default(),
+            has_last: false,
+            in_peak_db: -120.0,
+            block_pinned: 0.0,
+            lev_gr_db: 0.0,
+            hits: 0,
+            spec_fast: [-120.0; NPTS],
+            spec_avg: [f32::NAN; NPTS],
+        }
+    }
 }
 
 #[derive(Enum, Debug, PartialEq, Eq, Clone, Copy)]
@@ -217,6 +237,7 @@ pub struct Bloater {
     bus: Option<BusClip>,
     onset: Option<OnsetDetector>,
     analyzer: Option<Analyzer>,
+    spectrum: Option<Spectrum>,
     snap_in: triple_buffer::Input<Snapshot>,
     snap_out: Arc<Mutex<triple_buffer::Output<Snapshot>>>,
     sample_rate: f32,
@@ -235,6 +256,7 @@ impl Default for Bloater {
             bus: None,
             onset: None,
             analyzer: None,
+            spectrum: None,
             snap_in,
             snap_out: Arc::new(Mutex::new(snap_out)),
             sample_rate: 44100.0,
@@ -292,6 +314,7 @@ impl Plugin for Bloater {
         self.bus = Some(bus);
         self.onset = Some(OnsetDetector::new(self.sample_rate));
         self.analyzer = Some(Analyzer::new(self.sample_rate));
+        self.spectrum = Some(Spectrum::new(self.sample_rate));
         context.set_latency_samples(0);
         true
     }
@@ -306,6 +329,9 @@ impl Plugin for Bloater {
         if let Some(a) = &mut self.analyzer {
             a.reset();
         }
+        if let Some(sp) = &mut self.spectrum {
+            sp.reset();
+        }
         self.hits = 0;
     }
 
@@ -315,11 +341,12 @@ impl Plugin for Bloater {
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let (Some(bus), Some(onset), Some(an)) = (&mut self.bus, &mut self.onset, &mut self.analyzer) else {
+        let (Some(bus), Some(onset), Some(an), Some(spec)) = (&mut self.bus, &mut self.onset, &mut self.analyzer, &mut self.spectrum) else {
             return ProcessStatus::Normal;
         };
         if self.control.reset_stats.swap(false, Ordering::Relaxed) {
             an.clear_accumulators();
+            spec.clear();
             self.hits = 0;
         }
         bus.update(&self.params.bus_settings());
@@ -340,6 +367,7 @@ impl Plugin for Bloater {
         if per_play {
             if playing && !self.was_playing {
                 an.clear_accumulators();
+                spec.clear();
                 self.hits = 0;
             }
             if !playing && self.was_playing {
@@ -349,12 +377,15 @@ impl Plugin for Bloater {
         }
         self.was_playing = playing;
         let analyse = !per_play || playing;
+        let mut spec_frame = false;
         for i in 0..len {
-            if !analyse {
-                break;
-            }
             let l = slices[0][i];
             let r = if nch > 1 { slices[1][i] } else { l };
+            // the live spectrum always runs; its average only while measuring
+            spec_frame |= spec.push(0.5 * (l + r), analyse);
+            if !analyse {
+                continue;
+            }
             an.push(l, r);
             if let Some(t) = onset.push(0.5 * (l + r), sens) {
                 an.onset(t, kind);
@@ -362,7 +393,15 @@ impl Plugin for Bloater {
             }
         }
         self.since_report += len;
-        if force_report || (analyse && self.since_report >= 4096) {
+        let full = force_report || (analyse && self.since_report >= 4096);
+        if full || spec_frame {
+            self.snapshot.spec_fast = spec.fast_db;
+            spec.average_db(&mut self.snapshot.spec_avg);
+        }
+        if !full && spec_frame {
+            self.snap_in.write(self.snapshot);
+        }
+        if full {
             self.since_report = 0;
             self.snapshot.report = an.report();
             if let Some(p) = an.last_profile() {

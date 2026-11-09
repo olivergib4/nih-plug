@@ -37,6 +37,11 @@ the master (Master mode, drive set last to the pinned share you want).
 
 All measured on the clipped output, mid channel unless noted, silence excluded.
 
+* **Spectrum**: live mid-channel spectrum (1/6 octave, +4.5 dB/oct display tilt), its average
+  over the current pass, and the reference's average over its loudest 24 s.
+* **Measure per playback** (on by default): the statistics restart when the transport starts
+  and hold when it stops, so playing a section once gives one stable set of numbers; the
+  header shows how many seconds they cover.
 * **Hit profile graph**: clap level (RMS dBFS) in 0–3 / 3–10 / 10–25 / 25–60 / 60–120 /
   120–200 ms after the hit, and rail share (% of samples with either channel ≥ 0.999) in
   0–10 … 120–150 ms. Live median filled, last hit as a line, reference as an orange marker.

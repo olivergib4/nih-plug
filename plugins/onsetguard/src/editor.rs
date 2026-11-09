@@ -15,7 +15,7 @@ use crate::reference::ReferenceData;
 use crate::{BloaterParams, Control, Snapshot};
 
 const GUI_WIDTH: u32 = 1000;
-const GUI_HEIGHT: u32 = 780;
+const GUI_HEIGHT: u32 = 960;
 const LABEL_W: f32 = 108.0;
 const SLIDER_W: f32 = 176.0;
 
@@ -103,7 +103,10 @@ impl Model for Data {
                 let s = { *self.snap.lock().unwrap().read() };
                 self.live = s;
                 self.tick = self.tick.wrapping_add(1);
-                self.rows = rows(&s.report, self.reference.as_ref().map(|r| &r.report));
+                // the table only needs ~10 updates a second
+                if self.tick % 3 == 0 {
+                    self.rows = rows(&s.report, self.reference.as_ref().map(|r| &r.report));
+                }
             }
             Msg::ResetStats => {
                 self.control.reset_stats.store(true, Ordering::Relaxed);
@@ -258,6 +261,81 @@ impl View for ProfileGraph {
     }
 }
 
+/// Live spectrum: fast curve, average since play, reference average.
+pub struct SpectrumView;
+
+impl SpectrumView {
+    pub fn new(cx: &mut Context) -> Handle<'_, Self> {
+        Self.build(cx, |cx| {
+            Binding::new(cx, Data::tick, |cx, _| cx.needs_redraw());
+        })
+    }
+}
+
+const SPEC_LO: f32 = -60.0;
+const SPEC_HI: f32 = 0.0;
+
+impl View for SpectrumView {
+    fn element(&self) -> Option<&'static str> {
+        Some("spectrumview")
+    }
+
+    fn draw(&self, cx: &mut DrawContext, canvas: &mut Canvas) {
+        use crate::dsp::spectrum::{point_freq, tilt_db, F_HI, F_LO, NPTS};
+        let b = cx.bounds();
+        if b.w <= 0.0 || b.h <= 0.0 {
+            return;
+        }
+        let live = Data::live.get(cx);
+        let reference = Data::reference.get(cx);
+        let mut bg = vg::Path::new();
+        bg.rect(b.x, b.y, b.w, b.h);
+        canvas.fill_path(&bg, &vg::Paint::color(vg::Color::rgbaf(0.08, 0.08, 0.09, 1.0)));
+        let xf = |f: f32| b.x + b.w * ((f / F_LO).ln() / (F_HI / F_LO).ln());
+        let yd = |db: f32| b.y + b.h * (1.0 - ((db - SPEC_LO) / (SPEC_HI - SPEC_LO)).clamp(0.0, 1.0));
+        let mut g = vg::Path::new();
+        for f in [50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0] {
+            g.move_to(xf(f), b.y);
+            g.line_to(xf(f), b.y + b.h);
+        }
+        let mut db = SPEC_LO;
+        while db <= SPEC_HI {
+            g.move_to(b.x, yd(db));
+            g.line_to(b.x + b.w, yd(db));
+            db += 12.0;
+        }
+        canvas.stroke_path(&g, &vg::Paint::color(GRID).with_line_width(1.0));
+        let curve = |canvas: &mut Canvas, v: &[f32], color: vg::Color, width: f32| {
+            let mut p = vg::Path::new();
+            let mut started = false;
+            for k in 0..NPTS.min(v.len()) {
+                if v[k].is_nan() {
+                    continue;
+                }
+                let f = point_freq(k);
+                let (x, y) = (xf(f), yd(v[k] + tilt_db(f)));
+                if started {
+                    p.line_to(x, y);
+                } else {
+                    p.move_to(x, y);
+                    started = true;
+                }
+            }
+            if started {
+                canvas.stroke_path(&p, &vg::Paint::color(color).with_line_width(width));
+            }
+        };
+        curve(canvas, &live.spec_fast, vg::Color::rgbaf(0.8, 0.8, 0.8, 0.8), 1.0);
+        curve(canvas, &live.spec_avg, BAR_FILL, 2.0);
+        if let Some(r) = &reference {
+            curve(canvas, &r.spectrum_db, REF_COLOR, 2.0);
+        }
+        let mut border = vg::Path::new();
+        border.rect(b.x + 0.5, b.y + 0.5, b.w - 1.0, b.h - 1.0);
+        canvas.stroke_path(&border, &vg::Paint::color(vg::Color::rgbaf(0.3, 0.3, 0.32, 1.0)).with_line_width(1.0));
+    }
+}
+
 pub(crate) fn default_state() -> Arc<ViziaState> {
     ViziaState::new(|| (GUI_WIDTH, GUI_HEIGHT))
 }
@@ -331,7 +409,7 @@ pub(crate) fn create(
                 if proxy.emit(Msg::Tick).is_err() {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(33));
             }
         });
 
@@ -383,11 +461,24 @@ pub(crate) fn create(
                 // ---- analysis ----
                 VStack::new(cx, |cx| {
                     HStack::new(cx, |cx| {
+                        Label::new(cx, "Spectrum (1/6 oct, +4.5 dB/oct tilt, −60…0 dB)").class("section");
+                    })
+                    .height(Pixels(20.0));
+                    SpectrumView::new(cx).height(Pixels(200.0));
+                    HStack::new(cx, |cx| {
+                        Label::new(cx, "— live").class("legend").color(Color::rgb(200, 200, 200));
+                        Label::new(cx, "— average this pass").class("legend").color(Color::rgb(107, 148, 199));
+                        Label::new(cx, "— reference average").class("legend").color(Color::rgb(255, 184, 64));
+                        Label::new(cx, "grid: 50 · 100 · 200 · 500 · 1k · 2k · 5k · 10k Hz").class("sub").left(Stretch(1.0));
+                    })
+                    .height(Pixels(18.0))
+                    .col_between(Pixels(14.0));
+                    HStack::new(cx, |cx| {
                         Label::new(cx, "Hit profile — clap level (dBFS, −24…0) and rail share (0…100 %) after the hit").class("section");
                         Label::new(cx, Data::live.map(|s| format!("measured {:.1} s · {} claps · half-bar {:.3} s", s.report.measured_s, s.report.claps, s.report.period_s))).class("sub").left(Stretch(1.0));
                     })
                     .height(Pixels(20.0));
-                    ProfileGraph::new(cx).height(Pixels(190.0));
+                    ProfileGraph::new(cx).height(Pixels(160.0));
                     HStack::new(cx, |cx| {
                         for (a, b) in LEVEL_WINS_MS {
                             Label::new(cx, &format!("{}-{}", a as i32, b as i32)).class("tick").width(Stretch(1.0));

@@ -1,4 +1,4 @@
-//! Run a raw f32le stereo file through the bus clipper: `chain IN OUT drive_db soft(0/1) knee push_db`
+//! Run a raw f32le stereo file through the bus clipper: `chain IN OUT drive_db soft(0/1) knee push_db [clip(0/1) heq(0/1) heq_thr_db]`
 use onsetguard::dsp::busclip::{BusClip, BusSettings};
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -11,6 +11,16 @@ fn main() {
     s.soft_on = a[4] == "1";
     s.soft_knee = a[5].parse().unwrap();
     s.soft_push_db = a[6].parse().unwrap();
+    // optional: clip(0/1) heq(0/1) thr_db
+    if a.len() > 7 {
+        s.clip_on = a[7] == "1";
+    }
+    if a.len() > 8 {
+        s.hit_eq.on = a[8] == "1";
+    }
+    if a.len() > 9 {
+        s.hit_eq.thr_db = a[9].parse().unwrap();
+    }
     let mut b = BusClip::new(44100.0, 2);
     b.update(&s);
     b.reset();

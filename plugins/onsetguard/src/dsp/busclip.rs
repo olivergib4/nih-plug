@@ -2,9 +2,10 @@
 //! ceiling control on purpose: the clip is the ceiling, and loudness is shaped by what is sent
 //! into it (drive, band leveler, tilt/bell EQ, optional sub split). Zero latency.
 //!
-//! Signal path: drive → EQ (tilt + bell) → band leveler → [soft knee] → [sub split] → hard clip 0 dBFS.
+//! Signal path: [attack EQ] → drive → EQ (tilt + bell) → band leveler → [soft knee] → [sub split] → hard clip 0 dBFS.
 
 use crate::dsp::eq::{EqSettings, PreEq};
+use crate::dsp::hiteq::{HitEq, HitEqSettings};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BusSettings {
@@ -32,6 +33,8 @@ pub struct BusSettings {
     pub soft_on: bool,
     pub soft_knee: f32,
     pub soft_push_db: f32,
+    /// Attack EQ (acts only in a window after each hit); first in the chain.
+    pub hit_eq: HitEqSettings,
 }
 
 impl Default for BusSettings {
@@ -57,6 +60,7 @@ impl Default for BusSettings {
             soft_on: false,
             soft_knee: 0.5,
             soft_push_db: 0.2,
+            hit_eq: HitEqSettings::default(),
         }
     }
 }
@@ -150,6 +154,7 @@ pub struct BusClip {
     sr: f32,
     nch: usize,
     cur: BusSettings,
+    hit_eq: HitEq,
     eq: PreEq,
     // leveler
     lev_lo: [Lr4; MAX_CH],
@@ -177,6 +182,7 @@ impl BusClip {
             sr: sample_rate,
             nch: num_channels.min(MAX_CH),
             cur: BusSettings { drive_db: f32::NAN, ..s },
+            hit_eq: HitEq::new(sample_rate),
             eq: PreEq::new(sample_rate, num_channels.min(MAX_CH)),
             lev_lo: [Lr4::new(sr, s.lev_lo_hz as f64); MAX_CH],
             lev_hi: [Lr4::new(sr, s.lev_hi_hz as f64); MAX_CH],
@@ -198,6 +204,7 @@ impl BusClip {
 
     pub fn reset(&mut self) {
         self.eq.reset();
+        self.hit_eq.reset();
         for x in self.lev_lo.iter_mut().chain(self.lev_hi.iter_mut()).chain(self.sub_x.iter_mut()) {
             x.clear();
         }
@@ -231,6 +238,7 @@ impl BusClip {
             gain_db: [-t * 0.5, if s.bell_on { s.bell_db } else { 0.0 }, 0.0, t * 0.5],
         };
         self.eq.update(&eqs);
+        self.hit_eq.update(&s.hit_eq);
         self.cur = *s;
     }
 
@@ -238,6 +246,8 @@ impl BusClip {
     pub fn process(&mut self, channels: &mut [&mut [f32]], len: usize) {
         let nch = self.nch.min(channels.len());
         let s = self.cur;
+        // attack EQ (on the input, before the drive)
+        self.hit_eq.process(&mut channels[..nch], len);
         // drive
         let mut peak = 0.0f32;
         for i in 0..len {

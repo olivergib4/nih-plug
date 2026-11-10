@@ -109,6 +109,23 @@ pub struct BloaterParams {
     #[id = "soft_push"]
     pub soft_push: FloatParam,
 
+    #[id = "heq"]
+    pub heq: BoolParam,
+    #[id = "heq_thr"]
+    pub heq_thr: FloatParam,
+    #[id = "heq_start"]
+    pub heq_start: FloatParam,
+    #[id = "heq_len"]
+    pub heq_len: FloatParam,
+    #[id = "heq_bell_hz"]
+    pub heq_bell_hz: FloatParam,
+    #[id = "heq_bell_db"]
+    pub heq_bell_db: FloatParam,
+    #[id = "heq_shelf_hz"]
+    pub heq_shelf_hz: FloatParam,
+    #[id = "heq_shelf_db"]
+    pub heq_shelf_db: FloatParam,
+
     #[id = "tilt"]
     pub tilt: FloatParam,
     #[id = "bell"]
@@ -189,6 +206,14 @@ impl Default for BloaterParams {
                 .with_unit(" dB")
                 .with_step_size(0.01)
                 .with_value_to_string(formatters::v2s_f32_rounded(2)),
+            heq: BoolParam::new("Attack EQ", false),
+            heq_thr: db_param("Attack EQ Trigger", 12.0, 3.0, 40.0),
+            heq_start: ms_param("Attack EQ Start", 8.8, 0.0, 50.0),
+            heq_len: ms_param("Attack EQ Length", 52.0, 5.0, 300.0),
+            heq_bell_hz: hz_param("Attack EQ Bell Freq", 2000.0, 200.0, 12000.0),
+            heq_bell_db: db_param("Attack EQ Bell Gain", -4.0, -12.0, 12.0),
+            heq_shelf_hz: hz_param("Attack EQ Shelf Freq", 5000.0, 1000.0, 16000.0),
+            heq_shelf_db: db_param("Attack EQ Shelf Gain", 4.0, -12.0, 12.0),
             tilt: db_param("Tilt", 0.0, -6.0, 6.0),
             bell: BoolParam::new("Bell", false),
             bell_hz: hz_param("Bell Freq", 2000.0, 100.0, 12000.0),
@@ -238,6 +263,16 @@ impl BloaterParams {
             soft_on: self.soft.value(),
             soft_knee: self.soft_knee.value(),
             soft_push_db: self.soft_push.value(),
+            hit_eq: dsp::hiteq::HitEqSettings {
+                on: self.heq.value(),
+                thr_db: self.heq_thr.value(),
+                start_ms: self.heq_start.value(),
+                len_ms: self.heq_len.value(),
+                bell_hz: self.heq_bell_hz.value(),
+                bell_db: self.heq_bell_db.value(),
+                shelf_hz: self.heq_shelf_hz.value(),
+                shelf_db: self.heq_shelf_db.value(),
+            },
         }
     }
 }

@@ -15,7 +15,7 @@ use crate::reference::ReferenceData;
 use crate::{BloaterParams, Control, Snapshot};
 
 const GUI_WIDTH: u32 = 1000;
-const GUI_HEIGHT: u32 = 1000;
+const GUI_HEIGHT: u32 = 1240;
 const LABEL_W: f32 = 108.0;
 const SLIDER_W: f32 = 176.0;
 
@@ -453,6 +453,15 @@ pub(crate) fn create(
                     toggle_row(cx, "Sub split", |p| &p.sub);
                     row(cx, "Crossover", |p| &p.sub_hz);
                     row(cx, "Sub ceiling", |p| &p.sub_ceil);
+                    section(cx, "Attack EQ (only after each hit)");
+                    toggle_row(cx, "Attack EQ", |p| &p.heq);
+                    row(cx, "Trigger within (of loudest hit)", |p| &p.heq_thr);
+                    row(cx, "Start after hit", |p| &p.heq_start);
+                    row(cx, "Length", |p| &p.heq_len);
+                    row(cx, "Bell freq", |p| &p.heq_bell_hz);
+                    row(cx, "Bell gain", |p| &p.heq_bell_db);
+                    row(cx, "Shelf freq", |p| &p.heq_shelf_hz);
+                    row(cx, "Shelf gain", |p| &p.heq_shelf_db);
                     section(cx, "Hit detection");
                     row(cx, "Sensitivity", |p| &p.sens);
                     row(cx, "Profile", |p| &p.pick);

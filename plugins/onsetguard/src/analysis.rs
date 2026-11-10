@@ -219,6 +219,8 @@ pub struct Analyzer {
     hits_rail: u64,
     rest_rail: u64,
     spread_sum: f64,
+    /// Samples accumulated since the statistics were last cleared (windows fill from here).
+    win_cnt: usize,
     spread_win: usize,
     spread_levels: Vec<f32>,
     spread_n: usize,
@@ -403,6 +405,7 @@ impl Analyzer {
             hits_rail: 0,
             rest_rail: 0,
             spread_sum: 0.0,
+            win_cnt: 0,
             spread_win: sil_len,
             spread_levels: vec![0.0; MAX_SPREAD],
             spread_n: 0,
@@ -479,6 +482,7 @@ impl Analyzer {
         self.hits_rail = 0;
         self.rest_rail = 0;
         self.spread_sum = 0.0;
+        self.win_cnt = 0;
         self.spread_n = 0;
         self.spread_head = 0;
         self.lm_sum = 0.0;
@@ -778,16 +782,22 @@ impl Analyzer {
             return;
         }
         let i = a & self.lmask;
-        let rel = a - self.span.0 + 1;
+        // counted from the last clear (or the span start), so a window never mixes in audio from
+        // before the statistics were restarted
+        self.win_cnt += 1;
+        let rel = self.win_cnt;
+        let quiet = self.silent[i] != 0;
         // spread: 50 ms windows every 25 ms from the span start, stereo 500-6k power
         self.spread_sum += self.spread_pow[i] as f64;
         if rel >= self.spread_win {
             let old = self.spread_pow[(a + 1).wrapping_sub(self.spread_win) & self.lmask] as f64;
             if (rel - self.spread_win) % (self.spread_win / 2) == 0 {
-                let v = db_pow(self.spread_sum / self.spread_win as f64);
-                self.spread_levels[self.spread_head] = v;
-                self.spread_head = (self.spread_head + 1) % MAX_SPREAD;
-                self.spread_n = (self.spread_n + 1).min(MAX_SPREAD);
+                let v = db_pow(self.spread_sum.max(0.0) / self.spread_win as f64);
+                if !quiet {
+                    self.spread_levels[self.spread_head] = v;
+                    self.spread_head = (self.spread_head + 1) % MAX_SPREAD;
+                    self.spread_n = (self.spread_n + 1).min(MAX_SPREAD);
+                }
             }
             self.spread_sum -= old;
         }
@@ -796,10 +806,12 @@ impl Analyzer {
         if rel >= self.lm_win {
             let old = self.band_sq[(a + 1).wrapping_sub(self.lm_win) & self.lmask][2] as f64;
             if (rel - self.lm_win) % (self.lm_win / 2) == 0 {
-                let v = db_pow(self.lm_sum / self.lm_win as f64);
-                self.lm_levels[self.lm_head] = v;
-                self.lm_head = (self.lm_head + 1) % MAX_SPREAD;
-                self.lm_n = (self.lm_n + 1).min(MAX_SPREAD);
+                let v = db_pow(self.lm_sum.max(0.0) / self.lm_win as f64);
+                if !quiet {
+                    self.lm_levels[self.lm_head] = v;
+                    self.lm_head = (self.lm_head + 1) % MAX_SPREAD;
+                    self.lm_n = (self.lm_n + 1).min(MAX_SPREAD);
+                }
             }
             self.lm_sum -= old;
         }
@@ -999,6 +1011,31 @@ mod tests {
         assert!((rep.level_db[5] + 12.0).abs() < 1.0, "{:?}", rep.level_db);
         assert!(rep.band_delta(0) > 25.0, "{rep:?}");
         assert!(rep.pinned_pct < 1.0);
+    }
+
+    #[test]
+    fn spread_is_sane_after_restart() {
+        // loud noise, then clear mid-stream: windows must not mix pre-clear audio (was ~190 dB)
+        let sr = 44100.0;
+        let mut an = Analyzer::new(sr);
+        let mut seed = 9u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        };
+        for _ in 0..(3 * 44100) {
+            let v = rnd() * 0.5;
+            an.push(v, v);
+        }
+        an.clear_accumulators();
+        for _ in 0..(3 * 44100) {
+            let v = rnd() * 0.5;
+            an.push(v, v);
+        }
+        an.flush();
+        let r = an.report();
+        assert!(r.spread_db.is_finite() && r.spread_db < 3.0, "{}", r.spread_db);
+        assert!(r.lowmid_peak_db.is_finite() && r.lowmid_peak_db < 3.0, "{}", r.lowmid_peak_db);
     }
 
     #[test]

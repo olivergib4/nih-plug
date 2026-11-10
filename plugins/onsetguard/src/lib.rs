@@ -90,7 +90,7 @@ pub enum HitPick {
 
 #[derive(Params)]
 pub struct BloaterParams {
-    #[persist = "editor-state"]
+    #[persist = "editor-state-2"]
     pub editor_state: Arc<ViziaState>,
     /// JSON of the last analysed reference (`reference::ReferenceData`), kept with the project.
     #[persist = "reference"]

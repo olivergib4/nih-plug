@@ -14,8 +14,8 @@ use crate::analysis::{Report, BANDS, LEVEL_WINS_MS, RAIL_WINS_MS};
 use crate::reference::ReferenceData;
 use crate::{BloaterParams, Control, Snapshot};
 
-const GUI_WIDTH: u32 = 1000;
-const GUI_HEIGHT: u32 = 1240;
+const GUI_WIDTH: u32 = 1316;
+const GUI_HEIGHT: u32 = 1000;
 const LABEL_W: f32 = 108.0;
 const SLIDER_W: f32 = 176.0;
 
@@ -449,20 +449,27 @@ pub(crate) fn create(
                     row(cx, "Ratio", |p| &p.lev_ratio);
                     row(cx, "Attack", |p| &p.lev_att);
                     row(cx, "Release", |p| &p.lev_rel);
-                    section(cx, "Sub split");
-                    toggle_row(cx, "Sub split", |p| &p.sub);
-                    row(cx, "Crossover", |p| &p.sub_hz);
-                    row(cx, "Sub ceiling", |p| &p.sub_ceil);
-                    section(cx, "Attack EQ (only after each hit)");
+                })
+                .width(Pixels(LABEL_W + SLIDER_W + 20.0))
+                .row_between(Pixels(2.0))
+                .class("panel");
+
+                // ---- controls, second column ----
+                VStack::new(cx, |cx| {
+                    section(cx, "Attack EQ (only in a window after each hit)");
                     toggle_row(cx, "Attack EQ", |p| &p.heq);
-                    row(cx, "Trigger within (of loudest hit)", |p| &p.heq_thr);
+                    row(cx, "Trigger within", |p| &p.heq_thr);
                     row(cx, "Start after hit", |p| &p.heq_start);
                     row(cx, "Length", |p| &p.heq_len);
                     row(cx, "Bell freq", |p| &p.heq_bell_hz);
                     row(cx, "Bell gain", |p| &p.heq_bell_db);
                     row(cx, "Shelf freq", |p| &p.heq_shelf_hz);
                     row(cx, "Shelf gain", |p| &p.heq_shelf_db);
-                    section(cx, "Hit detection");
+                    section(cx, "Sub split");
+                    toggle_row(cx, "Sub split", |p| &p.sub);
+                    row(cx, "Crossover", |p| &p.sub_hz);
+                    row(cx, "Sub ceiling", |p| &p.sub_ceil);
+                    section(cx, "Hit detection (meters)");
                     row(cx, "Sensitivity", |p| &p.sens);
                     row(cx, "Profile", |p| &p.pick);
                     toggle_row(cx, "Per playback", |p| &p.per_play);

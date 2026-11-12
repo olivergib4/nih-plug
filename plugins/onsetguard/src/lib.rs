@@ -29,6 +29,7 @@ use triple_buffer::TripleBuffer;
 pub mod analysis;
 pub mod dsp;
 mod editor;
+pub mod guard;
 pub mod reference;
 
 use analysis::{Analyzer, HitKind, HitProfile, Report};

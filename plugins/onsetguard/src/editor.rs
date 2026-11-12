@@ -10,7 +10,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::analysis::{Report, BANDS, LEVEL_WINS_MS, RAIL_WINS_MS};
+use crate::analysis::{room_left, Report, BANDS, LEVEL_WINS_MS, RAIL_WINS_MS};
+use crate::guard::{gauges, Gauge, Status, NGAUGES};
 use crate::reference::ReferenceData;
 use crate::{BloaterParams, Control, Snapshot};
 
@@ -36,6 +37,8 @@ pub struct Data {
     pub reference: Option<ReferenceData>,
     pub ref_status: String,
     pub rows: Vec<Row>,
+    pub gauges: Vec<Gauge>,
+    pub details: bool,
     pub busy: bool,
     pub tick: u64,
 }
@@ -46,6 +49,7 @@ pub enum Msg {
     ReferenceDone(Result<ReferenceData, String>),
     ClearReference,
     ResetStats,
+    ToggleDetails,
 }
 
 fn fmt(v: f32, digits: usize, unit: &str) -> String {
@@ -93,6 +97,24 @@ fn rows(live: &Report, reference: Option<&Report>) -> Vec<Row> {
         push(&format!("level {}", BANDS[b].0), &move |r| r.band_all_db[b], 1, " dB");
     }
     push("clap 5-10k at 25-60 ms", &|r| r.tail_db, 1, " dB");
+    // guard rails (NaN for references stored before these were measured)
+    let g = |r: &Report, v: f32| if r.guard { v } else { f32::NAN };
+    push("sub crest (ceiling = 1.00)", &|r| g(r, r.sub_crest), 2, "");
+    push("sub flattened per second", &|r| g(r, r.sub_flat_per_s), 1, "");
+    for b in 2..BANDS.len() {
+        push(&format!("width at hits {}", BANDS[b].0), &move |r| g(r, r.width_hits_db[b]), 1, " dB");
+    }
+    for b in 1..BANDS.len() {
+        push(&format!("width between {}", BANDS[b].0), &move |r| g(r, r.width_rest_db[b]), 1, " dB");
+    }
+    for b in 1..BANDS.len() {
+        let name = format!("room left {}", BANDS[b].0);
+        let v = match reference {
+            Some(r) if live.measured_s >= 1.0 => room_left(live, r, b),
+            _ => f32::NAN,
+        };
+        out.push(Row { name, live: fmt(v, 1, " dB"), reference: String::new(), delta: String::new() });
+    }
     out
 }
 
@@ -105,14 +127,26 @@ impl Model for Data {
                 self.tick = self.tick.wrapping_add(1);
                 // the table only needs ~10 updates a second
                 if self.tick % 3 == 0 {
-                    self.rows = rows(&s.report, self.reference.as_ref().map(|r| &r.report));
+                    let reference = self.reference.as_ref().map(|r| &r.report);
+                    if self.details {
+                        self.rows = rows(&s.report, reference);
+                    }
+                    let g = gauges(&s.report, reference).to_vec();
+                    if g != self.gauges {
+                        self.gauges = g;
+                    }
                 }
+            }
+            Msg::ToggleDetails => {
+                self.details = !self.details;
+                self.rows = rows(&self.live.report, self.reference.as_ref().map(|r| &r.report));
             }
             Msg::ResetStats => {
                 self.control.reset_stats.store(true, Ordering::Relaxed);
             }
             Msg::ClearReference => {
                 self.reference = None;
+                self.gauges = gauges(&self.live.report, None).to_vec();
                 *self.params.reference_json.lock().unwrap() = String::new();
                 self.ref_status = "no reference".into();
             }
@@ -142,6 +176,7 @@ impl Model for Data {
                     }
                     self.reference = Some(r.clone());
                     self.rows = rows(&self.live.report, Some(&r.report));
+                    self.gauges = gauges(&self.live.report, Some(&r.report)).to_vec();
                 }
                 Err(msg) if msg.starts_with("analysing") => {
                     self.ref_status = msg.clone();
@@ -170,6 +205,61 @@ fn pick_file() -> Option<std::path::PathBuf> {
 
 /// The hit profile graph: clap level per window (left) and rail share per window (right), live
 /// median filled, latest hit outlined, reference as a marker line per bar.
+/// One gauge bar of the simple view: a track, the target zone and a marker coloured by status.
+pub struct GaugeBar {
+    index: usize,
+}
+
+impl GaugeBar {
+    pub fn new(cx: &mut Context, index: usize) -> Handle<'_, Self> {
+        Self { index }.build(cx, |cx| {
+            Binding::new(cx, Data::tick, |cx, _| cx.needs_redraw());
+        })
+    }
+}
+
+fn status_color(s: Status) -> vg::Color {
+    match s {
+        Status::Idle => vg::Color::rgbaf(0.45, 0.45, 0.47, 1.0),
+        Status::Ok => vg::Color::rgbaf(0.36, 0.78, 0.47, 1.0),
+        Status::Warn => vg::Color::rgbaf(0.95, 0.72, 0.25, 1.0),
+        Status::Bad => vg::Color::rgbaf(0.92, 0.36, 0.33, 1.0),
+    }
+}
+
+impl View for GaugeBar {
+    fn element(&self) -> Option<&'static str> {
+        Some("gaugebar")
+    }
+
+    fn draw(&self, cx: &mut DrawContext, canvas: &mut Canvas) {
+        let b = cx.bounds();
+        if b.w <= 0.0 || b.h <= 0.0 {
+            return;
+        }
+        let all = Data::gauges.get(cx);
+        let Some(g) = all.get(self.index) else { return };
+        let (y, h) = (b.y + b.h * 0.25, b.h * 0.5);
+        let mut track = vg::Path::new();
+        track.rounded_rect(b.x, y, b.w, h, 3.0);
+        canvas.fill_path(&track, &vg::Paint::color(vg::Color::rgbaf(0.08, 0.08, 0.09, 1.0)));
+        if g.zone.1 > g.zone.0 {
+            let mut zone = vg::Path::new();
+            zone.rect(b.x + b.w * g.zone.0, y, b.w * (g.zone.1 - g.zone.0), h);
+            canvas.fill_path(&zone, &vg::Paint::color(vg::Color::rgbaf(0.36, 0.78, 0.47, 0.28)));
+        }
+        let mut border = vg::Path::new();
+        border.rounded_rect(b.x, y, b.w, h, 3.0);
+        canvas.stroke_path(&border, &vg::Paint::color(vg::Color::rgbaf(0.3, 0.3, 0.32, 1.0)).with_line_width(1.0));
+        if !g.pos.is_nan() {
+            let x = (b.x + b.w * g.pos).clamp(b.x + 3.0, b.x + b.w - 3.0);
+            let mut m = vg::Path::new();
+            m.rounded_rect(x - 3.0, b.y + 1.0, 6.0, b.h - 2.0, 2.0);
+            canvas.fill_path(&m, &vg::Paint::color(status_color(g.status)));
+        }
+    }
+}
+
 pub struct ProfileGraph;
 
 impl ProfileGraph {
@@ -395,6 +485,8 @@ pub(crate) fn create(
             snap: snap.clone(),
             live: Snapshot::default(),
             rows: rows(&Report::default(), reference.as_ref().map(|r| &r.report)),
+            gauges: gauges(&Report::default(), reference.as_ref().map(|r| &r.report)).to_vec(),
+            details: false,
             reference,
             ref_status,
             busy: false,
@@ -523,23 +615,40 @@ pub(crate) fn create(
                     .height(Pixels(18.0))
                     .col_between(Pixels(14.0));
 
-                    // table
-                    HStack::new(cx, |cx| {
-                        Label::new(cx, "metric").class("th").width(Pixels(210.0));
-                        Label::new(cx, "live").class("th").width(Pixels(110.0));
-                        Label::new(cx, "reference").class("th").width(Pixels(110.0));
-                        Label::new(cx, "live − ref").class("th").width(Pixels(110.0));
-                    })
-                    .height(Pixels(18.0))
-                    .top(Pixels(6.0));
-                    List::new(cx, Data::rows, |cx, _, item| {
+                    // simple view: six gauges against the loaded reference
+                    Label::new(cx, "Where the mix stands against the reference (green zone = target)").class("section").top(Pixels(8.0));
+                    for i in 0..NGAUGES {
                         HStack::new(cx, |cx| {
-                            Label::new(cx, item.map(|r| r.name.clone())).class("td").width(Pixels(210.0));
-                            Label::new(cx, item.map(|r| r.live.clone())).class("td").width(Pixels(110.0));
-                            Label::new(cx, item.map(|r| r.reference.clone())).class("td").class("ref").width(Pixels(110.0));
-                            Label::new(cx, item.map(|r| r.delta.clone())).class("td").width(Pixels(110.0));
+                            Label::new(cx, Data::gauges.map(move |g| g.get(i).map(|x| x.name).unwrap_or("").to_string())).class("gname").width(Pixels(110.0));
+                            GaugeBar::new(cx, i).width(Pixels(250.0)).height(Pixels(22.0));
+                            Label::new(cx, Data::gauges.map(move |g| g.get(i).map(|x| x.text.clone()).unwrap_or_default())).class("gtext").left(Pixels(12.0));
                         })
-                        .height(Pixels(17.0));
+                        .height(Pixels(26.0));
+                    }
+                    Binding::new(cx, Data::details, |cx, details| {
+                        if details.get(cx) {
+                            VStack::new(cx, |cx| {
+                            // table
+                            HStack::new(cx, |cx| {
+                                Label::new(cx, "metric").class("th").width(Pixels(210.0));
+                                Label::new(cx, "live").class("th").width(Pixels(110.0));
+                                Label::new(cx, "reference").class("th").width(Pixels(110.0));
+                                Label::new(cx, "live − ref").class("th").width(Pixels(110.0));
+                            })
+                            .height(Pixels(18.0))
+                            .top(Pixels(6.0));
+                            List::new(cx, Data::rows, |cx, _, item| {
+                                HStack::new(cx, |cx| {
+                                    Label::new(cx, item.map(|r| r.name.clone())).class("td").width(Pixels(210.0));
+                                    Label::new(cx, item.map(|r| r.live.clone())).class("td").width(Pixels(110.0));
+                                    Label::new(cx, item.map(|r| r.reference.clone())).class("td").class("ref").width(Pixels(110.0));
+                                    Label::new(cx, item.map(|r| r.delta.clone())).class("td").width(Pixels(110.0));
+                                })
+                                .height(Pixels(17.0));
+                            });
+                            })
+                            .height(Auto);
+                        }
                     });
 
                     // reference + actions
@@ -547,6 +656,7 @@ pub(crate) fn create(
                         Button::new(cx, |cx| cx.emit(Msg::LoadReference), |cx| Label::new(cx, "Load reference…"));
                         Button::new(cx, |cx| cx.emit(Msg::ClearReference), |cx| Label::new(cx, "Clear"));
                         Button::new(cx, |cx| cx.emit(Msg::ResetStats), |cx| Label::new(cx, "Reset stats"));
+                        Button::new(cx, |cx| cx.emit(Msg::ToggleDetails), |cx| Label::new(cx, Data::details.map(|d| if *d { "Hide details" } else { "Details" })));
                         Label::new(cx, Data::ref_status).class("sub").top(Pixels(6.0)).left(Pixels(8.0));
                     })
                     .height(Pixels(30.0))

@@ -129,13 +129,43 @@ pub struct Report {
     /// Seconds of non-silent audio the statistics cover.
     #[serde(default)]
     pub measured_s: f32,
+    /// True when the guard-rail fields below were measured (false for references stored by older versions).
+    #[serde(default)]
+    pub guard: bool,
+    /// Side level minus mid level per band, dB, inside the 150 ms after hits (width at the hits).
+    #[serde(default)]
+    pub width_hits_db: [f32; NBANDS],
+    /// Side level minus mid level per band, dB, between hits.
+    #[serde(default)]
+    pub width_rest_db: [f32; NBANDS],
+    /// Sub crest between hits: 95th percentile of |mid below 120 Hz|, as a share of full scale.
+    #[serde(default)]
+    pub sub_crest: f32,
+    /// Between hits: how often per second the output sits at the ceiling for 1 ms or longer (only a
+    /// low-frequency wave can hold it there that long, so this counts the sub being flattened).
+    #[serde(default)]
+    pub sub_flat_per_s: f32,
 }
 
 impl Report {
     pub fn band_delta(&self, b: usize) -> f32 {
         self.band_hits_db[b] - self.band_rest_db[b]
     }
+    /// How far the bed (between hits) in band `b` sits below the full-band level of the hits, dB.
+    pub fn bed_under_drums(&self, b: usize) -> f32 {
+        self.band_hits_db[0] - self.band_rest_db[b]
+    }
 }
+
+/// Room left in band `b` before the bed is as close to the drums as in the reference, dB (negative = over).
+pub fn room_left(live: &Report, reference: &Report, b: usize) -> f32 {
+    live.bed_under_drums(b) - reference.bed_under_drums(b)
+}
+
+pub const SUB_HIST: usize = 128;
+/// Bins per unit of full scale in the sub-crest histogram.
+pub const SUB_HIST_SCALE: f32 = 64.0;
+pub const SUB_FLAT_MS: f32 = 1.0;
 
 #[derive(Clone, Copy)]
 struct Pending {
@@ -186,11 +216,15 @@ pub struct Analyzer {
     rail: Vec<u8>,
     silent: Vec<u8>,
     band_sq: Vec<[f32; NBANDS]>,
+    side_sq: Vec<[f32; NBANDS]>,
+    sub_abs: Vec<f32>,
     spread_pow: Vec<f32>,
     // filters (mid channel unless noted)
     hf: SosChain,
     mf: SosChain,
     bands: [SosChain; NBANDS - 1],
+    side_bands: [SosChain; NBANDS - 1],
+    sub: SosChain,
     tail: SosChain,
     spread_l: SosChain,
     spread_r: SosChain,
@@ -214,6 +248,11 @@ pub struct Analyzer {
     // accumulators
     hits_pow: [f64; NBANDS],
     rest_pow: [f64; NBANDS],
+    hits_side: [f64; NBANDS],
+    rest_side: [f64; NBANDS],
+    sub_hist: [u32; SUB_HIST],
+    flat_run: usize,
+    flat_runs: u64,
     hits_n: u64,
     rest_n: u64,
     hits_rail: u64,
@@ -392,6 +431,12 @@ impl Analyzer {
             bp(BANDS[3].1, BANDS[3].2),
             bp(BANDS[4].1, BANDS[4].2),
         ];
+        let side_bands = [
+            bp(BANDS[1].1, BANDS[1].2),
+            bp(BANDS[2].1, BANDS[2].2),
+            bp(BANDS[3].1, BANDS[3].2),
+            bp(BANDS[4].1, BANDS[4].2),
+        ];
         let sone_len = (GRID_WINDOW_S * sample_rate) as usize / SONE_HOP + 2;
         Analyzer {
             sr: sample_rate,
@@ -407,10 +452,14 @@ impl Analyzer {
             rail: vec![0; lring],
             silent: vec![1; lring],
             band_sq: vec![[0.0; NBANDS]; lring],
+            side_sq: vec![[0.0; NBANDS]; lring],
+            sub_abs: vec![0.0; lring],
             spread_pow: vec![0.0; lring],
             hf: bp(2000.0, 8000.0),
             mf: bp(500.0, 8000.0),
             bands,
+            side_bands,
+            sub: bp(15.0, 120.0),
             tail: bp(5000.0, 10000.0),
             spread_l: bp(500.0, 6000.0),
             spread_r: bp(500.0, 6000.0),
@@ -431,6 +480,11 @@ impl Analyzer {
             acc_upto: 0,
             hits_pow: [0.0; NBANDS],
             rest_pow: [0.0; NBANDS],
+            hits_side: [0.0; NBANDS],
+            rest_side: [0.0; NBANDS],
+            sub_hist: [0; SUB_HIST],
+            flat_run: 0,
+            flat_runs: 0,
             hits_n: 0,
             rest_n: 0,
             hits_rail: 0,
@@ -478,12 +532,20 @@ impl Analyzer {
         for b in &mut self.band_sq {
             *b = [0.0; NBANDS];
         }
+        for b in &mut self.side_sq {
+            *b = [0.0; NBANDS];
+        }
+        self.sub_abs.fill(0.0);
         self.spread_pow.fill(0.0);
         self.hf.reset();
         self.mf.reset();
         for b in &mut self.bands {
             b.reset();
         }
+        for b in &mut self.side_bands {
+            b.reset();
+        }
+        self.sub.reset();
         self.tail.reset();
         self.spread_l.reset();
         self.spread_r.reset();
@@ -508,6 +570,11 @@ impl Analyzer {
         self.period_s = 0.0;
         self.hits_pow = [0.0; NBANDS];
         self.rest_pow = [0.0; NBANDS];
+        self.hits_side = [0.0; NBANDS];
+        self.rest_side = [0.0; NBANDS];
+        self.sub_hist = [0; SUB_HIST];
+        self.flat_run = 0;
+        self.flat_runs = 0;
         self.hits_n = 0;
         self.rest_n = 0;
         self.hits_rail = 0;
@@ -579,6 +646,16 @@ impl Analyzer {
             sq[k + 1] = y * y;
         }
         self.band_sq[li] = sq;
+        // side channel per band (width) and the sub alone (crest against the ceiling)
+        let sd = 0.5 * (l - r);
+        let mut ssq = [0.0f32; NBANDS];
+        ssq[0] = sd * sd;
+        for (k, b) in self.side_bands.iter_mut().enumerate() {
+            let y = b.process(sd as f64) as f32;
+            ssq[k + 1] = y * y;
+        }
+        self.side_sq[li] = ssq;
+        self.sub_abs[li] = (self.sub.process(md) as f32).abs();
         let t = self.tail.process(md) as f32;
         self.tail_sq[si] = t * t;
         let sl = self.spread_l.process(l as f64) as f32;
@@ -848,24 +925,38 @@ impl Analyzer {
             }
             self.lm_sum -= old;
         }
+        let in_hit = a < self.mask_until;
+        // stretches at the ceiling of 1 ms or longer that end between hits: the sub being flattened
+        if self.rail[i] != 0 {
+            self.flat_run += 1;
+        } else {
+            if self.flat_run >= self.ms(SUB_FLAT_MS) && !in_hit {
+                self.flat_runs += 1;
+            }
+            self.flat_run = 0;
+        }
         if self.silent[i] != 0 {
             return;
         }
-        let in_hit = a < self.mask_until;
         let sq = self.band_sq[i];
+        let ssq = self.side_sq[i];
         let rl = self.rail[i] as u64;
         if in_hit {
             for b in 0..NBANDS {
                 self.hits_pow[b] += sq[b] as f64;
+                self.hits_side[b] += ssq[b] as f64;
             }
             self.hits_n += 1;
             self.hits_rail += rl;
         } else {
             for b in 0..NBANDS {
                 self.rest_pow[b] += sq[b] as f64;
+                self.rest_side[b] += ssq[b] as f64;
             }
             self.rest_n += 1;
             self.rest_rail += rl;
+            let k = ((self.sub_abs[i] * SUB_HIST_SCALE) as usize).min(SUB_HIST - 1);
+            self.sub_hist[k] += 1;
         }
     }
 
@@ -980,6 +1071,26 @@ impl Analyzer {
         r.pinned_rest_pct = 100.0 * self.rest_rail as f32 / self.rest_n.max(1) as f32;
         let ms = self.sone_sum / self.sone_n.max(1) as f64;
         r.phon = if ms > 1e-4 { (40.0 + 10.0 * ms.log2()) as f32 } else { 0.0 };
+        // guard rails
+        r.guard = true;
+        for b in 0..NBANDS {
+            r.width_hits_db[b] = if self.hits_n > 0 { db_pow(self.hits_side[b] / self.hits_n as f64) - r.band_hits_db[b] } else { f32::NAN };
+            r.width_rest_db[b] = if self.rest_n > 0 { db_pow(self.rest_side[b] / self.rest_n as f64) - r.band_rest_db[b] } else { f32::NAN };
+        }
+        let total: u64 = self.sub_hist.iter().map(|&c| c as u64).sum();
+        r.sub_crest = f32::NAN;
+        if total >= 1000 {
+            let want = (0.95 * total as f64) as u64;
+            let mut acc = 0u64;
+            for (k, &c) in self.sub_hist.iter().enumerate() {
+                acc += c as u64;
+                if acc >= want {
+                    r.sub_crest = (k as f32 + 0.5) / SUB_HIST_SCALE;
+                    break;
+                }
+            }
+        }
+        r.sub_flat_per_s = if self.rest_n as f32 > self.sr { self.flat_runs as f32 / (self.rest_n as f32 / self.sr) } else { f32::NAN };
         r
     }
 }

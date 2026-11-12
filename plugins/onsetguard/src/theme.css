@@ -29,6 +29,18 @@
 .legend {
   font-size: 11;
 }
+.gname {
+  font-size: 13;
+  color: #e6e4dc;
+  top: 1s;
+  bottom: 1s;
+}
+.gtext {
+  font-size: 13;
+  color: #e6e4dc;
+  top: 1s;
+  bottom: 1s;
+}
 .th {
   font-size: 11;
   color: #9a9a9a;

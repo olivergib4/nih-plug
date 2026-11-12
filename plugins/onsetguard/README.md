@@ -35,6 +35,24 @@ the master (Master mode, drive set last to the pinned share you want).
 | Hit detection | Sensitivity | Onset detector threshold for the analyser. |
 | | Profile | Loud HF hits (claps/snares: hits within 6 dB of the loudest recent 2–8 kHz level) or all hits. |
 
+## Simple view (default)
+
+Six gauges, each a bar with a green target zone taken from the loaded reference and a marker for
+the current pass. Play the drop once; the words next to each bar say what to do.
+
+| Gauge | What it compares with the reference | Reads |
+|---|---|---|
+| DRUMS | How often the output is pinned during hits | on target / hot into the master / soft |
+| GROWL LOW, MID, HIGH | How close the bed between hits (250-1k, 1-4k, 4-10k) sits to the drums | on target / N dB over / N dB room |
+| SUB | Sub crest between hits (level below 120 Hz against the ceiling) | at the reference level / over: being flattened / room |
+| LOUDNESS | Mean loudness in phon | on target / louder / quieter |
+
+"Over" on a growl gauge means that band of the bed is closer to the drums than in the reference by
+that many dB, so the drums stand out less; "room" means it can come up by that much first. The
+gauges need a reference and at least 3 s of a pass. **Details** shows the full table below, which
+also has the room per band, the sub crest and flattening rate, and stereo width (side minus mid)
+per band at hits and between hits.
+
 ## Readouts
 
 All measured on the clipped output, mid channel unless noted, silence excluded.

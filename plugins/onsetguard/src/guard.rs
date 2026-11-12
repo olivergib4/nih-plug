@@ -87,9 +87,16 @@ pub fn gauges(live: &Report, reference: Option<&Report>) -> [Gauge; NGAUGES] {
         idle(NAMES[4], "no sub measured")
     } else {
         let over = 20.0 * (live.sub_crest / r.sub_crest).log10();
+        // Once the sub is clipped its measured crest stops rising, so how often the low end is held flat at
+        // the ceiling (against the reference) is the second sign of it being pushed too far.
         let flattened = live.sub_flat_per_s > 2.0 * r.sub_flat_per_s + 2.0;
+        let crushed = live.sub_flat_per_s > 6.0 * r.sub_flat_per_s + 10.0;
         let (status, text) = if over > 1.5 || (over > 0.5 && flattened) {
             (Status::Bad, format!("{:.0} dB over: being flattened", over.max(1.0)))
+        } else if crushed {
+            (Status::Bad, "low end flattened far more than the reference".to_string())
+        } else if flattened {
+            (Status::Warn, "low end flattened more than the reference".to_string())
         } else if over > 0.5 {
             (Status::Warn, format!("{:.0} dB over", over.max(1.0)))
         } else if over >= -1.5 {
@@ -172,6 +179,20 @@ mod tests {
         assert_eq!(g[4].text, "ok, 2 dB room");
         assert_eq!(g[5].text, "1.3 phon quieter");
         assert!(g.iter().all(|x| x.status == Status::Ok));
+    }
+
+    #[test]
+    fn a_flattened_low_end_is_flagged_even_when_the_crest_matches() {
+        // measured: same crest as the reference (1.09 against 1.10) but held flat 73 times a second against 8.5
+        let mut r = rep(-3.0, [-15.0, -17.0, -24.0], 35.0, 1.09, 109.3);
+        r.sub_flat_per_s = 8.5;
+        let mut live = rep(-3.0, [-15.0, -17.0, -24.0], 35.0, 1.10, 109.3);
+        live.sub_flat_per_s = 73.4;
+        assert_eq!(gauges(&live, Some(&r))[4].status, Status::Bad);
+        live.sub_flat_per_s = 25.0;
+        assert_eq!(gauges(&live, Some(&r))[4].status, Status::Warn);
+        live.sub_flat_per_s = 12.0;
+        assert_eq!(gauges(&live, Some(&r))[4].status, Status::Ok);
     }
 
     #[test]

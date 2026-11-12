@@ -315,27 +315,58 @@ pub fn on_grid(t: f32, period: f32, phase: f32) -> bool {
 
 /// For a locked period, the phase bin (20 ms) whose hits are brightest among the bins that
 /// collect at least 60 % of the best count. Returns the chosen phase.
-pub fn brightest_phase(times: &[f32], hfs: &[f32], period: f32, best_count: usize, best_phase: f32) -> f32 {
+///
+/// `hfs` is the 2-8 kHz level of the first 25 ms of each hit; `tails` is its 5-10 kHz level at
+/// 25-60 ms (NaN while a hit is not measured yet). A kick layered with a bright zap can match the
+/// clap in the first 25 ms, but only the clap stays bright afterwards, so the tail decides when every
+/// candidate phase has at least two measured hits; otherwise the first 25 ms decide.
+pub fn brightest_phase(times: &[f32], hfs: &[f32], tails: &[f32], period: f32, best_count: usize, best_phase: f32) -> f32 {
     let nbins = ((period / GRID_BIN_S) as usize + 1).min(128);
     let mut count = [0u16; 128];
     let mut hf_sum = [0.0f32; 128];
-    for (&t, &h) in times.iter().zip(hfs) {
+    let mut tail_n = [0u16; 128];
+    let mut tail_sum = [0.0f32; 128];
+    for ((&t, &h), &tl) in times.iter().zip(hfs).zip(tails) {
         let k = (((t.rem_euclid(period)) / period) * nbins as f32) as usize;
         let k = k.min(nbins - 1);
         count[k] += 1;
         hf_sum[k] += h;
+        if tl.is_finite() {
+            tail_n[k] += 1;
+            tail_sum[k] += tl;
+        }
     }
+    // A phase can straddle two bins (the fitted period is never exact, so a phase drifts by a few ms over the
+    // window), so each candidate is a bin together with its two neighbours.
+    let at = |v: &[u16; 128], k: usize| v[(k + nbins - 1) % nbins] + v[k] + v[(k + 1) % nbins];
+    let atf = |v: &[f32; 128], k: usize| v[(k + nbins - 1) % nbins] + v[k] + v[(k + 1) % nbins];
     let min_count = ((best_count as f32) * 0.6).ceil().max(GRID_MIN_HITS as f32) as u16;
-    let mut best = (f32::NEG_INFINITY, best_phase);
+    let use_tail = (0..nbins).filter(|&k| at(&count, k) >= min_count).all(|k| at(&tail_n, k) >= 2);
+    let mut best = (f32::NEG_INFINITY, 0u16, usize::MAX);
     for k in 0..nbins {
-        if count[k] >= min_count {
-            let mean = hf_sum[k] / count[k] as f32;
-            if mean > best.0 {
-                best = (mean, (k as f32 + 0.5) * period / nbins as f32);
+        let c = at(&count, k);
+        if c >= min_count {
+            let mean = if use_tail { atf(&tail_sum, k) / at(&tail_n, k) as f32 } else { atf(&hf_sum, k) / c as f32 };
+            // brighter wins; among equally bright neighbours (the same hits seen from the next bin), the fuller
+            if mean > best.0 + 0.5 || (mean > best.0 - 0.5 && c > best.1) {
+                best = (mean.max(best.0), c, k);
             }
         }
     }
-    best.1
+    if best.2 == usize::MAX {
+        return best_phase;
+    }
+    // phase = mean position of the hits in the chosen bins, measured from the middle bin's centre
+    let centre = (best.2 as f32 + 0.5) * period / nbins as f32;
+    let (mut acc, mut m) = (0.0f32, 0u32);
+    for &t in times {
+        let d = (t - centre + period / 2.0).rem_euclid(period) - period / 2.0;
+        if d.abs() <= 1.5 * period / nbins as f32 {
+            acc += d;
+            m += 1;
+        }
+    }
+    (centre + if m > 0 { acc / m as f32 } else { 0.0 }).rem_euclid(period)
 }
 
 impl Analyzer {
@@ -713,12 +744,14 @@ impl Analyzer {
         }
         let mut times = [0.0f32; MAX_HITS];
         let mut hfs = [0.0f32; MAX_HITS];
+        let mut tails = [f32::NAN; MAX_HITS];
         let mut n = 0;
         for k in lo..hi {
             let h = self.hit(k);
             if h.kind_auto && h.at >= t0 && h.hf_db >= hf_max - GRID_HF_RANGE_DB {
                 times[n] = h.at as f32 / self.sr;
                 hfs[n] = h.hf_db;
+                tails[n] = if h.evaluated { h.tail_db } else { f32::NAN };
                 n += 1;
             }
         }
@@ -727,7 +760,7 @@ impl Analyzer {
             let locked = count >= GRID_MIN_HITS;
             // among the phases of that period that collect nearly as many hits, take the
             // brightest (the clap/snare, not the kick/zap on the other beat)
-            let phase = if locked { brightest_phase(&times[..n], &hfs[..n], period, count, phase) } else { phase };
+            let phase = if locked { brightest_phase(&times[..n], &hfs[..n], &tails[..n], period, count, phase) } else { phase };
             self.period_s = if locked { period } else { 0.0 };
             for k in lo..hi {
                 let sr = self.sr;
@@ -1036,6 +1069,30 @@ mod tests {
         let r = an.report();
         assert!(r.spread_db.is_finite() && r.spread_db < 3.0, "{}", r.spread_db);
         assert!(r.lowmid_peak_db.is_finite() && r.lowmid_peak_db < 3.0, "{}", r.lowmid_peak_db);
+    }
+
+    #[test]
+    fn brightest_phase_handles_drift_and_bright_kicks() {
+        // period 1.654 s; kicks at phase ~0.667 (steady), claps at phase 1.487..1.500 (drifting over a bin edge)
+        let period = 1.654f32;
+        let (mut times, mut hfs, mut tails) = (vec![], vec![], vec![]);
+        for i in 0..12 {
+            let base = 5.0 + i as f32 * 1.6552;
+            times.push(base);
+            hfs.push(-6.0); // kick with a zap: as bright as the clap at first
+            tails.push(-25.0);
+            times.push(base + 0.8276);
+            hfs.push(-6.0);
+            tails.push(-11.0);
+        }
+        let kick_phase = times[0].rem_euclid(period);
+        let ph = brightest_phase(&times, &hfs, &tails, period, 12, kick_phase);
+        let clap_phase = times[1].rem_euclid(period);
+        let d = (ph - clap_phase + period / 2.0).rem_euclid(period) - period / 2.0;
+        assert!(d.abs() < 0.02, "picked {ph}, clap at {clap_phase}, kick at {kick_phase}");
+        for (i, &t) in times.iter().enumerate() {
+            assert_eq!(on_grid(t, period, ph), i % 2 == 1, "hit {i}");
+        }
     }
 
     #[test]

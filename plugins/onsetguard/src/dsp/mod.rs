@@ -4,5 +4,6 @@ pub mod butter;
 pub mod eq;
 pub mod hiteq;
 pub mod onset;
+pub mod oversample;
 pub mod sone;
 pub mod spectrum;

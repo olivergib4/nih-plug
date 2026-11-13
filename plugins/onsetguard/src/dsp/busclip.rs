@@ -3,9 +3,15 @@
 //! into it (drive, band leveler, tilt/bell EQ, optional sub split). Zero latency.
 //!
 //! Signal path: [attack EQ] → drive → EQ (tilt + bell) → band leveler → [soft knee] → [sub split] → hard clip 0 dBFS.
+//!
+//! With `os_on` the soft knee, sub split and hard clip run at 4x the sample rate (minimum-phase
+//! filters, so no pre-ringing), followed by a plain ceiling at the base rate for the few samples
+//! the down-conversion pushes back over. Clipping above the base rate keeps the distortion from
+//! folding back into the audible band and stops bright material being held dead flat.
 
 use crate::dsp::eq::{EqSettings, PreEq};
 use crate::dsp::hiteq::{HitEq, HitEqSettings};
+use crate::dsp::oversample::{Oversampler, OS};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BusSettings {
@@ -35,6 +41,8 @@ pub struct BusSettings {
     pub soft_push_db: f32,
     /// Attack EQ (acts only in a window after each hit); first in the chain.
     pub hit_eq: HitEqSettings,
+    /// Run the clip stage (soft knee, sub split, hard clip) at 4x the sample rate.
+    pub os_on: bool,
 }
 
 impl Default for BusSettings {
@@ -61,6 +69,7 @@ impl Default for BusSettings {
             soft_knee: 0.5,
             soft_push_db: 0.2,
             hit_eq: HitEqSettings::default(),
+            os_on: false,
         }
     }
 }
@@ -164,6 +173,9 @@ pub struct BusClip {
     lev_rel: f32,
     // sub split
     sub_x: [Lr4; MAX_CH],
+    // 4x path: converters and the sub split at the higher rate
+    os: [Oversampler; MAX_CH],
+    sub_x_os: [Lr4; MAX_CH],
     // smoothed drive
     drive_lin: f32,
     drive_target: f32,
@@ -190,6 +202,8 @@ impl BusClip {
             lev_att: 0.0,
             lev_rel: 0.0,
             sub_x: [Lr4::new(sr, s.sub_hz as f64); MAX_CH],
+            os: [Oversampler::default(), Oversampler::default()],
+            sub_x_os: [Lr4::new(sr * OS as f64, s.sub_hz as f64); MAX_CH],
             drive_lin: 1.0,
             drive_target: 1.0,
             drive_coef: 1.0 - (-1.0f32 / (0.005 * sample_rate)).exp(),
@@ -205,8 +219,11 @@ impl BusClip {
     pub fn reset(&mut self) {
         self.eq.reset();
         self.hit_eq.reset();
-        for x in self.lev_lo.iter_mut().chain(self.lev_hi.iter_mut()).chain(self.sub_x.iter_mut()) {
+        for x in self.lev_lo.iter_mut().chain(self.lev_hi.iter_mut()).chain(self.sub_x.iter_mut()).chain(self.sub_x_os.iter_mut()) {
             x.clear();
+        }
+        for o in &mut self.os {
+            o.reset();
         }
         self.lev_env = 0.0;
         self.drive_lin = self.drive_target;
@@ -228,6 +245,9 @@ impl BusClip {
             for x in &mut self.sub_x {
                 *x = Lr4::new(sr, s.sub_hz.clamp(20.0, 500.0) as f64);
             }
+            for x in &mut self.sub_x_os {
+                *x = Lr4::new(sr * OS as f64, s.sub_hz.clamp(20.0, 500.0) as f64);
+            }
         }
         self.lev_att = 1.0 - (-1.0f32 / (s.lev_attack_ms.max(0.05) * 0.001 * self.sr)).exp();
         self.lev_rel = 1.0 - (-1.0f32 / (s.lev_release_ms.max(1.0) * 0.001 * self.sr)).exp();
@@ -239,6 +259,14 @@ impl BusClip {
         };
         self.eq.update(&eqs);
         self.hit_eq.update(&s.hit_eq);
+        if s.os_on != self.cur.os_on {
+            for o in &mut self.os {
+                o.reset();
+            }
+            for x in &mut self.sub_x_os {
+                x.clear();
+            }
+        }
         self.cur = *s;
     }
 
@@ -294,20 +322,19 @@ impl BusClip {
         let push = 10f32.powf(s.soft_push_db / 20.0);
         for i in 0..len {
             for ch in 0..nch {
-                let mut x = channels[ch][i];
+                let x = channels[ch][i];
                 peak = peak.max(x.abs());
-                if s.soft_on && s.clip_on {
-                    x = soft_knee(x, knee) * push;
-                }
                 let y = if !s.clip_on {
                     x
-                } else if s.sub_on {
-                    let (lo, hi) = self.sub_x[ch].split(x as f64);
-                    let lo = (lo as f32).clamp(-sub_ceil, sub_ceil);
-                    let hi = (hi as f32).clamp(-1.0, 1.0);
-                    (lo + hi).clamp(-1.0, 1.0)
+                } else if s.os_on {
+                    let mut u = self.os[ch].up(x);
+                    for v in u.iter_mut() {
+                        *v = clip_stage(*v, &s, knee, push, sub_ceil, &mut self.sub_x_os[ch]);
+                    }
+                    // the down-conversion overshoots a little: a plain ceiling at the base rate
+                    self.os[ch].down(u).clamp(-1.0, 1.0)
                 } else {
-                    x.clamp(-1.0, 1.0)
+                    clip_stage(x, &s, knee, push, sub_ceil, &mut self.sub_x[ch])
                 };
                 if y.abs() >= 0.999 {
                     pinned += 1;
@@ -317,6 +344,22 @@ impl BusClip {
         }
         self.in_peak = peak;
         self.out_pinned = if len > 0 { pinned as f32 / (len * nch.max(1)) as f32 } else { 0.0 };
+    }
+}
+
+/// Soft knee (optional) → sub split (optional) → hard clip at 0 dBFS, for one sample.
+#[inline]
+fn clip_stage(mut x: f32, s: &BusSettings, knee: f32, push: f32, sub_ceil: f32, sub_x: &mut Lr4) -> f32 {
+    if s.soft_on {
+        x = soft_knee(x, knee) * push;
+    }
+    if s.sub_on {
+        let (lo, hi) = sub_x.split(x as f64);
+        let lo = (lo as f32).clamp(-sub_ceil, sub_ceil);
+        let hi = (hi as f32).clamp(-1.0, 1.0);
+        (lo + hi).clamp(-1.0, 1.0)
+    } else {
+        x.clamp(-1.0, 1.0)
     }
 }
 
@@ -421,6 +464,53 @@ mod tests {
         let orig = l.clone();
         b.process(&mut [&mut l, &mut r], n);
         assert!(l.iter().zip(&orig).skip(1024).all(|(a, o)| (a - o * 10f32.powf(0.2 / 20.0)).abs() < 1e-3));
+    }
+
+    #[test]
+    fn oversampled_clip_keeps_the_ceiling_and_stops_dead_flat_runs() {
+        // a bright tone driven hard: at 1x it is held flat for whole half-cycles; at 4x it is not
+        let sr = 44100.0;
+        let n = 16384;
+        let longest_run = |os: bool| {
+            let mut s = BusSettings::default();
+            s.drive_db = 20.0;
+            s.os_on = os;
+            let mut b = BusClip::new(sr, 2);
+            b.update(&s);
+            b.reset();
+            let mut l = sine(7000.0, sr, n, 0.5);
+            let mut r = l.clone();
+            b.process(&mut [&mut l, &mut r], n);
+            assert!(l.iter().all(|v| v.abs() <= 1.0));
+            let (mut run, mut best, mut flat) = (0usize, 0usize, 0usize);
+            for v in &l[1024..] {
+                if v.abs() >= 0.9999 {
+                    run += 1;
+                    flat += 1;
+                    best = best.max(run);
+                } else {
+                    run = 0;
+                }
+            }
+            (best, flat as f32 / (n - 1024) as f32, rms(&l[1024..]))
+        };
+        let (run1, flat1, rms1) = longest_run(false);
+        let (run4, flat4, rms4) = longest_run(true);
+        assert!(flat1 > 0.8, "{flat1}");
+        assert!(flat4 < 0.6 * flat1, "{flat4} vs {flat1}");
+        assert!(run4 <= run1, "{run4} vs {run1}");
+        // loudness stays within about 2 dB
+        assert!((20.0 * (rms4 / rms1).log10()).abs() < 2.5, "{rms4} vs {rms1}");
+        // quiet material passes unchanged in level
+        let mut s = BusSettings::default();
+        s.os_on = true;
+        let mut b = BusClip::new(sr, 2);
+        b.update(&s);
+        b.reset();
+        let mut l = sine(1000.0, sr, n, 0.3);
+        let mut r = l.clone();
+        b.process(&mut [&mut l, &mut r], n);
+        assert!((20.0 * (rms(&l[2048..]) / (0.3 / 2f32.sqrt())).log10()).abs() < 0.1);
     }
 
     #[test]

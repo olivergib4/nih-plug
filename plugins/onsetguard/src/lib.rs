@@ -103,6 +103,8 @@ pub struct BloaterParams {
     pub drive: FloatParam,
     #[id = "clip"]
     pub clip: BoolParam,
+    #[id = "os"]
+    pub os: BoolParam,
     #[id = "soft"]
     pub soft: BoolParam,
     #[id = "soft_knee"]
@@ -197,6 +199,7 @@ impl Default for BloaterParams {
             mode: EnumParam::new("Mode", Mode::Bus),
             drive: db_param("Drive", 0.0, -12.0, 24.0),
             clip: BoolParam::new("Clip", true),
+            os: BoolParam::new("Oversample 4x", false),
             soft: BoolParam::new("Soft Stage", false),
             soft_knee: FloatParam::new("Soft Knee", 0.5, FloatRange::Linear { min: 0.1, max: 0.95 })
                 .with_step_size(0.01)
@@ -264,6 +267,7 @@ impl BloaterParams {
             soft_on: self.soft.value(),
             soft_knee: self.soft_knee.value(),
             soft_push_db: self.soft_push.value(),
+            os_on: self.os.value(),
             hit_eq: dsp::hiteq::HitEqSettings {
                 on: self.heq.value(),
                 thr_db: self.heq_thr.value(),

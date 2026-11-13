@@ -523,6 +523,7 @@ pub(crate) fn create(
                     section(cx, "Clip");
                     row(cx, "Mode", |p| &p.mode);
                     toggle_row(cx, "Clip", |p| &p.clip);
+                    toggle_row(cx, "Oversample 4x", |p| &p.os);
                     row(cx, "Drive", |p| &p.drive);
                     section(cx, "Soft stage before the clip");
                     toggle_row(cx, "Soft stage", |p| &p.soft);

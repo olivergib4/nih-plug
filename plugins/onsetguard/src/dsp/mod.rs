@@ -6,4 +6,5 @@ pub mod hiteq;
 pub mod onset;
 pub mod oversample;
 pub mod sone;
+pub mod space;
 pub mod spectrum;

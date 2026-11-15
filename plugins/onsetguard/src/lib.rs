@@ -35,6 +35,7 @@ pub mod reference;
 use analysis::{Analyzer, HitKind, HitProfile, Report};
 use dsp::busclip::{BusClip, BusSettings};
 use dsp::onset::OnsetDetector;
+use dsp::space::{Space, SpaceRole, SpaceSettings};
 use dsp::spectrum::{Spectrum, NPTS};
 
 /// Snapshot of the live analysis for the editor.
@@ -49,6 +50,9 @@ pub struct Snapshot {
     pub block_pinned: f32,
     pub lev_gr_db: f32,
     pub hits: u32,
+    /// Space section: claps it has reacted to and the lowest gain of the last block, dB.
+    pub space_triggers: u32,
+    pub space_gain_db: f32,
     /// Live spectrum (fast ballistics) and its average since play, dBFS per 1/6-octave point.
     pub spec_fast: [f32; NPTS],
     pub spec_avg: [f32; NPTS],
@@ -64,6 +68,8 @@ impl Default for Snapshot {
             block_pinned: 0.0,
             lev_gr_db: 0.0,
             hits: 0,
+            space_triggers: 0,
+            space_gain_db: 0.0,
             spec_fast: [-120.0; NPTS],
             spec_avg: [f32::NAN; NPTS],
         }
@@ -87,6 +93,22 @@ pub enum HitPick {
     /// Profile every detected hit.
     #[name = "All hits"]
     All,
+}
+
+/// What the Space section does on this track (see `dsp::space`).
+#[derive(Enum, Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SpaceMode {
+    #[name = "Off"]
+    Off,
+    /// On the growls, clap on the sidechain: duck everything above the split after each clap.
+    #[name = "Growls: duck"]
+    Growls,
+    /// On the sub, clap on the sidechain: drop out at the clap, back shortly after.
+    #[name = "Sub: dip"]
+    Sub,
+    /// On the clap itself: dip its tail.
+    #[name = "Clap: tail dip"]
+    ClapTail,
 }
 
 #[derive(Params)]
@@ -159,6 +181,27 @@ pub struct BloaterParams {
     pub sub_hz: FloatParam,
     #[id = "sub_ceil"]
     pub sub_ceil: FloatParam,
+
+    #[id = "sp_role"]
+    pub sp_role: EnumParam<SpaceMode>,
+    #[id = "sp_thr"]
+    pub sp_thr: FloatParam,
+    #[id = "sp_hz"]
+    pub sp_hz: FloatParam,
+    #[id = "sp_depth"]
+    pub sp_depth: FloatParam,
+    #[id = "sp_back"]
+    pub sp_back: FloatParam,
+    #[id = "sp_sub_hold"]
+    pub sp_sub_hold: FloatParam,
+    #[id = "sp_sub_back"]
+    pub sp_sub_back: FloatParam,
+    #[id = "sp_tail_db"]
+    pub sp_tail_db: FloatParam,
+    #[id = "sp_tail_from"]
+    pub sp_tail_from: FloatParam,
+    #[id = "sp_tail_to"]
+    pub sp_tail_to: FloatParam,
 
     #[id = "sens"]
     pub sens: FloatParam,
@@ -235,6 +278,16 @@ impl Default for BloaterParams {
             sub: BoolParam::new("Sub Split", false),
             sub_hz: hz_param("Sub Freq", 90.0, 40.0, 300.0),
             sub_ceil: db_param("Sub Ceiling", -3.0, -12.0, 0.0),
+            sp_role: EnumParam::new("Space", SpaceMode::Off),
+            sp_thr: db_param("Space Trigger", 12.0, 3.0, 40.0),
+            sp_hz: hz_param("Space Split", 150.0, 60.0, 1000.0),
+            sp_depth: db_param("Space Growl Duck", 24.0, 0.0, 48.0),
+            sp_back: ms_param("Space Growls Back", 250.0, 50.0, 600.0),
+            sp_sub_hold: ms_param("Space Sub Down Until", 55.0, 6.0, 300.0),
+            sp_sub_back: ms_param("Space Sub Full At", 130.0, 10.0, 600.0),
+            sp_tail_db: db_param("Space Tail Dip", 7.0, 0.0, 24.0),
+            sp_tail_from: ms_param("Space Tail From", 150.0, 40.0, 500.0),
+            sp_tail_to: ms_param("Space Tail To", 250.0, 60.0, 800.0),
             sens: FloatParam::new("Hit Sensitivity", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_step_size(0.01)
                 .with_value_to_string(formatters::v2s_f32_rounded(2)),
@@ -282,6 +335,28 @@ impl BloaterParams {
     }
 }
 
+impl BloaterParams {
+    pub fn space_settings(&self) -> SpaceSettings {
+        SpaceSettings {
+            role: match self.sp_role.value() {
+                SpaceMode::Off => SpaceRole::Off,
+                SpaceMode::Growls => SpaceRole::Growls,
+                SpaceMode::Sub => SpaceRole::Sub,
+                SpaceMode::ClapTail => SpaceRole::ClapTail,
+            },
+            thr_db: self.sp_thr.value(),
+            split_hz: self.sp_hz.value(),
+            depth_db: self.sp_depth.value(),
+            back_ms: self.sp_back.value(),
+            sub_hold_ms: self.sp_sub_hold.value(),
+            sub_back_ms: self.sp_sub_back.value(),
+            tail_db: self.sp_tail_db.value(),
+            tail_from_ms: self.sp_tail_from.value(),
+            tail_to_ms: self.sp_tail_to.value(),
+        }
+    }
+}
+
 /// Requests from the editor to the audio thread.
 #[derive(Default)]
 pub struct Control {
@@ -294,6 +369,9 @@ pub struct Bloater {
     params: Arc<BloaterParams>,
     control: Arc<Control>,
     bus: Option<BusClip>,
+    space: Option<Space>,
+    /// Latency last reported to the host (the Space lookahead, or 0).
+    latency: u32,
     onset: Option<OnsetDetector>,
     analyzer: Option<Analyzer>,
     spectrum: Option<Spectrum>,
@@ -313,6 +391,8 @@ impl Default for Bloater {
             params: Arc::new(BloaterParams::default()),
             control: Arc::new(Control::default()),
             bus: None,
+            space: None,
+            latency: 0,
             onset: None,
             analyzer: None,
             spectrum: None,
@@ -335,6 +415,14 @@ impl Plugin for Bloater {
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
+        // stereo with a stereo sidechain: the clap, for the Space section on the growls and the sub
+        AudioIOLayout {
+            main_input_channels: NonZeroU32::new(2),
+            main_output_channels: NonZeroU32::new(2),
+            aux_input_ports: &[new_nonzero_u32(2)],
+            names: PortNames { layout: None, main_input: None, main_output: None, aux_inputs: &["Clap"], aux_outputs: &[] },
+            ..AudioIOLayout::const_default()
+        },
         AudioIOLayout {
             main_input_channels: NonZeroU32::new(2),
             main_output_channels: NonZeroU32::new(2),
@@ -371,16 +459,24 @@ impl Plugin for Bloater {
         let mut bus = BusClip::new(self.sample_rate, nch);
         bus.update(&self.params.bus_settings());
         self.bus = Some(bus);
+        let mut space = Space::new(self.sample_rate);
+        let sp = self.params.space_settings();
+        space.update(&sp);
+        self.latency = space.latency(sp.role);
+        self.space = Some(space);
         self.onset = Some(OnsetDetector::new(self.sample_rate));
         self.analyzer = Some(Analyzer::new(self.sample_rate));
         self.spectrum = Some(Spectrum::new(self.sample_rate));
-        context.set_latency_samples(0);
+        context.set_latency_samples(self.latency);
         true
     }
 
     fn reset(&mut self) {
         if let Some(b) = &mut self.bus {
             b.reset();
+        }
+        if let Some(s) = &mut self.space {
+            s.reset();
         }
         if let Some(o) = &mut self.onset {
             o.reset();
@@ -397,10 +493,10 @@ impl Plugin for Bloater {
     fn process(
         &mut self,
         buffer: &mut Buffer,
-        _aux: &mut AuxiliaryBuffers,
+        aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let (Some(bus), Some(onset), Some(an), Some(spec)) = (&mut self.bus, &mut self.onset, &mut self.analyzer, &mut self.spectrum) else {
+        let (Some(bus), Some(space), Some(onset), Some(an), Some(spec)) = (&mut self.bus, &mut self.space, &mut self.onset, &mut self.analyzer, &mut self.spectrum) else {
             return ProcessStatus::Normal;
         };
         if self.control.reset_stats.swap(false, Ordering::Relaxed) {
@@ -411,6 +507,17 @@ impl Plugin for Bloater {
         bus.update(&self.params.bus_settings());
         let len = buffer.samples();
         let slices = buffer.as_slice();
+        // Space first: it makes room around the clap before anything is driven into the clip
+        let sp = self.params.space_settings();
+        space.update(&sp);
+        let latency = space.latency(sp.role);
+        if latency != self.latency {
+            self.latency = latency;
+            context.set_latency_samples(latency);
+        }
+        let side = aux.inputs.first().map(|b| b.as_slice_immutable()).filter(|s| !s.is_empty() && s[0].len() >= len);
+        let sc: Option<[&[f32]; 2]> = side.map(|s| [&s[0][..len], &s[if s.len() > 1 { 1 } else { 0 }][..len]]);
+        space.process(slices, sc, len);
         bus.process(slices, len);
         // analysis on the clipped output
         let sens = self.params.sens.value();
@@ -471,6 +578,8 @@ impl Plugin for Bloater {
             self.snapshot.block_pinned = bus.out_pinned;
             self.snapshot.lev_gr_db = bus.lev_gr_db;
             self.snapshot.hits = self.hits;
+            self.snapshot.space_triggers = space.triggers;
+            self.snapshot.space_gain_db = space.gain_db;
             self.snap_in.write(self.snapshot);
         }
         ProcessStatus::Normal

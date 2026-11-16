@@ -57,6 +57,8 @@ pub struct SpaceSettings {
     pub tail_to_ms: f32,
     /// Clap body: lift (dB) of the centre between `BODY_LO_HZ` and `BODY_HI_HZ` from `body_from_ms` to `body_to_ms`.
     pub body_db: f32,
+    /// Clap body: lift (dB) of the sides in the same band and window, so the body can be filled without narrowing it.
+    pub body_side_db: f32,
     pub body_from_ms: f32,
     pub body_to_ms: f32,
 }
@@ -75,6 +77,7 @@ impl Default for SpaceSettings {
             tail_from_ms: 150.0,
             tail_to_ms: 250.0,
             body_db: 0.0,
+            body_side_db: 0.0,
             body_from_ms: 20.0,
             body_to_ms: 95.0,
         }
@@ -164,6 +167,9 @@ pub struct Space {
     /// Body band of the mid channel: 2nd-order high-pass then low-pass.
     body_bp: [Bq; 2],
     body_gain: f32,
+    /// The same band of the side channel.
+    side_bp: [Bq; 2],
+    side_gain: f32,
     det: Bq,
     env: f32,
     env_rel: f32,
@@ -194,6 +200,8 @@ impl Space {
             lp: [[Bq::default(); 4]; 2],
             body_bp: [Bq::default(); 2],
             body_gain: 1.0,
+            side_bp: [Bq::default(); 2],
+            side_gain: 1.0,
             det: Bq::default(),
             env: 0.0,
             env_rel: (-1.0f32 / (0.005 * sample_rate)).exp(),
@@ -214,6 +222,7 @@ impl Space {
         s.det.highpass(sample_rate as f64, 2000.0, std::f64::consts::FRAC_1_SQRT_2);
         s.body_bp[0].highpass(sample_rate as f64, BODY_LO_HZ as f64, std::f64::consts::FRAC_1_SQRT_2);
         s.body_bp[1].lowpass(sample_rate as f64, BODY_HI_HZ as f64, std::f64::consts::FRAC_1_SQRT_2);
+        s.side_bp = s.body_bp;
         s.update(&SpaceSettings::default());
         s
     }
@@ -233,10 +242,11 @@ impl Space {
             }
         }
         self.det.clear();
-        for b in self.body_bp.iter_mut() {
+        for b in self.body_bp.iter_mut().chain(self.side_bp.iter_mut()) {
             b.clear();
         }
         self.body_gain = 1.0;
+        self.side_gain = 1.0;
         self.env = 0.0;
         self.peak = 0.0;
         self.armed = true;
@@ -335,9 +345,9 @@ impl Space {
 
     /// Target gain of the body band `t` ms after the hit (`ClapTail` role).
     #[inline]
-    fn body_curve(&self, t: f32) -> f32 {
+    fn body_curve(&self, t: f32, amount_db: f32) -> f32 {
         let s = &self.cur;
-        if s.body_db == 0.0 {
+        if amount_db == 0.0 {
             return 1.0;
         }
         let from = s.body_from_ms;
@@ -348,11 +358,11 @@ impl Space {
         if t <= a0 || t >= o1 {
             1.0
         } else if t < a1 {
-            db_to_gain(s.body_db * (t - a0) / BODY_FADE_IN_MS)
+            db_to_gain(amount_db * (t - a0) / BODY_FADE_IN_MS)
         } else if t <= to {
-            db_to_gain(s.body_db)
+            db_to_gain(amount_db)
         } else {
-            db_to_gain(s.body_db * (o1 - t) / BODY_FADE_OUT_MS)
+            db_to_gain(amount_db * (o1 - t) / BODY_FADE_OUT_MS)
         }
     }
 
@@ -417,19 +427,36 @@ impl Space {
             }
             let g = self.gain;
             min_gain = min_gain.min(g);
-            // body lift: the band-passed mid channel is added back, scaled
+            // body lift: the band-passed mid and side channels are added back, scaled
             let mut body_add = 0.0f32;
+            let mut side_add = 0.0f32;
             if role == SpaceRole::ClapTail {
-                let bt = if self.since > (self.sr as usize) * 4 { 1.0 } else { self.body_curve(u - HIT_AFTER_TRIGGER_MS) };
+                let idle = self.since > (self.sr as usize) * 4;
+                let t = u - HIT_AFTER_TRIGGER_MS;
+                let bt = if idle { 1.0 } else { self.body_curve(t, self.cur.body_db) };
+                let st = if idle || nch < 2 { 1.0 } else { self.body_curve(t, self.cur.body_side_db) };
                 self.body_gain += (bt - self.body_gain) * self.slew;
                 if (self.body_gain - bt).abs() < 1e-6 {
                     self.body_gain = bt;
                 }
-                let mid = if nch > 1 { 0.5 * (channels[0][i] + channels[1][i]) } else { channels[0][i] };
+                self.side_gain += (st - self.side_gain) * self.slew;
+                if (self.side_gain - st).abs() < 1e-6 {
+                    self.side_gain = st;
+                }
+                let (mid, side) = if nch > 1 {
+                    (0.5 * (channels[0][i] + channels[1][i]), 0.5 * (channels[0][i] - channels[1][i]))
+                } else {
+                    (channels[0][i], 0.0)
+                };
                 let hp = self.body_bp[0].run(mid as f64);
                 let bp = self.body_bp[1].run(hp) as f32;
+                let shp = self.side_bp[0].run(side as f64);
+                let sbp = self.side_bp[1].run(shp) as f32;
                 if self.body_gain != 1.0 {
                     body_add = (self.body_gain - 1.0) * bp;
+                }
+                if self.side_gain != 1.0 {
+                    side_add = (self.side_gain - 1.0) * sbp;
                 }
             }
 
@@ -446,10 +473,12 @@ impl Space {
                     for b in self.lp[ch].iter_mut() {
                         low = b.run(low);
                     }
+                    // the side band goes to the two channels with opposite sign
+                    let add = body_add + if ch == 0 { side_add } else { -side_add };
                     if g == 1.0 && !delayed {
-                        x + body_add
+                        x + add
                     } else {
-                        (low + g as f64 * (x as f64 - low)) as f32 + body_add
+                        (low + g as f64 * (x as f64 - low)) as f32 + add
                     }
                 } else {
                     g * x
@@ -655,6 +684,36 @@ mod tests {
         let s0: Vec<f32> = l0.iter().zip(&r0).map(|(a, b)| 0.5 * (a - b)).collect();
         let s1: Vec<f32> = l.iter().zip(&r).map(|(a, b)| 0.5 * (a - b)).collect();
         assert!((20.0 * (band(&s1) / band(&s0)).log10()).abs() < 0.1);
+    }
+
+    #[test]
+    fn side_lift_raises_the_sides_of_the_body_and_leaves_the_centre() {
+        let n = ms(900.0);
+        let at = ms(400.0);
+        let trig = clap(n, at);
+        let t600 = tone(n, 600.0, 0.1);
+        let mut sp = Space::new(SR);
+        sp.update(&SpaceSettings { role: SpaceRole::ClapTail, tail_db: 0.0, body_db: 0.0, body_side_db: 6.0, ..Default::default() });
+        sp.reset();
+        // the clap in the centre, the tone on the sides only
+        let mut l: Vec<f32> = trig.iter().zip(&t600).map(|(a, b)| a + b).collect();
+        let mut r: Vec<f32> = trig.iter().zip(&t600).map(|(a, b)| a - b).collect();
+        let (l0, r0) = (l.clone(), r.clone());
+        sp.process(&mut [&mut l, &mut r], None, n);
+        let hit = at + ms(HIT_AFTER_TRIGGER_MS);
+        let probe = |x: &[f32]| {
+            let w = &t600[hit + ms(30.0)..hit + ms(90.0)];
+            x[hit + ms(30.0)..hit + ms(90.0)].iter().zip(w).map(|(a, b)| a * b).sum::<f32>() / w.iter().map(|b| b * b).sum::<f32>()
+        };
+        let side = |a: &[f32], b: &[f32]| -> Vec<f32> { a.iter().zip(b).map(|(x, y)| 0.5 * (x - y)).collect() };
+        let mid = |a: &[f32], b: &[f32]| -> Vec<f32> { a.iter().zip(b).map(|(x, y)| 0.5 * (x + y)).collect() };
+        let lift = 20.0 * (probe(&side(&l, &r)) / probe(&side(&l0, &r0))).log10();
+        assert!((lift - 6.0).abs() < 1.0, "sides lifted {lift:.2} dB");
+        // the centre (the clap itself) is bit for bit what went in... up to rounding of the mid/side sum
+        let (m0, m1) = (mid(&l0, &r0), mid(&l, &r));
+        for i in 0..n {
+            assert!((m0[i] - m1[i]).abs() < 1e-6);
+        }
     }
 
     #[test]

@@ -20,6 +20,8 @@ pub struct ClapShaperParams {
     pub thr: FloatParam,
     #[id = "body_db"]
     pub body_db: FloatParam,
+    #[id = "body_side_db"]
+    pub body_side_db: FloatParam,
     #[id = "body_from"]
     pub body_from: FloatParam,
     #[id = "body_to"]
@@ -51,10 +53,11 @@ fn ms(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
 impl Default for ClapShaperParams {
     fn default() -> Self {
         ClapShaperParams {
-            editor_state: ViziaState::new(|| (380, 500)),
+            editor_state: ViziaState::new(|| (380, 535)),
             on: BoolParam::new("On", true),
             thr: db("Trigger within", 12.0, 3.0, 40.0),
             body_db: db("Body lift", 8.0, 0.0, 12.0),
+            body_side_db: db("Body sides lift", 8.0, 0.0, 18.0),
             body_from: ms("Body from", 20.0, 5.0, 100.0),
             body_to: ms("Body to", 95.0, 20.0, 300.0),
             tail_db: db("Tail dip", 7.0, 0.0, 24.0),
@@ -78,6 +81,7 @@ impl ClapShaperParams {
             tail_from_ms: self.tail_from.value(),
             tail_to_ms: self.tail_to.value(),
             body_db: self.body_db.value(),
+            body_side_db: self.body_side_db.value(),
             body_from_ms: self.body_from.value(),
             body_to_ms: self.body_to.value(),
             ..SpaceSettings::default()
@@ -164,8 +168,9 @@ impl Plugin for ClapShaper {
                 Label::new(cx, "Last on the clap's bus, before the drum clip.").height(Pixels(26.0));
                 row(cx, "On", |p| &p.on);
                 row(cx, "Trigger within", |p| &p.thr);
-                Label::new(cx, "Body (centre, 150 Hz to 1.5 kHz)").height(Pixels(26.0)).top(Pixels(8.0));
-                row(cx, "Lift by", |p| &p.body_db);
+                Label::new(cx, "Body (150 Hz to 1.5 kHz)").height(Pixels(26.0)).top(Pixels(8.0));
+                row(cx, "Lift centre by", |p| &p.body_db);
+                row(cx, "Lift sides by", |p| &p.body_side_db);
                 row(cx, "From", |p| &p.body_from);
                 row(cx, "To", |p| &p.body_to);
                 Label::new(cx, "Tail").height(Pixels(26.0)).top(Pixels(8.0));

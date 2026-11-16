@@ -5,7 +5,7 @@ bus that adds to the tail, or the tail dip is undone). It triggers from its own 
 
 | Section | What it does | Defaults |
 |---|---|---|
-| Body | Lifts the centre (mid channel, about 150 Hz to 1.5 kHz) by *Lift by* between *From* and *To* after the hit, so the body stays dense for as long as the clap sounds. | 8 dB, 20 to 95 ms |
+| Body | Lifts the body (about 150 Hz to 1.5 kHz) between *From* and *To* after the hit, so it stays dense for as long as the clap sounds. *Lift centre by* and *Lift sides by* are separate: equal amounts keep the width, more on the sides widens the body, sides at 0 narrows it. | 8 dB centre, 8 dB sides, 20 to 95 ms |
 | Tail | Dips everything above *Above* by *Dip by* between *From* and *To*, so the clap ends cleanly before the growls return. | 7 dB, 150 to 250 ms, above 150 Hz |
 
 Set either amount to 0 dB to switch that section off. The trigger is the same as in Clap Space; on a bus that also

@@ -1,9 +1,9 @@
 //! Run a raw f32le stereo file through the Space section:
-//! `space IN OUT role(growls|sub|tail) [SIDE|-] [depth_db back_ms sub_hold_ms sub_back_ms tail_db tail_from_ms tail_to_ms split_hz thr_db]`
+//! `space IN OUT role(growls|sub|tail) [SIDE|-] [depth_db back_ms sub_hold_ms sub_back_ms tail_db tail_from_ms tail_to_ms split_hz thr_db body_db body_from_ms body_to_ms]`
 //! SIDE is the sidechain (the clap) as raw f32le stereo, "-" for none. The output is delayed by the lookahead
 //! for the growls and sub roles, as in the plugin before the host compensates. Trigger positions (samples in
 //! the input) go to stderr.
-use onsetguard::dsp::space::{Space, SpaceRole, SpaceSettings};
+use clapdsp::space::{Space, SpaceRole, SpaceSettings};
 
 fn read(p: &str) -> (Vec<f32>, Vec<f32>) {
     let bytes = std::fs::read(p).unwrap();
@@ -35,6 +35,9 @@ fn main() {
     s.tail_to_ms = f(11, s.tail_to_ms);
     s.split_hz = f(12, s.split_hz);
     s.thr_db = f(13, s.thr_db);
+    s.body_db = f(14, s.body_db);
+    s.body_from_ms = f(15, s.body_from_ms);
+    s.body_to_ms = f(16, s.body_to_ms);
     let mut sp = Space::new(44100.0);
     sp.update(&s);
     sp.reset();

@@ -562,18 +562,6 @@ pub(crate) fn create(
                     toggle_row(cx, "Sub split", |p| &p.sub);
                     row(cx, "Crossover", |p| &p.sub_hz);
                     row(cx, "Sub ceiling", |p| &p.sub_ceil);
-                    section(cx, "Space around the clap (clap on the sidechain)");
-                    row(cx, "Space", |p| &p.sp_role);
-                    row(cx, "Trigger within", |p| &p.sp_thr);
-                    row(cx, "Split", |p| &p.sp_hz);
-                    row(cx, "Growl duck", |p| &p.sp_depth);
-                    row(cx, "Growls back at", |p| &p.sp_back);
-                    row(cx, "Sub down until", |p| &p.sp_sub_hold);
-                    row(cx, "Sub full at", |p| &p.sp_sub_back);
-                    row(cx, "Clap tail dip", |p| &p.sp_tail_db);
-                    row(cx, "Tail dip from", |p| &p.sp_tail_from);
-                    row(cx, "Tail dip to", |p| &p.sp_tail_to);
-                    Label::new(cx, Data::live.map(|s| format!("claps seen {}   gain now {:+.1} dB", s.space_triggers, s.space_gain_db))).class("sub");
                     section(cx, "Hit detection (meters)");
                     row(cx, "Sensitivity", |p| &p.sens);
                     row(cx, "Profile", |p| &p.pick);

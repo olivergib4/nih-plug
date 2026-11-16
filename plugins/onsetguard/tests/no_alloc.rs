@@ -3,7 +3,6 @@
 use onsetguard::analysis::{Analyzer, HitKind};
 use onsetguard::dsp::busclip::{BusClip, BusSettings};
 use onsetguard::dsp::onset::OnsetDetector;
-use onsetguard::dsp::space::{Space, SpaceRole, SpaceSettings};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -36,17 +35,10 @@ fn audio_path_does_not_allocate() {
     s.bell_on = true;
     s.tilt_db = 2.0;
     bus.update(&s);
-    let mut spaces = [SpaceRole::Growls, SpaceRole::Sub, SpaceRole::ClapTail].map(|role| {
-        let mut sp = Space::new(sr);
-        sp.update(&SpaceSettings { role, ..Default::default() });
-        sp
-    });
     let mut det = OnsetDetector::new(sr);
     let mut an = Analyzer::new(sr);
     let mut l = vec![0.0f32; block];
     let mut r = vec![0.0f32; block];
-    let mut side_l = vec![0.0f32; block];
-    let mut side_r = vec![0.0f32; block];
     let mut t = 0usize;
     let mut hits = 0;
     let mut reports = 0;
@@ -58,12 +50,6 @@ fn audio_path_does_not_allocate() {
             let x = (n * 2.0 * std::f32::consts::PI * 55.0 / sr).sin() * 0.5 + (n * 2.0 * std::f32::consts::PI * 700.0 / sr).sin() * 0.3 + burst;
             l[i] = x;
             r[i] = -0.8 * x;
-        }
-        for sp in spaces.iter_mut() {
-            side_l.copy_from_slice(&l);
-            side_r.copy_from_slice(&r);
-            let mut ch: [&mut [f32]; 2] = [&mut l[..], &mut r[..]];
-            sp.process(&mut ch, Some([&side_l[..], &side_r[..]]), block);
         }
         {
             let mut ch: [&mut [f32]; 2] = [&mut l[..], &mut r[..]];

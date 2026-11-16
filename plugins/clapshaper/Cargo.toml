@@ -1,0 +1,16 @@
+[package]
+name = "clapshaper"
+version = "1.0.0"
+edition = "2021"
+authors = ["OGII"]
+license = "GPL-3.0-or-later"
+description = "Shapes the clap itself after each hit: lifts the centre of its body and dips its tail"
+homepage = "https://github.com/olivergib4/nih-plug/tree/master/plugins/clapshaper"
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+nih_plug = { path = "../../", features = ["assert_process_allocs"] }
+nih_plug_vizia = { path = "../../nih_plug_vizia" }
+clapdsp = { path = "../clapdsp" }

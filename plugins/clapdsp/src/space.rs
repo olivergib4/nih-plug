@@ -5,8 +5,10 @@
 //!   changes, so a sub living in the same signal is left alone.
 //! * `Sub` (on the sub track, clap on the sidechain): the whole signal drops out at the clap, stays down
 //!   until `sub_hold_ms` and is back to full level at `sub_back_ms`.
-//! * `ClapTail` (on the clap track, triggered by its own input): everything above `split_hz` is dipped by
-//!   `tail_db` between `tail_from_ms` and `tail_to_ms` after the hit.
+//! * `ClapTail` (on the clap or its bus, triggered by its own input): everything above `split_hz` is dipped
+//!   by `tail_db` between `tail_from_ms` and `tail_to_ms` after the hit, and the centre of the body
+//!   (about 150 Hz to 1.5 kHz, mid channel only, with gentle edges) is lifted by `body_db` between `body_from_ms` and
+//!   `body_to_ms`. Either can be set to 0 dB.
 //!
 //! Defaults are the values found by ear against the first hit of the second drop of the reference track:
 //! 24 dB / 250 ms for the growls (18 dB or 200 ms already let the clap sink back, more than 24 dB / 250 ms
@@ -53,6 +55,10 @@ pub struct SpaceSettings {
     pub tail_db: f32,
     pub tail_from_ms: f32,
     pub tail_to_ms: f32,
+    /// Clap body: lift (dB) of the centre between `BODY_LO_HZ` and `BODY_HI_HZ` from `body_from_ms` to `body_to_ms`.
+    pub body_db: f32,
+    pub body_from_ms: f32,
+    pub body_to_ms: f32,
 }
 
 impl Default for SpaceSettings {
@@ -68,6 +74,9 @@ impl Default for SpaceSettings {
             tail_db: 7.0,
             tail_from_ms: 150.0,
             tail_to_ms: 250.0,
+            body_db: 0.0,
+            body_from_ms: 20.0,
+            body_to_ms: 95.0,
         }
     }
 }
@@ -84,6 +93,11 @@ pub const RETRIGGER_MS: f32 = 150.0;
 /// After a trigger the detector re-arms only once the envelope has fallen this far below the trigger
 /// level, so a clap with a long bright tail (a bus that adds reverb or upward compression) counts once.
 pub const REARM_DB: f32 = 12.0;
+/// Band of the body lift.
+pub const BODY_LO_HZ: f32 = 120.0;
+pub const BODY_HI_HZ: f32 = 1800.0;
+const BODY_FADE_IN_MS: f32 = 12.0;
+const BODY_FADE_OUT_MS: f32 = 30.0;
 const TAIL_FADE_IN_MS: f32 = 30.0;
 const TAIL_FADE_OUT_MS: f32 = 20.0;
 
@@ -147,12 +161,17 @@ pub struct Space {
     cur: SpaceSettings,
     /// LR8 low-pass per channel: BW4 twice.
     lp: [[Bq; 4]; 2],
+    /// Body band of the mid channel: 2nd-order high-pass then low-pass.
+    body_bp: [Bq; 2],
+    body_gain: f32,
     det: Bq,
     env: f32,
     env_rel: f32,
     peak: f32,
     peak_rel: f32,
     armed: bool,
+    /// Loudest level of the hit that triggered last (its first 20 ms).
+    trig_level: f32,
     /// Samples since the last trigger (large when idle).
     since: usize,
     look: usize,
@@ -173,12 +192,15 @@ impl Space {
             sr: sample_rate,
             cur: SpaceSettings { split_hz: f32::NAN, ..Default::default() },
             lp: [[Bq::default(); 4]; 2],
+            body_bp: [Bq::default(); 2],
+            body_gain: 1.0,
             det: Bq::default(),
             env: 0.0,
             env_rel: (-1.0f32 / (0.005 * sample_rate)).exp(),
             peak: 0.0,
             peak_rel: 10f32.powf(-2.0 / 20.0 / sample_rate),
             armed: true,
+            trig_level: 0.0,
             since: usize::MAX / 2,
             look,
             delay: [vec![0.0; look.max(1)], vec![0.0; look.max(1)]],
@@ -190,6 +212,8 @@ impl Space {
             gain_db: 0.0,
         };
         s.det.highpass(sample_rate as f64, 2000.0, std::f64::consts::FRAC_1_SQRT_2);
+        s.body_bp[0].highpass(sample_rate as f64, BODY_LO_HZ as f64, std::f64::consts::FRAC_1_SQRT_2);
+        s.body_bp[1].lowpass(sample_rate as f64, BODY_HI_HZ as f64, std::f64::consts::FRAC_1_SQRT_2);
         s.update(&SpaceSettings::default());
         s
     }
@@ -209,9 +233,14 @@ impl Space {
             }
         }
         self.det.clear();
+        for b in self.body_bp.iter_mut() {
+            b.clear();
+        }
+        self.body_gain = 1.0;
         self.env = 0.0;
         self.peak = 0.0;
         self.armed = true;
+        self.trig_level = 0.0;
         self.since = usize::MAX / 2;
         for d in self.delay.iter_mut() {
             d.fill(0.0);
@@ -304,6 +333,29 @@ impl Space {
         }
     }
 
+    /// Target gain of the body band `t` ms after the hit (`ClapTail` role).
+    #[inline]
+    fn body_curve(&self, t: f32) -> f32 {
+        let s = &self.cur;
+        if s.body_db == 0.0 {
+            return 1.0;
+        }
+        let from = s.body_from_ms;
+        let to = s.body_to_ms.max(from + 1.0);
+        let a0 = from - BODY_FADE_IN_MS + 2.0;
+        let a1 = from + 2.0;
+        let o1 = to + BODY_FADE_OUT_MS;
+        if t <= a0 || t >= o1 {
+            1.0
+        } else if t < a1 {
+            db_to_gain(s.body_db * (t - a0) / BODY_FADE_IN_MS)
+        } else if t <= to {
+            db_to_gain(s.body_db)
+        } else {
+            db_to_gain(s.body_db * (o1 - t) / BODY_FADE_OUT_MS)
+        }
+    }
+
     /// Process `len` samples of `channels` in place. `side` is the sidechain (the clap) for the `Growls`
     /// and `Sub` roles; `ClapTail` triggers from `channels` itself.
     pub fn process(&mut self, channels: &mut [&mut [f32]], side: Option<[&[f32]; 2]>, len: usize) {
@@ -316,6 +368,7 @@ impl Space {
         let rel = 10f32.powf(-self.cur.thr_db.abs() / 20.0);
         let rearm = rel * 10f32.powf(-REARM_DB / 20.0);
         let retrig = (RETRIGGER_MS * self.sr / 1000.0) as usize;
+        let hit_len = (0.020 * self.sr) as usize;
         let delayed = matches!(role, SpaceRole::Growls | SpaceRole::Sub);
         let split = matches!(role, SpaceRole::Growls | SpaceRole::ClapTail);
         let ms_per_sample = 1000.0 / self.sr;
@@ -338,9 +391,16 @@ impl Space {
             if self.env < self.peak * rearm {
                 self.armed = true;
             }
-            if self.armed && self.since >= retrig && self.env > 1e-3 && self.env >= self.peak * rel {
+            if self.since < hit_len {
+                self.trig_level = self.trig_level.max(self.env);
+            }
+            // fire when re-armed, or when something 12 dB louder than the last hit arrives (a steady
+            // background that happened to trigger must not make the detector miss the clap)
+            let louder = self.env >= self.trig_level * 4.0;
+            if (self.armed || louder) && self.since >= retrig && self.env > 1e-3 && self.env >= self.peak * rel {
                 self.armed = false;
                 self.since = 0;
+                self.trig_level = self.env;
                 self.triggers = self.triggers.wrapping_add(1);
             }
 
@@ -357,6 +417,21 @@ impl Space {
             }
             let g = self.gain;
             min_gain = min_gain.min(g);
+            // body lift: the band-passed mid channel is added back, scaled
+            let mut body_add = 0.0f32;
+            if role == SpaceRole::ClapTail {
+                let bt = if self.since > (self.sr as usize) * 4 { 1.0 } else { self.body_curve(u - HIT_AFTER_TRIGGER_MS) };
+                self.body_gain += (bt - self.body_gain) * self.slew;
+                if (self.body_gain - bt).abs() < 1e-6 {
+                    self.body_gain = bt;
+                }
+                let mid = if nch > 1 { 0.5 * (channels[0][i] + channels[1][i]) } else { channels[0][i] };
+                let hp = self.body_bp[0].run(mid as f64);
+                let bp = self.body_bp[1].run(hp) as f32;
+                if self.body_gain != 1.0 {
+                    body_add = (self.body_gain - 1.0) * bp;
+                }
+            }
 
             for ch in 0..nch {
                 let x = if delayed {
@@ -372,9 +447,9 @@ impl Space {
                         low = b.run(low);
                     }
                     if g == 1.0 && !delayed {
-                        x
+                        x + body_add
                     } else {
-                        (low + g as f64 * (x as f64 - low)) as f32
+                        (low + g as f64 * (x as f64 - low)) as f32 + body_add
                     }
                 } else {
                     g * x
@@ -542,6 +617,44 @@ mod tests {
         let hit = ms(100.0) + ms(HIT_AFTER_TRIGGER_MS);
         let d = rms_db(&x[hit + ms(160.0)..hit + ms(230.0)]) - rms_db(&y[hit + ms(160.0)..hit + ms(230.0)]);
         assert!((d - 7.0).abs() < 0.5, "tail dip {d:.2} dB");
+    }
+
+    #[test]
+    fn body_lift_raises_the_centre_of_the_body_only() {
+        let n = ms(900.0);
+        // the steady tone below triggers once when it starts; the clap comes well after that
+        let at = ms(400.0);
+        let trig = clap(n, at);
+        // a 600 Hz tone under the clap: in phase (centre) on one run, out of phase (sides) on the other
+        let t600 = tone(n, 600.0, 0.1);
+        let run_ms = |side_sign: f32| {
+            let mut sp = Space::new(SR);
+            sp.update(&SpaceSettings { role: SpaceRole::ClapTail, tail_db: 0.0, body_db: 8.0, ..Default::default() });
+            sp.reset();
+            let mut l: Vec<f32> = trig.iter().zip(&t600).map(|(a, b)| a + b).collect();
+            let mut r: Vec<f32> = trig.iter().zip(&t600).map(|(a, b)| a + side_sign * b).collect();
+            let (l0, r0) = (l.clone(), r.clone());
+            sp.process(&mut [&mut l, &mut r], None, n);
+            (l0, r0, l, r)
+        };
+        let hit = at + ms(HIT_AFTER_TRIGGER_MS);
+        let band = |x: &[f32]| {
+            // crude 600 Hz probe: correlate with the tone
+            let w = &t600[hit + ms(30.0)..hit + ms(90.0)];
+            let y = &x[hit + ms(30.0)..hit + ms(90.0)];
+            y.iter().zip(w).map(|(a, b)| a * b).sum::<f32>() / w.iter().map(|b| b * b).sum::<f32>()
+        };
+        let (l0, _, l, _) = run_ms(1.0);
+        let lift = 20.0 * (band(&l) / band(&l0)).log10();
+        assert!((lift - 8.0).abs() < 1.0, "centre lifted {lift:.2} dB");
+        // untouched from the first clap-free moment before the hit to the body window, and after it
+        assert_eq!(&l0[at - ms(20.0)..hit + ms(8.0)], &l[at - ms(20.0)..hit + ms(8.0)]);
+        assert_eq!(&l0[hit + ms(130.0)..], &l[hit + ms(130.0)..]);
+        // a side-only 600 Hz tone is not lifted
+        let (l0, r0, l, r) = run_ms(-1.0);
+        let s0: Vec<f32> = l0.iter().zip(&r0).map(|(a, b)| 0.5 * (a - b)).collect();
+        let s1: Vec<f32> = l.iter().zip(&r).map(|(a, b)| 0.5 * (a - b)).collect();
+        assert!((20.0 * (band(&s1) / band(&s0)).log10()).abs() < 0.1);
     }
 
     #[test]

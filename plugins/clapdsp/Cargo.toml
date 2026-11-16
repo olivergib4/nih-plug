@@ -1,0 +1,9 @@
+[package]
+name = "clapdsp"
+version = "1.0.0"
+edition = "2021"
+authors = ["OGII"]
+license = "GPL-3.0-or-later"
+description = "Clap-triggered gain curves shared by Clap Space and Clap Shaper"
+
+[dependencies]

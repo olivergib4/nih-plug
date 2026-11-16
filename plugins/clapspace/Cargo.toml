@@ -1,0 +1,16 @@
+[package]
+name = "clapspace"
+version = "1.0.0"
+edition = "2021"
+authors = ["OGII"]
+license = "GPL-3.0-or-later"
+description = "Makes room for the clap: ducks the growls or dips the sub after each clap, triggered by the clap on the sidechain"
+homepage = "https://github.com/olivergib4/nih-plug/tree/master/plugins/clapspace"
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+nih_plug = { path = "../../", features = ["assert_process_allocs"] }
+nih_plug_vizia = { path = "../../nih_plug_vizia" }
+clapdsp = { path = "../clapdsp" }

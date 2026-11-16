@@ -33,3 +33,9 @@ name = "Spectral Compressor"
 
 [onsetguard]
 name = "Bloater"
+
+[clapspace]
+name = "Clap Space"
+
+[clapshaper]
+name = "Clap Shaper"

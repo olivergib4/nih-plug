@@ -45,6 +45,9 @@ members = [
   "plugins/safety_limiter",
   "plugins/spectral_compressor",
   "plugins/onsetguard",
+  "plugins/clapdsp",
+  "plugins/clapspace",
+  "plugins/clapshaper",
 ]
 
 [features]

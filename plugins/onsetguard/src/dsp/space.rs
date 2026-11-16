@@ -13,7 +13,8 @@
 //! made no further difference), 55 / 130 ms for the sub, 7 dB from 150 to 250 ms for the clap tail.
 //!
 //! Trigger: the same relative detector as the Attack EQ (mid channel above 2 kHz coming within `thr_db` of
-//! the loudest recent hit, at most once every 150 ms), fed from the sidechain for `Growls` and `Sub` and from
+//! the loudest recent hit, at most once every 150 ms and not again until the level has fallen a further
+//! 12 dB, so a long bright tail does not count as a second hit), fed from the sidechain for `Growls` and `Sub` and from
 //! the input for `ClapTail`. Times in the settings count from the hit, which is `HIT_AFTER_TRIGGER_MS` after
 //! the trigger (the detector fires on the first milliseconds of the zap). Feed it the clap on its own: on a
 //! clipped drum bus the kick's click is as bright as the clap and triggers it too.
@@ -80,6 +81,9 @@ pub const SUB_DEPTH_DB: f32 = 32.0;
 /// The growls return over this long, centred on `back_ms`.
 pub const GROWL_RETURN_MS: f32 = 30.0;
 pub const RETRIGGER_MS: f32 = 150.0;
+/// After a trigger the detector re-arms only once the envelope has fallen this far below the trigger
+/// level, so a clap with a long bright tail (a bus that adds reverb or upward compression) counts once.
+pub const REARM_DB: f32 = 12.0;
 const TAIL_FADE_IN_MS: f32 = 30.0;
 const TAIL_FADE_OUT_MS: f32 = 20.0;
 
@@ -148,7 +152,7 @@ pub struct Space {
     env_rel: f32,
     peak: f32,
     peak_rel: f32,
-    above: bool,
+    armed: bool,
     /// Samples since the last trigger (large when idle).
     since: usize,
     look: usize,
@@ -174,7 +178,7 @@ impl Space {
             env_rel: (-1.0f32 / (0.005 * sample_rate)).exp(),
             peak: 0.0,
             peak_rel: 10f32.powf(-2.0 / 20.0 / sample_rate),
-            above: false,
+            armed: true,
             since: usize::MAX / 2,
             look,
             delay: [vec![0.0; look.max(1)], vec![0.0; look.max(1)]],
@@ -207,7 +211,7 @@ impl Space {
         self.det.clear();
         self.env = 0.0;
         self.peak = 0.0;
-        self.above = false;
+        self.armed = true;
         self.since = usize::MAX / 2;
         for d in self.delay.iter_mut() {
             d.fill(0.0);
@@ -310,6 +314,7 @@ impl Space {
             return;
         }
         let rel = 10f32.powf(-self.cur.thr_db.abs() / 20.0);
+        let rearm = rel * 10f32.powf(-REARM_DB / 20.0);
         let retrig = (RETRIGGER_MS * self.sr / 1000.0) as usize;
         let delayed = matches!(role, SpaceRole::Growls | SpaceRole::Sub);
         let split = matches!(role, SpaceRole::Growls | SpaceRole::ClapTail);
@@ -330,12 +335,14 @@ impl Space {
             let d = (self.det.run(trig as f64) as f32).abs();
             self.env = if d > self.env { d } else { self.env * self.env_rel };
             self.peak = (self.peak * self.peak_rel).max(self.env);
-            let now_above = self.env > 1e-3 && self.env >= self.peak * rel;
-            if now_above && !self.above && self.since >= retrig {
+            if self.env < self.peak * rearm {
+                self.armed = true;
+            }
+            if self.armed && self.since >= retrig && self.env > 1e-3 && self.env >= self.peak * rel {
+                self.armed = false;
                 self.since = 0;
                 self.triggers = self.triggers.wrapping_add(1);
             }
-            self.above = now_above;
 
             // gain for the sample that leaves the delay now
             let u = if delayed {
@@ -515,6 +522,26 @@ mod tests {
         assert!((d - 7.0).abs() < 0.3, "{d:.2}");
         let after = rms_db(&x[hit + ms(270.0)..hit + ms(400.0)]) - rms_db(&y[hit + ms(270.0)..hit + ms(400.0)]);
         assert!(after.abs() < 0.05, "{after:.3}");
+    }
+
+    #[test]
+    fn a_long_bright_tail_does_not_retrigger() {
+        // a clap whose tail is still only 8 dB down after 150 ms, as on a bus that adds reverb
+        let n = ms(1800.0);
+        let mut x = vec![0.0f32; n];
+        for at in [ms(100.0), ms(957.0)] {
+            for i in at..(at + ms(600.0)).min(n) {
+                let t = (i - at) as f32 / SR;
+                let noise = ((i as f32 * 12.9898).sin() * 43758.5).fract();
+                x[i] += 0.9 * noise * 10f32.powf(-(8.0 / 0.150) * t / 20.0);
+            }
+        }
+        let side = vec![0.0; n];
+        let (y, sp) = run(SpaceRole::ClapTail, &x, &side);
+        assert_eq!(sp.triggers, 2, "one trigger per clap");
+        let hit = ms(100.0) + ms(HIT_AFTER_TRIGGER_MS);
+        let d = rms_db(&x[hit + ms(160.0)..hit + ms(230.0)]) - rms_db(&y[hit + ms(160.0)..hit + ms(230.0)]);
+        assert!((d - 7.0).abs() < 0.5, "tail dip {d:.2} dB");
     }
 
     #[test]

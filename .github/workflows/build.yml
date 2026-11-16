@@ -113,3 +113,14 @@ jobs:
           gh release upload builds "bloater-latest-${{ matrix.name }}.zip" --clobber
           echo "version: $(grep '^version' plugins/onsetguard/Cargo.toml) commit: $GITHUB_SHA" > "build-info-${{ matrix.name }}.txt"
           gh release upload builds "build-info-${{ matrix.name }}.txt" --clobber
+      - name: Publish branch builds to the rolling "builds-test" release
+        # Same as above for any other branch, so a test build can be fetched without touching the master build.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd "$ARCHIVE_NAME" && 7z a -tzip "../bloater-test-${{ matrix.name }}.zip" "$ARCHIVE_NAME" > /dev/null)
+          gh release view builds-test > /dev/null 2>&1 || gh release create builds-test --title "Rolling test builds" --notes "Latest build of a branch other than master, replaced on every push." --prerelease
+          gh release upload builds-test "bloater-test-${{ matrix.name }}.zip" --clobber
+          echo "version: $(grep '^version' plugins/onsetguard/Cargo.toml) branch: $GITHUB_REF_NAME commit: $GITHUB_SHA" > "build-info-test-${{ matrix.name }}.txt"
+          gh release upload builds-test "build-info-test-${{ matrix.name }}.txt" --clobber

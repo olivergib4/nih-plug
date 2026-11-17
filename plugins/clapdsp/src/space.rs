@@ -120,9 +120,14 @@ pub const RETRIGGER_MS: f32 = 150.0;
 /// After a trigger the detector re-arms only once the envelope has fallen this far below the trigger
 /// level, so a clap with a long bright tail (a bus that adds reverb or upward compression) counts once.
 pub const REARM_DB: f32 = 12.0;
-/// Band of the body lift.
-pub const BODY_LO_HZ: f32 = 120.0;
-pub const BODY_HI_HZ: f32 = 1800.0;
+/// Band of the body lift: the response of a 3rd-order Butterworth band-pass run forwards and backwards
+/// (no phase shift), as a linear-phase filter of `2 * BODY_FIR_HALF_MS` so it can run in real time. The
+/// lifted band is then in phase with the rest at every frequency: a filter with phase shift, added back,
+/// takes away above the band what it adds inside it (1.4 dB at 3 to 8 kHz with the old one).
+pub const BODY_LO_HZ: f32 = 150.0;
+pub const BODY_HI_HZ: f32 = 1500.0;
+/// Half length of the body filter, which is also the latency of the `ClapTail` role.
+pub const BODY_FIR_HALF_MS: f32 = 20.0;
 /// Lean: left mids from 15 to 60 ms, right highs from 70 to 180 ms. The corners sit outside the bands that
 /// are meant to move (600 Hz to 1.5 kHz, and 1.5 kHz up) because the gentle filters only reach the full
 /// amount about an octave inside their corners.
@@ -193,6 +198,71 @@ impl Bq {
 /// The two section Qs of a 4th-order Butterworth filter.
 const BW4_Q: [f64; 2] = [0.541_196_100_146_197, 1.306_562_964_876_376_4];
 
+/// Linear-phase band filter (odd length, symmetric) with its own input history.
+struct Fir {
+    taps: Vec<f32>,
+    hist: Vec<f32>,
+    pos: usize,
+}
+
+impl Fir {
+    /// Zero-phase 3rd-order Butterworth band-pass (magnitude of the forwards-backwards run), `half` taps
+    /// each side of the centre, Hann windowed.
+    fn bandpass(sr: f32, lo: f32, hi: f32, half: usize) -> Fir {
+        let n = 2 * half + 1;
+        let m = 8192usize.max((4 * n).next_power_of_two());
+        let wl = (std::f64::consts::PI * lo as f64 / sr as f64).tan();
+        let wh = (std::f64::consts::PI * (hi as f64).min(0.45 * sr as f64) / sr as f64).tan();
+        let (w0sq, bw) = (wl * wh, wh - wl);
+        // desired response on the grid 0..m/2
+        let mag: Vec<f64> = (0..=m / 2)
+            .map(|k| {
+                if k == 0 || k == m / 2 {
+                    return 0.0;
+                }
+                let w = (std::f64::consts::PI * k as f64 / m as f64).tan();
+                let x = (w * w - w0sq) / (bw * w);
+                1.0 / (1.0 + x.powi(6))
+            })
+            .collect();
+        let mut taps = vec![0.0f32; n];
+        for (i, t) in taps.iter_mut().enumerate() {
+            let d = i as f64 - half as f64;
+            let mut acc = mag[0] + mag[m / 2] * (std::f64::consts::PI * d).cos();
+            for (k, g) in mag.iter().enumerate().take(m / 2).skip(1) {
+                acc += 2.0 * g * (2.0 * std::f64::consts::PI * k as f64 * d / m as f64).cos();
+            }
+            let win = 0.5 + 0.5 * (std::f64::consts::PI * d / (half as f64 + 1.0)).cos();
+            *t = (acc / m as f64 * win) as f32;
+        }
+        Fir { taps, hist: vec![0.0; n], pos: 0 }
+    }
+    fn clear(&mut self) {
+        self.hist.fill(0.0);
+        self.pos = 0;
+    }
+    #[inline]
+    fn run(&mut self, x: f32) -> f32 {
+        let n = self.taps.len();
+        self.hist[self.pos] = x;
+        // newest sample at `pos`, going back in time towards lower indices (wrapping)
+        let (a, b) = self.hist.split_at(self.pos + 1);
+        let mut acc = 0.0f32;
+        // taps are symmetric, so the direction of the walk does not matter
+        for (h, t) in a.iter().rev().zip(self.taps.iter()) {
+            acc += h * t;
+        }
+        for (h, t) in b.iter().rev().zip(self.taps[a.len()..].iter()) {
+            acc += h * t;
+        }
+        self.pos += 1;
+        if self.pos >= n {
+            self.pos = 0;
+        }
+        acc
+    }
+}
+
 #[inline]
 fn db_to_gain(db: f32) -> f32 {
     10f32.powf(db / 20.0)
@@ -203,12 +273,14 @@ pub struct Space {
     cur: SpaceSettings,
     /// LR8 low-pass per channel: BW4 twice.
     lp: [[Bq; 4]; 2],
-    /// Body band of the mid channel: 2nd-order high-pass then low-pass.
-    body_bp: [Bq; 2],
+    /// Body band of the left and of the right channel.
+    body_fir: [Fir; 2],
     body_gain: f32,
-    /// The same band of the side channel.
-    side_bp: [Bq; 2],
     side_gain: f32,
+    /// Delay of the `ClapTail` role (half the body filter).
+    clook: usize,
+    cdelay: [Vec<f32>; 2],
+    cpos: usize,
     /// Lean: mid band of the left channel, high band of the right.
     lean_l: [Bq; 2],
     lean_r: [Bq; 2],
@@ -246,14 +318,17 @@ pub struct Space {
 impl Space {
     pub fn new(sample_rate: f32) -> Self {
         let look = (LOOK_MS * sample_rate / 1000.0).round() as usize;
+        let clook = (BODY_FIR_HALF_MS * sample_rate / 1000.0).round() as usize;
         let mut s = Space {
             sr: sample_rate,
             cur: SpaceSettings { split_hz: f32::NAN, ..Default::default() },
             lp: [[Bq::default(); 4]; 2],
-            body_bp: [Bq::default(); 2],
+            body_fir: [Fir::bandpass(sample_rate, BODY_LO_HZ, BODY_HI_HZ, clook), Fir::bandpass(sample_rate, BODY_LO_HZ, BODY_HI_HZ, clook)],
             body_gain: 1.0,
-            side_bp: [Bq::default(); 2],
             side_gain: 1.0,
+            clook,
+            cdelay: [vec![0.0; clook.max(1)], vec![0.0; clook.max(1)]],
+            cpos: 0,
             lean_l: [Bq::default(); 2],
             lean_r: [Bq::default(); 2],
             lean_l_gain: 1.0,
@@ -284,9 +359,6 @@ impl Space {
             gain_db: 0.0,
         };
         s.det.highpass(sample_rate as f64, 2000.0, std::f64::consts::FRAC_1_SQRT_2);
-        s.body_bp[0].highpass(sample_rate as f64, BODY_LO_HZ as f64, std::f64::consts::FRAC_1_SQRT_2);
-        s.body_bp[1].lowpass(sample_rate as f64, BODY_HI_HZ as f64, std::f64::consts::FRAC_1_SQRT_2);
-        s.side_bp = s.body_bp;
         let q = std::f64::consts::FRAC_1_SQRT_2;
         s.lean_l[0].highpass(sample_rate as f64, LEAN_MID_LO_HZ as f64, q);
         s.lean_l[1].lowpass(sample_rate as f64, LEAN_MID_HI_HZ as f64, q);
@@ -303,7 +375,8 @@ impl Space {
     pub fn latency(&self, role: SpaceRole) -> u32 {
         match role {
             SpaceRole::Growls | SpaceRole::Sub => self.look as u32,
-            _ => 0,
+            SpaceRole::ClapTail => self.clook as u32,
+            SpaceRole::Off => 0,
         }
     }
 
@@ -314,9 +387,16 @@ impl Space {
             }
         }
         self.det.clear();
-        for b in self.body_bp.iter_mut().chain(self.side_bp.iter_mut()).chain(self.lean_l.iter_mut()).chain(self.lean_r.iter_mut()) {
+        for b in self.lean_l.iter_mut().chain(self.lean_r.iter_mut()) {
             b.clear();
         }
+        for f in self.body_fir.iter_mut() {
+            f.clear();
+        }
+        for d in self.cdelay.iter_mut() {
+            d.fill(0.0);
+        }
+        self.cpos = 0;
         self.lean_l_gain = 1.0;
         self.lean_r_gain = 1.0;
         for b in self.cen_m.iter_mut().chain(self.cen_s.iter_mut()) {
@@ -478,13 +558,15 @@ impl Space {
         let rearm = rel * 10f32.powf(-REARM_DB / 20.0);
         let retrig = (RETRIGGER_MS * self.sr / 1000.0) as usize;
         let hit_len = (0.020 * self.sr) as usize;
-        let delayed = matches!(role, SpaceRole::Growls | SpaceRole::Sub);
+        let keyed = matches!(role, SpaceRole::Growls | SpaceRole::Sub);
+        let delayed = keyed || role == SpaceRole::ClapTail;
+        let look = if keyed { self.look } else { self.clook };
         let split = matches!(role, SpaceRole::Growls | SpaceRole::ClapTail);
         let ms_per_sample = 1000.0 / self.sr;
         let mut min_gain = 1.0f32;
         for i in 0..len {
             // trigger
-            let trig = if delayed {
+            let trig = if keyed {
                 match side {
                     Some(sc) => 0.5 * (sc[0][i] + sc[1][i]),
                     None => 0.0,
@@ -515,7 +597,7 @@ impl Space {
 
             // gain for the sample that leaves the delay now
             let u = if delayed {
-                (self.since as f32 - self.look as f32) * ms_per_sample
+                (self.since as f32 - look as f32) * ms_per_sample
             } else {
                 self.since as f32 * ms_per_sample
             };
@@ -542,15 +624,14 @@ impl Space {
                 if (self.side_gain - st).abs() < 1e-6 {
                     self.side_gain = st;
                 }
-                let (mid, side) = if nch > 1 {
-                    (0.5 * (channels[0][i] + channels[1][i]), 0.5 * (channels[0][i] - channels[1][i]))
+                // the band of what comes in now lines up with what leaves the delay now
+                let bl = self.body_fir[0].run(channels[0][i]);
+                let (bp, sbp) = if nch > 1 {
+                    let br = self.body_fir[1].run(channels[1][i]);
+                    (0.5 * (bl + br), 0.5 * (bl - br))
                 } else {
-                    (channels[0][i], 0.0)
+                    (bl, 0.0)
                 };
-                let hp = self.body_bp[0].run(mid as f64);
-                let bp = self.body_bp[1].run(hp) as f32;
-                let shp = self.side_bp[0].run(side as f64);
-                let sbp = self.side_bp[1].run(shp) as f32;
                 if self.body_gain != 1.0 {
                     body_add = (self.body_gain - 1.0) * bp;
                 }
@@ -560,9 +641,13 @@ impl Space {
             }
 
             for ch in 0..nch {
-                let x = if delayed {
+                let x = if keyed {
                     let y = self.delay[ch][self.dpos];
                     self.delay[ch][self.dpos] = channels[ch][i];
+                    y
+                } else if delayed {
+                    let y = self.cdelay[ch][self.cpos];
+                    self.cdelay[ch][self.cpos] = channels[ch][i];
                     y
                 } else {
                     channels[ch][i]
@@ -574,7 +659,7 @@ impl Space {
                     }
                     // the side band goes to the two channels with opposite sign
                     let add = body_add + if ch == 0 { side_add } else { -side_add };
-                    if g == 1.0 && !delayed {
+                    if g == 1.0 && !keyed {
                         x + add
                     } else {
                         (low + g as f64 * (x as f64 - low)) as f32 + add
@@ -666,10 +751,15 @@ impl Space {
                 }
             }
 
-            if delayed {
+            if keyed {
                 self.dpos += 1;
                 if self.dpos >= self.look.max(1) {
                     self.dpos = 0;
+                }
+            } else if delayed {
+                self.cpos += 1;
+                if self.cpos >= self.clook.max(1) {
+                    self.cpos = 0;
                 }
             }
             self.since = self.since.saturating_add(1);
@@ -714,6 +804,18 @@ mod tests {
         run_with(SpaceSettings { role, ..Default::default() }, main, side)
     }
 
+    /// The `ClapTail` role delays by half its body filter: line the output up with the input again (the
+    /// last samples, which have not come out yet, are taken from the input).
+    fn undelay(sp: &Space, y: &mut Vec<f32>, x: &[f32]) {
+        if sp.cur.role != SpaceRole::ClapTail {
+            return;
+        }
+        let d = sp.latency(SpaceRole::ClapTail) as usize;
+        let n = y.len();
+        y.copy_within(d.., 0);
+        y[n - d..].copy_from_slice(&x[n - d..]);
+    }
+
     fn run_with(s: SpaceSettings, main: &[f32], side: &[f32]) -> (Vec<f32>, Space) {
         let mut sp = Space::new(SR);
         sp.update(&s);
@@ -727,6 +829,7 @@ mod tests {
             sp.process(&mut [cl, cr], Some([&side[pos..pos + len], &side[pos..pos + len]]), len);
             pos += len;
         }
+        undelay(&sp, &mut l, main);
         (l, sp)
     }
 
@@ -738,7 +841,7 @@ mod tests {
         let (y, sp) = run(SpaceRole::Off, &x, &side);
         assert_eq!(x, y);
         assert_eq!(sp.latency(SpaceRole::Off), 0);
-        assert_eq!(sp.latency(SpaceRole::ClapTail), 0);
+        assert_eq!(sp.latency(SpaceRole::ClapTail), ms(BODY_FIR_HALF_MS) as u32);
         assert_eq!(sp.latency(SpaceRole::Growls), ms(LOOK_MS) as u32);
     }
 
@@ -870,7 +973,10 @@ mod tests {
             let mut l: Vec<f32> = trig.iter().zip(&t600).map(|(a, b)| a + b).collect();
             let mut r: Vec<f32> = trig.iter().zip(&t600).map(|(a, b)| a + side_sign * b).collect();
             let (l0, r0) = (l.clone(), r.clone());
-            sp.process(&mut [&mut l, &mut r], None, n);
+            let (li, ri) = (l.clone(), r.clone());
+        sp.process(&mut [&mut l, &mut r], None, n);
+        undelay(&sp, &mut l, &li);
+        undelay(&sp, &mut r, &ri);
             (l0, r0, l, r)
         };
         let hit = at + ms(HIT_AFTER_TRIGGER_MS);
@@ -906,7 +1012,10 @@ mod tests {
         let mut l: Vec<f32> = trig.iter().zip(&t600).map(|(a, b)| a + b).collect();
         let mut r: Vec<f32> = trig.iter().zip(&t600).map(|(a, b)| a - b).collect();
         let (l0, r0) = (l.clone(), r.clone());
+        let (li, ri) = (l.clone(), r.clone());
         sp.process(&mut [&mut l, &mut r], None, n);
+        undelay(&sp, &mut l, &li);
+        undelay(&sp, &mut r, &ri);
         let hit = at + ms(HIT_AFTER_TRIGGER_MS);
         let probe = |x: &[f32]| {
             let w = &t600[hit + ms(30.0)..hit + ms(90.0)];
@@ -937,7 +1046,10 @@ mod tests {
         let mut l: Vec<f32> = (0..n).map(|i| trig[i] + c[i] + w[i]).collect();
         let mut r: Vec<f32> = (0..n).map(|i| trig[i] + c[i] - w[i]).collect();
         let (l0, r0) = (l.clone(), r.clone());
+        let (li, ri) = (l.clone(), r.clone());
         sp.process(&mut [&mut l, &mut r], None, n);
+        undelay(&sp, &mut l, &li);
+        undelay(&sp, &mut r, &ri);
         let hit = at + ms(HIT_AFTER_TRIGGER_MS);
         let (i0, i1) = (hit + ms(120.0), hit + ms(240.0));
         let pw = |a: &[f32], b: &[f32], sign: f32| -> f32 { (i0..i1).map(|i| (0.5 * (a[i] + sign * b[i])).powi(2)).sum::<f32>() };
@@ -958,6 +1070,30 @@ mod tests {
     }
 
     #[test]
+    fn body_lift_is_exact_in_the_band_and_takes_nothing_away_above_it() {
+        let n = ms(900.0);
+        let at = ms(400.0);
+        let trig = clap(n, at);
+        let hit = at + ms(HIT_AFTER_TRIGGER_MS);
+        for (hz, want) in [(400.0, 8.0), (900.0, 8.0), (5000.0, 0.0), (9000.0, 0.0), (40.0, 0.0)] {
+            let t = tone(n, hz, 0.05);
+            let mut sp = Space::new(SR);
+            sp.update(&SpaceSettings { role: SpaceRole::ClapTail, tail_db: 0.0, body_db: 8.0, body_side_db: 8.0, ..Default::default() });
+            sp.reset();
+            let x: Vec<f32> = (0..n).map(|i| trig[i] + t[i]).collect();
+            let (mut l, mut r) = (x.clone(), x.clone());
+            let (li, ri) = (l.clone(), r.clone());
+            sp.process(&mut [&mut l, &mut r], None, n);
+            undelay(&sp, &mut l, &li);
+            undelay(&sp, &mut r, &ri);
+            // after the burst has ended, while the lift is still fully on
+            let (i0, i1) = (hit + ms(65.0), hit + ms(93.0));
+            let got = 20.0 * ((l[i0..i1].iter().zip(&t[i0..i1]).map(|(p, q)| p * q).sum::<f32>() / t[i0..i1].iter().map(|q| q * q).sum::<f32>()).abs()).log10();
+            assert!((got - want).abs() < 0.25, "{hz} Hz: {got:.2} dB, wanted {want}");
+        }
+    }
+
+    #[test]
     fn push_raises_everything_for_the_length_of_the_body() {
         let n = ms(900.0);
         let at = ms(400.0);
@@ -969,7 +1105,10 @@ mod tests {
         sp.reset();
         let x: Vec<f32> = (0..n).map(|i| trig[i] + low[i] + high[i]).collect();
         let (mut l, mut r) = (x.clone(), x.clone());
+        let (li, ri) = (l.clone(), r.clone());
         sp.process(&mut [&mut l, &mut r], None, n);
+        undelay(&sp, &mut l, &li);
+        undelay(&sp, &mut r, &ri);
         let hit = at + ms(HIT_AFTER_TRIGGER_MS);
         let probe = |y: &[f32], w: &[f32], a: f32, b: f32| {
             let (i0, i1) = (hit + ms(a), hit + ms(b));
@@ -997,7 +1136,10 @@ mod tests {
         sp.reset();
         let x: Vec<f32> = (0..n).map(|i| trig[i] + mid[i] + high[i]).collect();
         let (mut l, mut r) = (x.clone(), x.clone());
+        let (li, ri) = (l.clone(), r.clone());
         sp.process(&mut [&mut l, &mut r], None, n);
+        undelay(&sp, &mut l, &li);
+        undelay(&sp, &mut r, &ri);
         let hit = at + ms(HIT_AFTER_TRIGGER_MS);
         let probe = |y: &[f32], w: &[f32], a: f32, b: f32| {
             let (i0, i1) = (hit + ms(a), hit + ms(b));
@@ -1025,7 +1167,10 @@ mod tests {
         sp.reset();
         let mut l = x.clone();
         let mut r = x.clone();
+        let (li, ri) = (l.clone(), r.clone());
         sp.process(&mut [&mut l, &mut r], None, n);
+        undelay(&sp, &mut l, &li);
+        undelay(&sp, &mut r, &ri);
         assert_eq!(sp.triggers, 0);
         let look = ms(LOOK_MS);
         // only the delay

@@ -1,6 +1,6 @@
 //! Clap Shaper: shapes the clap itself after each hit. Put it last on the clap's bus, before the drum bus clip:
 //! it lifts the centre of the body (150 Hz to 1.5 kHz) while the clap sounds and dips the tail afterwards.
-//! It triggers from its own input, so no sidechain. See `clapdsp::space` (`ClapTail`) for the details.
+//! It triggers from its own input, so no sidechain; 20 ms of latency for the phase-free body filter. See `clapdsp::space` (`ClapTail`) for the details.
 use clapdsp::space::{Space, SpaceRole, SpaceSettings};
 use nih_plug::prelude::*;
 use nih_plug_vizia::vizia::prelude::*;

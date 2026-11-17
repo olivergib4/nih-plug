@@ -103,11 +103,13 @@ pub const REARM_DB: f32 = 12.0;
 /// Band of the body lift.
 pub const BODY_LO_HZ: f32 = 120.0;
 pub const BODY_HI_HZ: f32 = 1800.0;
-/// Lean: left mids (`LEAN_MID_*`) from 15 to 60 ms, right highs (`LEAN_HIGH_*`) from 70 to 180 ms.
-pub const LEAN_MID_LO_HZ: f32 = 600.0;
-pub const LEAN_MID_HI_HZ: f32 = 1500.0;
-pub const LEAN_HIGH_LO_HZ: f32 = 1500.0;
-pub const LEAN_HIGH_HI_HZ: f32 = 12000.0;
+/// Lean: left mids from 15 to 60 ms, right highs from 70 to 180 ms. The corners sit outside the bands that
+/// are meant to move (600 Hz to 1.5 kHz, and 1.5 kHz up) because the gentle filters only reach the full
+/// amount about an octave inside their corners.
+pub const LEAN_MID_LO_HZ: f32 = 420.0;
+pub const LEAN_MID_HI_HZ: f32 = 2100.0;
+pub const LEAN_HIGH_LO_HZ: f32 = 1000.0;
+pub const LEAN_HIGH_HI_HZ: f32 = 14000.0;
 pub const LEAN_RIGHT_RATIO: f32 = 0.8;
 const BODY_FADE_IN_MS: f32 = 12.0;
 const BODY_FADE_OUT_MS: f32 = 30.0;
@@ -500,8 +502,32 @@ impl Space {
                 }
             }
 
-            // lean: the left channel's mids early, the right channel's highs late
-            let mut lean_add = [0.0f32; 2];
+            for ch in 0..nch {
+                let x = if delayed {
+                    let y = self.delay[ch][self.dpos];
+                    self.delay[ch][self.dpos] = channels[ch][i];
+                    y
+                } else {
+                    channels[ch][i]
+                };
+                channels[ch][i] = if split {
+                    let mut low = x as f64;
+                    for b in self.lp[ch].iter_mut() {
+                        low = b.run(low);
+                    }
+                    // the side band goes to the two channels with opposite sign
+                    let add = body_add + if ch == 0 { side_add } else { -side_add };
+                    if g == 1.0 && !delayed {
+                        x + add
+                    } else {
+                        (low + g as f64 * (x as f64 - low)) as f32 + add
+                    }
+                } else {
+                    g * x
+                };
+            }
+            // lean, on what the body and tail stages produced: the left channel's mids early, the right
+            // channel's highs late
             if role == SpaceRole::ClapTail && nch > 1 {
                 let idle = self.since > (self.sr as usize) * 4;
                 let t = u - HIT_AFTER_TRIGGER_MS;
@@ -521,37 +547,13 @@ impl Space {
                 let rh = self.lean_r[0].run(channels[1][i] as f64);
                 let rb = self.lean_r[1].run(rh) as f32;
                 if self.lean_l_gain != 1.0 {
-                    lean_add[0] = (self.lean_l_gain - 1.0) * lb;
+                    channels[0][i] += (self.lean_l_gain - 1.0) * lb;
                 }
                 if self.lean_r_gain != 1.0 {
-                    lean_add[1] = (self.lean_r_gain - 1.0) * rb;
+                    channels[1][i] += (self.lean_r_gain - 1.0) * rb;
                 }
             }
 
-            for ch in 0..nch {
-                let x = if delayed {
-                    let y = self.delay[ch][self.dpos];
-                    self.delay[ch][self.dpos] = channels[ch][i];
-                    y
-                } else {
-                    channels[ch][i]
-                };
-                channels[ch][i] = if split {
-                    let mut low = x as f64;
-                    for b in self.lp[ch].iter_mut() {
-                        low = b.run(low);
-                    }
-                    // the side band goes to the two channels with opposite sign
-                    let add = body_add + if ch == 0 { side_add } else { -side_add } + lean_add[ch];
-                    if g == 1.0 && !delayed {
-                        x + add
-                    } else {
-                        (low + g as f64 * (x as f64 - low)) as f32 + add
-                    }
-                } else {
-                    g * x
-                };
-            }
             if delayed {
                 self.dpos += 1;
                 if self.dpos >= self.look.max(1) {

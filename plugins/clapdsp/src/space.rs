@@ -72,6 +72,11 @@ pub struct SpaceSettings {
     /// this much and both centre and sides are then raised together so the stereo level stays where it
     /// was. The tail folds to mono louder and loses nothing in stereo.
     pub centre_db: f32,
+    /// Clap push (dB): the whole signal is raised by this much from `push_from_ms` to `push_to_ms` after
+    /// the hit (5 ms up, 30 ms back), so the clap's body goes into the following clip harder.
+    pub push_db: f32,
+    pub push_from_ms: f32,
+    pub push_to_ms: f32,
 }
 
 impl Default for SpaceSettings {
@@ -94,6 +99,9 @@ impl Default for SpaceSettings {
             body_to_ms: 95.0,
             lean_db: 0.0,
             centre_db: 0.0,
+            push_db: 0.0,
+            push_from_ms: 23.0,
+            push_to_ms: 63.0,
         }
     }
 }
@@ -213,6 +221,7 @@ pub struct Space {
     cen_ps: f32,
     cen_w: f32,
     cen_pow: f32,
+    push_gain: f32,
     det: Bq,
     env: f32,
     env_rel: f32,
@@ -254,6 +263,7 @@ impl Space {
             cen_pm: 0.0,
             cen_ps: 0.0,
             cen_w: 0.0,
+            push_gain: 1.0,
             // 20 ms power average
             cen_pow: 1.0 - (-1.0f32 / (0.020 * sample_rate)).exp(),
             det: Bq::default(),
@@ -315,6 +325,7 @@ impl Space {
         self.cen_pm = 0.0;
         self.cen_ps = 0.0;
         self.cen_w = 0.0;
+        self.push_gain = 1.0;
         self.body_gain = 1.0;
         self.side_gain = 1.0;
         self.env = 0.0;
@@ -637,6 +648,24 @@ impl Space {
                 }
             }
 
+            // push: everything up for the length of the body, last so it scales what the other stages made
+            if role == SpaceRole::ClapTail {
+                let idle = self.since > (self.sr as usize) * 4;
+                let t = u - HIT_AFTER_TRIGGER_MS;
+                let from = self.cur.push_from_ms;
+                let to = self.cur.push_to_ms.max(from + 6.0);
+                let pt = if idle { 1.0 } else { Self::trapezoid(t, self.cur.push_db, from, from + 5.0, to, to + 30.0) };
+                self.push_gain += (pt - self.push_gain) * self.slew;
+                if (self.push_gain - pt).abs() < 1e-6 {
+                    self.push_gain = pt;
+                }
+                if self.push_gain != 1.0 {
+                    for ch in channels.iter_mut() {
+                        ch[i] *= self.push_gain;
+                    }
+                }
+            }
+
             if delayed {
                 self.dpos += 1;
                 if self.dpos >= self.look.max(1) {
@@ -926,6 +955,34 @@ mod tests {
         assert!(diff(&l0, &l, ms(320.0), hit + ms(55.0)) == 0.0, "before: {}", diff(&l0, &l, ms(320.0), hit + ms(55.0)));
         assert!(diff(&l0, &l, hit + ms(285.0), n) == 0.0, "after: {}", diff(&l0, &l, hit + ms(285.0), n));
         assert!(diff(&r0, &r, hit + ms(285.0), n) == 0.0);
+    }
+
+    #[test]
+    fn push_raises_everything_for_the_length_of_the_body() {
+        let n = ms(900.0);
+        let at = ms(400.0);
+        let trig = clap(n, at);
+        let low = tone(n, 300.0, 0.05);
+        let high = tone(n, 6000.0, 0.05);
+        let mut sp = Space::new(SR);
+        sp.update(&SpaceSettings { role: SpaceRole::ClapTail, tail_db: 0.0, push_db: 6.0, ..Default::default() });
+        sp.reset();
+        let x: Vec<f32> = (0..n).map(|i| trig[i] + low[i] + high[i]).collect();
+        let (mut l, mut r) = (x.clone(), x.clone());
+        sp.process(&mut [&mut l, &mut r], None, n);
+        let hit = at + ms(HIT_AFTER_TRIGGER_MS);
+        let probe = |y: &[f32], w: &[f32], a: f32, b: f32| {
+            let (i0, i1) = (hit + ms(a), hit + ms(b));
+            20.0 * ((y[i0..i1].iter().zip(&w[i0..i1]).map(|(p, q)| p * q).sum::<f32>() / x[i0..i1].iter().zip(&w[i0..i1]).map(|(p, q)| p * q).sum::<f32>()).abs()).log10()
+        };
+        for w in [&low, &high] {
+            assert!((probe(&l, w, 30.0, 62.0) - 6.0).abs() < 0.3, "{:.2}", probe(&l, w, 30.0, 62.0));
+            assert!((probe(&r, w, 30.0, 62.0) - 6.0).abs() < 0.3);
+        }
+        // the hit itself and everything after the body are what went in
+        // (the tones starting at sample 0 count as a first, quiet hit: look after its window)
+        assert!(x[ms(320.0)..hit + ms(22.0)] == l[ms(320.0)..hit + ms(22.0)], "moved before the push");
+        assert!(x[hit + ms(100.0)..] == l[hit + ms(100.0)..], "moved after the push");
     }
 
     #[test]

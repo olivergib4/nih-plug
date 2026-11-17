@@ -61,6 +61,9 @@ pub struct SpaceSettings {
     pub body_side_db: f32,
     pub body_from_ms: f32,
     pub body_to_ms: f32,
+    /// Clap lean (dB): the left channel's mids come up by this much early in the clap and the right
+    /// channel's highs by 0.8 of it late, so the clap starts a little left and ends a little right.
+    pub lean_db: f32,
 }
 
 impl Default for SpaceSettings {
@@ -80,6 +83,7 @@ impl Default for SpaceSettings {
             body_side_db: 0.0,
             body_from_ms: 20.0,
             body_to_ms: 95.0,
+            lean_db: 0.0,
         }
     }
 }
@@ -99,6 +103,12 @@ pub const REARM_DB: f32 = 12.0;
 /// Band of the body lift.
 pub const BODY_LO_HZ: f32 = 120.0;
 pub const BODY_HI_HZ: f32 = 1800.0;
+/// Lean: left mids (`LEAN_MID_*`) from 15 to 60 ms, right highs (`LEAN_HIGH_*`) from 70 to 180 ms.
+pub const LEAN_MID_LO_HZ: f32 = 600.0;
+pub const LEAN_MID_HI_HZ: f32 = 1500.0;
+pub const LEAN_HIGH_LO_HZ: f32 = 1500.0;
+pub const LEAN_HIGH_HI_HZ: f32 = 12000.0;
+pub const LEAN_RIGHT_RATIO: f32 = 0.8;
 const BODY_FADE_IN_MS: f32 = 12.0;
 const BODY_FADE_OUT_MS: f32 = 30.0;
 const TAIL_FADE_IN_MS: f32 = 30.0;
@@ -170,6 +180,11 @@ pub struct Space {
     /// The same band of the side channel.
     side_bp: [Bq; 2],
     side_gain: f32,
+    /// Lean: mid band of the left channel, high band of the right.
+    lean_l: [Bq; 2],
+    lean_r: [Bq; 2],
+    lean_l_gain: f32,
+    lean_r_gain: f32,
     det: Bq,
     env: f32,
     env_rel: f32,
@@ -202,6 +217,10 @@ impl Space {
             body_gain: 1.0,
             side_bp: [Bq::default(); 2],
             side_gain: 1.0,
+            lean_l: [Bq::default(); 2],
+            lean_r: [Bq::default(); 2],
+            lean_l_gain: 1.0,
+            lean_r_gain: 1.0,
             det: Bq::default(),
             env: 0.0,
             env_rel: (-1.0f32 / (0.005 * sample_rate)).exp(),
@@ -223,6 +242,11 @@ impl Space {
         s.body_bp[0].highpass(sample_rate as f64, BODY_LO_HZ as f64, std::f64::consts::FRAC_1_SQRT_2);
         s.body_bp[1].lowpass(sample_rate as f64, BODY_HI_HZ as f64, std::f64::consts::FRAC_1_SQRT_2);
         s.side_bp = s.body_bp;
+        let q = std::f64::consts::FRAC_1_SQRT_2;
+        s.lean_l[0].highpass(sample_rate as f64, LEAN_MID_LO_HZ as f64, q);
+        s.lean_l[1].lowpass(sample_rate as f64, LEAN_MID_HI_HZ as f64, q);
+        s.lean_r[0].highpass(sample_rate as f64, LEAN_HIGH_LO_HZ as f64, q);
+        s.lean_r[1].lowpass(sample_rate as f64, (LEAN_HIGH_HI_HZ as f64).min(0.45 * sample_rate as f64), q);
         s.update(&SpaceSettings::default());
         s
     }
@@ -242,9 +266,11 @@ impl Space {
             }
         }
         self.det.clear();
-        for b in self.body_bp.iter_mut().chain(self.side_bp.iter_mut()) {
+        for b in self.body_bp.iter_mut().chain(self.side_bp.iter_mut()).chain(self.lean_l.iter_mut()).chain(self.lean_r.iter_mut()) {
             b.clear();
         }
+        self.lean_l_gain = 1.0;
+        self.lean_r_gain = 1.0;
         self.body_gain = 1.0;
         self.side_gain = 1.0;
         self.env = 0.0;
@@ -366,6 +392,20 @@ impl Space {
         }
     }
 
+    /// A dB-linear trapezoid: 0 dB until `a0`, `amount_db` from `a1` to `o0`, 0 dB again from `o1`.
+    #[inline]
+    fn trapezoid(t: f32, amount_db: f32, a0: f32, a1: f32, o0: f32, o1: f32) -> f32 {
+        if amount_db == 0.0 || t <= a0 || t >= o1 {
+            1.0
+        } else if t < a1 {
+            db_to_gain(amount_db * (t - a0) / (a1 - a0))
+        } else if t <= o0 {
+            db_to_gain(amount_db)
+        } else {
+            db_to_gain(amount_db * (o1 - t) / (o1 - o0))
+        }
+    }
+
     /// Process `len` samples of `channels` in place. `side` is the sidechain (the clap) for the `Growls`
     /// and `Sub` roles; `ClapTail` triggers from `channels` itself.
     pub fn process(&mut self, channels: &mut [&mut [f32]], side: Option<[&[f32]; 2]>, len: usize) {
@@ -460,6 +500,34 @@ impl Space {
                 }
             }
 
+            // lean: the left channel's mids early, the right channel's highs late
+            let mut lean_add = [0.0f32; 2];
+            if role == SpaceRole::ClapTail && nch > 1 {
+                let idle = self.since > (self.sr as usize) * 4;
+                let t = u - HIT_AFTER_TRIGGER_MS;
+                let lean = self.cur.lean_db;
+                let lt = if idle { 1.0 } else { Self::trapezoid(t, lean, 5.0, 15.0, 60.0, 90.0) };
+                let rt = if idle { 1.0 } else { Self::trapezoid(t, lean * LEAN_RIGHT_RATIO, 40.0, 70.0, 180.0, 230.0) };
+                self.lean_l_gain += (lt - self.lean_l_gain) * self.slew;
+                if (self.lean_l_gain - lt).abs() < 1e-6 {
+                    self.lean_l_gain = lt;
+                }
+                self.lean_r_gain += (rt - self.lean_r_gain) * self.slew;
+                if (self.lean_r_gain - rt).abs() < 1e-6 {
+                    self.lean_r_gain = rt;
+                }
+                let lh = self.lean_l[0].run(channels[0][i] as f64);
+                let lb = self.lean_l[1].run(lh) as f32;
+                let rh = self.lean_r[0].run(channels[1][i] as f64);
+                let rb = self.lean_r[1].run(rh) as f32;
+                if self.lean_l_gain != 1.0 {
+                    lean_add[0] = (self.lean_l_gain - 1.0) * lb;
+                }
+                if self.lean_r_gain != 1.0 {
+                    lean_add[1] = (self.lean_r_gain - 1.0) * rb;
+                }
+            }
+
             for ch in 0..nch {
                 let x = if delayed {
                     let y = self.delay[ch][self.dpos];
@@ -474,7 +542,7 @@ impl Space {
                         low = b.run(low);
                     }
                     // the side band goes to the two channels with opposite sign
-                    let add = body_add + if ch == 0 { side_add } else { -side_add };
+                    let add = body_add + if ch == 0 { side_add } else { -side_add } + lean_add[ch];
                     if g == 1.0 && !delayed {
                         x + add
                     } else {
@@ -714,6 +782,37 @@ mod tests {
         for i in 0..n {
             assert!((m0[i] - m1[i]).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn lean_lifts_left_mids_early_and_right_highs_late() {
+        let n = ms(900.0);
+        let at = ms(400.0);
+        let trig = clap(n, at);
+        let mid = tone(n, 1000.0, 0.05);
+        let high = tone(n, 4000.0, 0.05);
+        let mut sp = Space::new(SR);
+        sp.update(&SpaceSettings { role: SpaceRole::ClapTail, tail_db: 0.0, lean_db: 2.5, ..Default::default() });
+        sp.reset();
+        let x: Vec<f32> = (0..n).map(|i| trig[i] + mid[i] + high[i]).collect();
+        let (mut l, mut r) = (x.clone(), x.clone());
+        sp.process(&mut [&mut l, &mut r], None, n);
+        let hit = at + ms(HIT_AFTER_TRIGGER_MS);
+        let probe = |y: &[f32], w: &[f32], a: f32, b: f32| {
+            let (i0, i1) = (hit + ms(a), hit + ms(b));
+            20.0 * ((y[i0..i1].iter().zip(&w[i0..i1]).map(|(p, q)| p * q).sum::<f32>() / x[i0..i1].iter().zip(&w[i0..i1]).map(|(p, q)| p * q).sum::<f32>()).abs()).log10()
+        };
+        // early: left mids up 2.5 dB, right untouched
+        let lm = probe(&l, &mid, 20.0, 58.0);
+        assert!((lm - 2.5).abs() < 0.7, "left mids {lm:.2} dB");
+        assert!(probe(&r, &mid, 20.0, 38.0).abs() < 0.05);
+        // late: right highs up 2 dB, left untouched
+        let rh = probe(&r, &high, 80.0, 175.0);
+        assert!((rh - 2.0).abs() < 0.7, "right highs {rh:.2} dB");
+        assert!(probe(&l, &high, 100.0, 175.0).abs() < 0.05);
+        // and nothing is left of it afterwards
+        assert_eq!(&x[hit + ms(240.0)..], &l[hit + ms(240.0)..]);
+        assert_eq!(&x[hit + ms(240.0)..], &r[hit + ms(240.0)..]);
     }
 
     #[test]

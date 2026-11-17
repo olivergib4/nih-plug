@@ -55,7 +55,7 @@ pub struct SpaceSettings {
     pub sub_hold_ms: f32,
     /// Sub: back to full level this long after the hit.
     pub sub_back_ms: f32,
-    /// Clap tail: dip (positive dB) between `tail_from_ms` and `tail_to_ms`.
+    /// Clap tail: dip (positive dB) or lift (negative dB) between `tail_from_ms` and `tail_to_ms`.
     pub tail_db: f32,
     pub tail_from_ms: f32,
     pub tail_to_ms: f32,
@@ -489,7 +489,8 @@ impl Space {
                 }
             }
             SpaceRole::ClapTail => {
-                let d = -s.tail_db.abs();
+                // positive dips the tail, negative lifts it
+                let d = -s.tail_db;
                 let from = s.tail_from_ms;
                 let to = s.tail_to_ms.max(from + 1.0);
                 let a0 = from - TAIL_FADE_IN_MS;
@@ -935,6 +936,29 @@ mod tests {
         let d = rms_db(&x[hit + ms(160.0)..hit + ms(230.0)]) - rms_db(&y[hit + ms(160.0)..hit + ms(230.0)]);
         assert!((d - 7.0).abs() < 0.3, "{d:.2}");
         let after = rms_db(&x[hit + ms(270.0)..hit + ms(400.0)]) - rms_db(&y[hit + ms(270.0)..hit + ms(400.0)]);
+        assert!(after.abs() < 0.05, "{after:.3}");
+    }
+
+    #[test]
+    fn a_negative_tail_dip_lifts_the_tail_and_leaves_the_body_alone() {
+        let n = ms(900.0);
+        let at = ms(100.0);
+        let mut x = clap(n, at);
+        for (i, v) in x.iter_mut().enumerate() {
+            if i >= at {
+                *v += 0.05 * (2.0 * std::f32::consts::PI * 3000.0 * i as f32 / SR).sin();
+            }
+        }
+        let side = vec![0.0; n];
+        let s = SpaceSettings { role: SpaceRole::ClapTail, tail_db: -10.0, tail_from_ms: 110.0, tail_to_ms: 300.0, ..Default::default() };
+        let (y, sp) = run_with(s, &x, &side);
+        assert_eq!(sp.triggers, 1);
+        let hit = at + ms(HIT_AFTER_TRIGGER_MS);
+        let body = rms_db(&y[hit..hit + ms(75.0)]) - rms_db(&x[hit..hit + ms(75.0)]);
+        assert!(body.abs() < 0.05, "{body:.3}");
+        let d = rms_db(&y[hit + ms(120.0)..hit + ms(280.0)]) - rms_db(&x[hit + ms(120.0)..hit + ms(280.0)]);
+        assert!((d - 10.0).abs() < 0.3, "{d:.2}");
+        let after = rms_db(&y[hit + ms(330.0)..hit + ms(500.0)]) - rms_db(&x[hit + ms(330.0)..hit + ms(500.0)]);
         assert!(after.abs() < 0.05, "{after:.3}");
     }
 

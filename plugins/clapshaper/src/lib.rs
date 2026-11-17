@@ -75,7 +75,7 @@ impl Default for ClapShaperParams {
             push_db: db("Push", 0.0, 0.0, 12.0),
             push_from: ms("Push from", 23.0, 5.0, 100.0),
             push_to: ms("Push to", 63.0, 20.0, 300.0),
-            tail_db: db("Tail dip", 7.0, 0.0, 24.0),
+            tail_db: db("Tail dip", 7.0, -18.0, 24.0),
             tail_from: ms("Tail from", 150.0, 40.0, 500.0),
             tail_to: ms("Tail to", 250.0, 60.0, 800.0),
             split: FloatParam::new("Tail above", 150.0, FloatRange::Skewed { min: 60.0, max: 1000.0, factor: FloatRange::skew_factor(-2.0) })
@@ -200,7 +200,7 @@ impl Plugin for ClapShaper {
                 Label::new(cx, "Lean (starts left, ends right)").height(Pixels(26.0)).top(Pixels(8.0));
                 row(cx, "Lean by", |p| &p.lean_db);
                 Label::new(cx, "Tail").height(Pixels(26.0)).top(Pixels(8.0));
-                row(cx, "Dip by", |p| &p.tail_db);
+                row(cx, "Dip by (minus lifts)", |p| &p.tail_db);
                 row(cx, "From", |p| &p.tail_from);
                 row(cx, "To", |p| &p.tail_to);
                 row(cx, "Above", |p| &p.split);

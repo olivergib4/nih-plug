@@ -68,6 +68,10 @@ pub struct SpaceSettings {
     /// Clap lean (dB): the left channel's mids come up by this much early in the clap and the right
     /// channel's highs by 0.8 of it late, so the clap starts a little left and ends a little right.
     pub lean_db: f32,
+    /// Clap tail to centre (dB): from `CENTRE_FROM_MS` to `tail_to_ms` the sides of the tail come down by
+    /// this much and both centre and sides are then raised together so the stereo level stays where it
+    /// was. The tail folds to mono louder and loses nothing in stereo.
+    pub centre_db: f32,
 }
 
 impl Default for SpaceSettings {
@@ -89,6 +93,7 @@ impl Default for SpaceSettings {
             body_from_ms: 20.0,
             body_to_ms: 95.0,
             lean_db: 0.0,
+            centre_db: 0.0,
         }
     }
 }
@@ -118,6 +123,13 @@ pub const LEAN_MID_HI_HZ: f32 = 2100.0;
 pub const LEAN_HIGH_LO_HZ: f32 = 1000.0;
 pub const LEAN_HIGH_HI_HZ: f32 = 14000.0;
 pub const LEAN_RIGHT_RATIO: f32 = 0.8;
+/// Tail to centre: band, start (the end is `tail_to_ms`) and fades.
+pub const CENTRE_LO_HZ: f32 = 400.0;
+pub const CENTRE_HI_HZ: f32 = 7000.0;
+pub const CENTRE_FROM_MS: f32 = 85.0;
+const CENTRE_FADE_MS: f32 = 25.0;
+/// The level match never lifts by more than this.
+const CENTRE_MAX_LIFT_DB: f32 = 6.0;
 const BODY_FADE_IN_MS: f32 = 12.0;
 const BODY_FADE_OUT_MS: f32 = 30.0;
 const TAIL_FADE_IN_MS: f32 = 30.0;
@@ -194,6 +206,13 @@ pub struct Space {
     lean_r: [Bq; 2],
     lean_l_gain: f32,
     lean_r_gain: f32,
+    /// Tail to centre: band of the mid and of the side channel, their smoothed powers, the weight.
+    cen_m: [Bq; 2],
+    cen_s: [Bq; 2],
+    cen_pm: f32,
+    cen_ps: f32,
+    cen_w: f32,
+    cen_pow: f32,
     det: Bq,
     env: f32,
     env_rel: f32,
@@ -230,6 +249,13 @@ impl Space {
             lean_r: [Bq::default(); 2],
             lean_l_gain: 1.0,
             lean_r_gain: 1.0,
+            cen_m: [Bq::default(); 2],
+            cen_s: [Bq::default(); 2],
+            cen_pm: 0.0,
+            cen_ps: 0.0,
+            cen_w: 0.0,
+            // 20 ms power average
+            cen_pow: 1.0 - (-1.0f32 / (0.020 * sample_rate)).exp(),
             det: Bq::default(),
             env: 0.0,
             env_rel: (-1.0f32 / (0.005 * sample_rate)).exp(),
@@ -256,6 +282,9 @@ impl Space {
         s.lean_l[1].lowpass(sample_rate as f64, LEAN_MID_HI_HZ as f64, q);
         s.lean_r[0].highpass(sample_rate as f64, LEAN_HIGH_LO_HZ as f64, q);
         s.lean_r[1].lowpass(sample_rate as f64, (LEAN_HIGH_HI_HZ as f64).min(0.45 * sample_rate as f64), q);
+        s.cen_m[0].highpass(sample_rate as f64, CENTRE_LO_HZ as f64, q);
+        s.cen_m[1].lowpass(sample_rate as f64, (CENTRE_HI_HZ as f64).min(0.45 * sample_rate as f64), q);
+        s.cen_s = s.cen_m;
         s.update(&SpaceSettings::default());
         s
     }
@@ -280,6 +309,12 @@ impl Space {
         }
         self.lean_l_gain = 1.0;
         self.lean_r_gain = 1.0;
+        for b in self.cen_m.iter_mut().chain(self.cen_s.iter_mut()) {
+            b.clear();
+        }
+        self.cen_pm = 0.0;
+        self.cen_ps = 0.0;
+        self.cen_w = 0.0;
         self.body_gain = 1.0;
         self.side_gain = 1.0;
         self.env = 0.0;
@@ -536,6 +571,43 @@ impl Space {
                 } else {
                     g * x
                 };
+            }
+            // tail to centre, on what the body and tail stages produced: sides of the tail down, then both
+            // up by whatever keeps the band's stereo power where it was
+            if role == SpaceRole::ClapTail && nch > 1 {
+                let idle = self.since > (self.sr as usize) * 4;
+                let t = u - HIT_AFTER_TRIGGER_MS;
+                let amount = self.cur.centre_db.abs();
+                let to = self.cur.tail_to_ms.max(CENTRE_FROM_MS + 1.0);
+                let wt = if idle || amount == 0.0 || t <= CENTRE_FROM_MS - CENTRE_FADE_MS || t >= to + CENTRE_FADE_MS {
+                    0.0
+                } else if t < CENTRE_FROM_MS {
+                    (t - (CENTRE_FROM_MS - CENTRE_FADE_MS)) / CENTRE_FADE_MS
+                } else if t <= to {
+                    1.0
+                } else {
+                    (to + CENTRE_FADE_MS - t) / CENTRE_FADE_MS
+                };
+                self.cen_w += (wt - self.cen_w) * self.slew;
+                if (self.cen_w - wt).abs() < 1e-6 {
+                    self.cen_w = wt;
+                }
+                let mid = 0.5 * (channels[0][i] + channels[1][i]);
+                let side = 0.5 * (channels[0][i] - channels[1][i]);
+                let mh = self.cen_m[0].run(mid as f64);
+                let mb = self.cen_m[1].run(mh) as f32;
+                let sh = self.cen_s[0].run(side as f64);
+                let sb = self.cen_s[1].run(sh) as f32;
+                self.cen_pm += (mb * mb - self.cen_pm) * self.cen_pow;
+                self.cen_ps += (sb * sb - self.cen_ps) * self.cen_pow;
+                if self.cen_w > 0.0 {
+                    let g = db_to_gain(-amount);
+                    let k = ((self.cen_pm + self.cen_ps) / (self.cen_pm + g * g * self.cen_ps + 1e-20)).sqrt().clamp(1.0, db_to_gain(CENTRE_MAX_LIFT_DB));
+                    let m_add = self.cen_w * (k - 1.0) * mb;
+                    let s_add = self.cen_w * (g * k - 1.0) * sb;
+                    channels[0][i] += m_add + s_add;
+                    channels[1][i] += m_add - s_add;
+                }
             }
             // lean, on what the body and tail stages produced: the left channel's mids early, the right
             // channel's highs late
@@ -820,6 +892,40 @@ mod tests {
         for i in 0..n {
             assert!((m0[i] - m1[i]).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn tail_to_centre_moves_the_tail_inwards_at_the_same_stereo_level() {
+        let n = ms(1000.0);
+        let at = ms(400.0);
+        let trig = clap(n, at);
+        // a tail that is as loud on the sides as in the centre: 1 kHz in the centre, 1.5 kHz on the sides
+        let c = tone(n, 1000.0, 0.05);
+        let w = tone(n, 1500.0, 0.05);
+        let mut sp = Space::new(SR);
+        sp.update(&SpaceSettings { role: SpaceRole::ClapTail, tail_db: 0.0, centre_db: 4.0, ..Default::default() });
+        sp.reset();
+        let mut l: Vec<f32> = (0..n).map(|i| trig[i] + c[i] + w[i]).collect();
+        let mut r: Vec<f32> = (0..n).map(|i| trig[i] + c[i] - w[i]).collect();
+        let (l0, r0) = (l.clone(), r.clone());
+        sp.process(&mut [&mut l, &mut r], None, n);
+        let hit = at + ms(HIT_AFTER_TRIGGER_MS);
+        let (i0, i1) = (hit + ms(120.0), hit + ms(240.0));
+        let pw = |a: &[f32], b: &[f32], sign: f32| -> f32 { (i0..i1).map(|i| (0.5 * (a[i] + sign * b[i])).powi(2)).sum::<f32>() };
+        let (m0, s0, m1, s1) = (pw(&l0, &r0, 1.0), pw(&l0, &r0, -1.0), pw(&l, &r, 1.0), pw(&l, &r, -1.0));
+        let up = 10.0 * (m1 / m0).log10();
+        let down = 10.0 * (s1 / s0).log10();
+        let total = 10.0 * ((m1 + s1) / (m0 + s0)).log10();
+        // sides 4 dB under the centre's change, the sum where it was
+        assert!((up - down - 4.0).abs() < 0.6, "centre {up:.2} dB, sides {down:.2} dB");
+        assert!(up > 1.0 && down < -1.5, "centre {up:.2} dB, sides {down:.2} dB");
+        assert!(total.abs() < 0.4, "stereo level moved {total:.2} dB");
+        // the hit, the body and everything after the tail are what went in
+        let diff = |a: &[f32], b: &[f32], i0: usize, i1: usize| (i0..i1).map(|i| (a[i] - b[i]).abs()).fold(0.0f32, f32::max);
+        // (the tones starting at sample 0 count as a first, quiet hit: look after its window)
+        assert!(diff(&l0, &l, ms(320.0), hit + ms(55.0)) == 0.0, "before: {}", diff(&l0, &l, ms(320.0), hit + ms(55.0)));
+        assert!(diff(&l0, &l, hit + ms(285.0), n) == 0.0, "after: {}", diff(&l0, &l, hit + ms(285.0), n));
+        assert!(diff(&r0, &r, hit + ms(285.0), n) == 0.0);
     }
 
     #[test]

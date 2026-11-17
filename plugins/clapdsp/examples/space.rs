@@ -1,5 +1,5 @@
 //! Run a raw f32le stereo file through the Space section:
-//! `space IN OUT role(growls|sub|tail) [SIDE|-] [depth_db back_ms sub_hold_ms sub_back_ms tail_db tail_from_ms tail_to_ms split_hz thr_db body_db body_from_ms body_to_ms body_side_db lean_db before_ms]`
+//! `space IN OUT role(growls|sub|tail) [SIDE|-] [depth_db back_ms sub_hold_ms sub_back_ms tail_db tail_from_ms tail_to_ms split_hz thr_db body_db body_from_ms body_to_ms body_side_db lean_db before_ms centre_db]`
 //! SIDE is the sidechain (the clap) as raw f32le stereo, "-" for none. The output is delayed by the lookahead
 //! for the growls and sub roles, as in the plugin before the host compensates. Trigger positions (samples in
 //! the input) go to stderr.
@@ -41,6 +41,7 @@ fn main() {
     s.body_side_db = f(17, s.body_side_db);
     s.lean_db = f(18, s.lean_db);
     s.before_ms = f(19, s.before_ms);
+    s.centre_db = f(20, s.centre_db);
     let mut sp = Space::new(44100.0);
     sp.update(&s);
     sp.reset();

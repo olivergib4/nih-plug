@@ -28,6 +28,8 @@ pub struct ClapShaperParams {
     pub body_to: FloatParam,
     #[id = "lean_db"]
     pub lean_db: FloatParam,
+    #[id = "centre_db"]
+    pub centre_db: FloatParam,
     #[id = "tail_db"]
     pub tail_db: FloatParam,
     #[id = "tail_from"]
@@ -55,7 +57,7 @@ fn ms(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
 impl Default for ClapShaperParams {
     fn default() -> Self {
         ClapShaperParams {
-            editor_state: ViziaState::new(|| (380, 600)),
+            editor_state: ViziaState::new(|| (380, 632)),
             on: BoolParam::new("On", true),
             thr: db("Trigger within", 12.0, 3.0, 40.0),
             body_db: db("Body lift", 8.0, 0.0, 12.0),
@@ -63,6 +65,7 @@ impl Default for ClapShaperParams {
             body_from: ms("Body from", 20.0, 5.0, 100.0),
             body_to: ms("Body to", 95.0, 20.0, 300.0),
             lean_db: db("Lean", 0.0, 0.0, 6.0),
+            centre_db: db("Tail to centre", 4.0, 0.0, 9.0),
             tail_db: db("Tail dip", 7.0, 0.0, 24.0),
             tail_from: ms("Tail from", 150.0, 40.0, 500.0),
             tail_to: ms("Tail to", 250.0, 60.0, 800.0),
@@ -88,6 +91,7 @@ impl ClapShaperParams {
             body_from_ms: self.body_from.value(),
             body_to_ms: self.body_to.value(),
             lean_db: self.lean_db.value(),
+            centre_db: self.centre_db.value(),
             ..SpaceSettings::default()
         }
     }
@@ -184,6 +188,7 @@ impl Plugin for ClapShaper {
                 row(cx, "From", |p| &p.tail_from);
                 row(cx, "To", |p| &p.tail_to);
                 row(cx, "Above", |p| &p.split);
+                row(cx, "To centre by", |p| &p.centre_db);
                 Label::new(
                     cx,
                     Data::status.map(|s| {

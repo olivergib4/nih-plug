@@ -29,6 +29,8 @@ pub struct ClapSpaceParams {
     pub job: EnumParam<Job>,
     #[id = "thr"]
     pub thr: FloatParam,
+    #[id = "before"]
+    pub before: FloatParam,
     #[id = "depth"]
     pub depth: FloatParam,
     #[id = "back"]
@@ -58,10 +60,14 @@ fn ms(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
 impl Default for ClapSpaceParams {
     fn default() -> Self {
         ClapSpaceParams {
-            editor_state: ViziaState::new(|| (380, 470)),
+            editor_state: ViziaState::new(|| (380, 502)),
             on: BoolParam::new("On", true),
             job: EnumParam::new("Job", Job::Growls),
             thr: db("Trigger within", 12.0, 3.0, 40.0),
+            before: FloatParam::new("Down before clap", 40.0, FloatRange::Linear { min: 0.0, max: 58.0 })
+                .with_unit(" ms")
+                .with_step_size(1.0)
+                .with_value_to_string(formatters::v2s_f32_rounded(0)),
             depth: db("Growl duck", 24.0, 0.0, 48.0),
             back: ms("Growls back at", 250.0, 50.0, 600.0),
             split: FloatParam::new("Growl split", 150.0, FloatRange::Skewed { min: 60.0, max: 1000.0, factor: FloatRange::skew_factor(-2.0) })
@@ -87,6 +93,7 @@ impl ClapSpaceParams {
             },
             thr_db: self.thr.value(),
             split_hz: self.split.value(),
+            before_ms: self.before.value(),
             depth_db: self.depth.value(),
             back_ms: self.back.value(),
             sub_hold_ms: self.sub_hold.value(),
@@ -178,6 +185,7 @@ impl Plugin for ClapSpace {
                 row(cx, "On", |p| &p.on);
                 row(cx, "Job", |p| &p.job);
                 row(cx, "Trigger within", |p| &p.thr);
+                row(cx, "Down before clap", |p| &p.before);
                 Label::new(cx, "Growls").height(Pixels(26.0)).top(Pixels(8.0));
                 row(cx, "Duck by", |p| &p.depth);
                 row(cx, "Back at", |p| &p.back);

@@ -13,7 +13,7 @@ clap sink back, more than 24 dB / 250 ms made no difference.
 
 It triggers when the sidechain's level above 2 kHz comes within *Trigger within* dB of the loudest recent hit, at most
 once per 150 ms, and not again until the level has fallen a further 12 dB. Feed it the clap alone: on a clipped drum bus
-the kick triggers it too. 5 ms of latency (reported to the host) so the gain is already down when the clap lands.
+the kick triggers it too. *Down before clap* (40 ms by default, 0 to 58) takes the growls or the sub down that long ahead of the clap as well: in every bounce where the clap's attack came through at full level, the mix was out for about 40 ms before the hit, and a sub running right up to the clap cost about 3 dB of its first milliseconds under the clip. This replaces a separate early trigger track. 64 ms of latency (reported to the host, the same at every setting).
 The line at the bottom shows how many claps it has reacted to and the gain right now.
 
 The DSP and its tests live in `plugins/clapdsp`.

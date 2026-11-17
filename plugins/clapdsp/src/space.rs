@@ -21,8 +21,9 @@
 //! the trigger (the detector fires on the first milliseconds of the zap). Feed it the clap on its own: on a
 //! clipped drum bus the kick's click is as bright as the clap and triggers it too.
 //!
-//! `Growls` and `Sub` delay the signal by `LOOK_MS` (reported as latency) so the gain is already down when
-//! the clap arrives. `ClapTail` and `Off` add no latency; `Off` is bit transparent.
+//! `Growls` and `Sub` delay the signal by `LOOK_MS` (reported as latency) so the gain is already down
+//! `before_ms` ahead of the clap (40 ms by default: in every bounce where the clap's attack came through
+//! at full level, the mix above 150 Hz and the sub were out for about 40 ms before the hit). `ClapTail` and `Off` add no latency; `Off` is bit transparent.
 //!
 //! The split is complementary: low = LR8 low-pass (two 4th-order Butterworth in series, the same magnitude
 //! as the zero-phase 4th-order filter the values were found with), high = input - low, so with the gain at
@@ -47,6 +48,9 @@ pub struct SpaceSettings {
     pub depth_db: f32,
     /// Growls: back to full level this long after the hit.
     pub back_ms: f32,
+    /// Growls and Sub: already down this long before the clap (0 = only from the clap on). At most
+    /// `LOOK_MS - FADE_MS`.
+    pub before_ms: f32,
     /// Sub: stays down until this long after the hit.
     pub sub_hold_ms: f32,
     /// Sub: back to full level this long after the hit.
@@ -74,6 +78,7 @@ impl Default for SpaceSettings {
             split_hz: 150.0,
             depth_db: 24.0,
             back_ms: 250.0,
+            before_ms: 40.0,
             sub_hold_ms: 55.0,
             sub_back_ms: 130.0,
             tail_db: 7.0,
@@ -88,8 +93,10 @@ impl Default for SpaceSettings {
     }
 }
 
-/// Lookahead of the `Growls` and `Sub` roles.
-pub const LOOK_MS: f32 = 5.0;
+/// Lookahead of the `Growls` and `Sub` roles: fixed, so the latency does not move with the "before" time.
+pub const LOOK_MS: f32 = 64.0;
+/// The gain goes down over this long, ending `before_ms` ahead of the clap.
+pub const FADE_MS: f32 = 5.0;
 /// The reference point of the timings ("the hit") lies this long after the detector fires.
 pub const HIT_AFTER_TRIGGER_MS: f32 = 2.9;
 /// How far the sub is taken down at the hit.
@@ -321,10 +328,11 @@ impl Space {
                 let d = -s.depth_db.abs();
                 let r0 = s.back_ms - 0.5 * GROWL_RETURN_MS;
                 let r1 = s.back_ms + 0.5 * GROWL_RETURN_MS;
-                if u <= -LOOK_MS || t >= r1 {
+                let b = s.before_ms.clamp(0.0, LOOK_MS - FADE_MS);
+                if u <= -(b + FADE_MS) || t >= r1 {
                     1.0
-                } else if u < 0.0 {
-                    db_to_gain(d * (u + LOOK_MS) / LOOK_MS)
+                } else if u < -b {
+                    db_to_gain(d * (u + b + FADE_MS) / FADE_MS)
                 } else if t <= r0 {
                     db_to_gain(d)
                 } else {
@@ -337,10 +345,13 @@ impl Space {
                 let down_end = HIT_AFTER_TRIGGER_MS + 3.0;
                 let hold = s.sub_hold_ms.max(down_end);
                 let back = s.sub_back_ms.max(hold + 1.0);
-                if u <= -LOOK_MS || t >= back {
+                let b = s.before_ms.clamp(0.0, LOOK_MS - FADE_MS);
+                // with no "before" time the fall runs into the first milliseconds of the hit, as it always did
+                let (f0, f1) = if b > 0.0 { (-(b + FADE_MS), -b) } else { (-FADE_MS, down_end) };
+                if u <= f0 || t >= back {
                     1.0
-                } else if u < down_end {
-                    db_to_gain(d * (u + LOOK_MS) / (down_end + LOOK_MS))
+                } else if u < f1 {
+                    db_to_gain(d * (u - f0) / (f1 - f0))
                 } else if t <= hold {
                     db_to_gain(d)
                 } else {
@@ -599,8 +610,11 @@ mod tests {
     }
 
     fn run(role: SpaceRole, main: &[f32], side: &[f32]) -> (Vec<f32>, Space) {
+        run_with(SpaceSettings { role, ..Default::default() }, main, side)
+    }
+
+    fn run_with(s: SpaceSettings, main: &[f32], side: &[f32]) -> (Vec<f32>, Space) {
         let mut sp = Space::new(SR);
-        let s = SpaceSettings { role, ..Default::default() };
         sp.update(&s);
         sp.reset();
         let mut l = main.to_vec();
@@ -637,7 +651,7 @@ mod tests {
         // a growl-like 1 kHz tone
         let (y, sp) = run(SpaceRole::Growls, &tone(n, 1000.0, 0.5), &side);
         assert_eq!(sp.triggers, 1);
-        let full = rms_db(&y[ms(20.0)..ms(150.0)]);
+        let full = rms_db(&y[ms(80.0)..ms(150.0)]);
         // already down when the clap arrives (the clap sits `look` later in the delayed signal)
         let at_hit = rms_db(&y[at + look..at + look + ms(10.0)]);
         assert!((full - at_hit - 24.0).abs() < 1.0, "at the hit {:.1} dB down", full - at_hit);
@@ -648,12 +662,12 @@ mod tests {
         // a 50 Hz sub in the same signal passes (within 1 dB: the low-pass delays it a little, so a small
         // part of it lands in the band that is turned down)
         let (ys, _) = run(SpaceRole::Growls, &tone(n, 50.0, 0.5), &side);
-        let sub_full = rms_db(&ys[ms(40.0)..ms(160.0)]);
+        let sub_full = rms_db(&ys[ms(80.0)..ms(160.0)]);
         let sub_held = rms_db(&ys[hit + ms(40.0)..hit + ms(200.0)]);
         assert!((sub_full - sub_held).abs() < 1.0, "sub moved {:.2} dB", sub_full - sub_held);
         // an octave above the split the full depth is reached
         let (yh, _) = run(SpaceRole::Growls, &tone(n, 300.0, 0.5), &side);
-        let d300 = rms_db(&yh[ms(40.0)..ms(160.0)]) - rms_db(&yh[hit + ms(40.0)..hit + ms(200.0)]);
+        let d300 = rms_db(&yh[ms(80.0)..ms(160.0)]) - rms_db(&yh[hit + ms(40.0)..hit + ms(200.0)]);
         assert!(d300 > 22.0, "300 Hz only {d300:.1} dB down");
     }
 
@@ -663,9 +677,9 @@ mod tests {
         let at = ms(200.0);
         let side = clap(n, at);
         let hit = at + ms(LOOK_MS) + ms(HIT_AFTER_TRIGGER_MS);
-        let (y, _) = run(SpaceRole::Sub, &tone(n, 45.0, 0.8), &side);
+        let (y, _) = run_with(SpaceSettings { role: SpaceRole::Sub, before_ms: 0.0, ..Default::default() }, &tone(n, 45.0, 0.8), &side);
         let peak = |a: usize, b: usize| y[a..b].iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let full = peak(ms(60.0), ms(150.0));
+        let full = peak(ms(100.0), ms(180.0));
         // full level until 5 ms before the trigger point
         assert!((peak(hit - ms(40.0), hit - ms(10.0)) / full - 1.0).abs() < 0.02);
         // down by 32 dB from just after the hit to 55 ms
@@ -673,6 +687,28 @@ mod tests {
         assert!(20.0 * (down / full).log10() < -30.0, "{:.1} dB", 20.0 * (down / full).log10());
         // back at 130 ms
         assert!((peak(hit + ms(135.0), hit + ms(200.0)) / full - 1.0).abs() < 0.02);
+    }
+
+    #[test]
+    fn growls_and_sub_are_already_down_40_ms_before_the_clap() {
+        let n = ms(900.0);
+        let at = ms(300.0);
+        let side = clap(n, at);
+        let hit = at + ms(LOOK_MS) + ms(HIT_AFTER_TRIGGER_MS);
+        for (role, hz, depth) in [(SpaceRole::Growls, 1000.0, 24.0), (SpaceRole::Sub, 45.0, 32.0)] {
+            let (y, _) = run(role, &tone(n, hz, 0.5), &side);
+            let peak = |a: usize, b: usize| y[a..b].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let full = peak(ms(100.0), ms(200.0));
+            // untouched until 50 ms before the clap
+            assert!((peak(hit - ms(90.0), hit - ms(50.0)) / full - 1.0).abs() < 0.02, "{role:?} moved early");
+            // fully down from 40 ms before it
+            let down = 20.0 * (peak(hit - ms(38.0), hit) / full).log10();
+            assert!((down + depth).abs() < 1.5, "{role:?} {down:.1} dB before the clap");
+            // with the time at 0 the 40 ms before the clap stay at full level
+            let (y0, _) = run_with(SpaceSettings { role, before_ms: 0.0, ..Default::default() }, &tone(n, hz, 0.5), &side);
+            let p0 = y0[hit - ms(40.0)..hit - ms(12.0)].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!((p0 / full - 1.0).abs() < 0.02, "{role:?} moved with before = 0");
+        }
     }
 
     #[test]

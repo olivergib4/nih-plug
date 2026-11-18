@@ -39,3 +39,6 @@ name = "Clap Space"
 
 [clapshaper]
 name = "Clap Shaper"
+
+[budget]
+name = "Budget"

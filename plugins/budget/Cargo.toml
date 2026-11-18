@@ -1,0 +1,15 @@
+[package]
+name = "budget"
+version = "1.0.0"
+edition = "2021"
+authors = ["OGII"]
+license = "GPL-3.0-or-later"
+description = "Shows how loud the growls and the sub may get before they take room from the clap"
+homepage = "https://github.com/olivergib4/nih-plug/tree/master/plugins/budget"
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+nih_plug = { path = "../../", features = ["assert_process_allocs"] }
+nih_plug_vizia = { path = "../../nih_plug_vizia" }

@@ -47,6 +47,7 @@ members = [
   "plugins/onsetguard",
   "plugins/clapdsp",
   "plugins/clapspace",
+  "plugins/budget",
   "plugins/clapshaper",
 ]
 

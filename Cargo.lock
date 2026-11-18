@@ -849,6 +849,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "budget"
+version = "1.0.0"
+dependencies = [
+ "nih_plug",
+ "nih_plug_vizia",
+]
+
+[[package]]
 name = "buffr_glitch"
 version = "0.2.0"
 dependencies = [

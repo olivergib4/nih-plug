@@ -48,6 +48,13 @@ pub struct SpaceSettings {
     pub depth_db: f32,
     /// Growls: back to full level this long after the hit.
     pub back_ms: f32,
+    /// Growls: after coming back they stay this many dB (positive) under full level until `soft1_until_ms`
+    /// after the hit, then `soft2_db` under until `soft2_until_ms`, then full. Each change takes
+    /// `SOFT_STEP_MS`, so it can be placed in a gap between two growl hits and is not heard as a swell.
+    pub soft1_db: f32,
+    pub soft1_until_ms: f32,
+    pub soft2_db: f32,
+    pub soft2_until_ms: f32,
     /// Growls and Sub: already down this long before the clap (0 = only from the clap on). At most
     /// `LOOK_MS - FADE_MS`.
     pub before_ms: f32,
@@ -87,6 +94,10 @@ impl Default for SpaceSettings {
             split_hz: 150.0,
             depth_db: 24.0,
             back_ms: 250.0,
+            soft1_db: 0.0,
+            soft1_until_ms: 375.0,
+            soft2_db: 0.0,
+            soft2_until_ms: 505.0,
             before_ms: 40.0,
             sub_hold_ms: 55.0,
             sub_back_ms: 130.0,
@@ -116,6 +127,8 @@ pub const HIT_AFTER_TRIGGER_MS: f32 = 2.9;
 pub const SUB_DEPTH_DB: f32 = 32.0;
 /// The growls return over this long, centred on `back_ms`.
 pub const GROWL_RETURN_MS: f32 = 30.0;
+/// Each change of the softer level after the return takes this long.
+pub const SOFT_STEP_MS: f32 = 20.0;
 pub const RETRIGGER_MS: f32 = 150.0;
 /// After a trigger the detector re-arms only once the envelope has fallen this far below the trigger
 /// level, so a clap with a long bright tail (a bus that adds reverb or upward compression) counts once.
@@ -455,14 +468,32 @@ impl Space {
                 let r0 = s.back_ms - 0.5 * GROWL_RETURN_MS;
                 let r1 = s.back_ms + 0.5 * GROWL_RETURN_MS;
                 let b = s.before_ms.clamp(0.0, LOOK_MS - FADE_MS);
-                if u <= -(b + FADE_MS) || t >= r1 {
+                // the softer levels after the return: `a1` until `u1`, `a2` until `u2`, then full
+                let u1 = s.soft1_until_ms;
+                let a1 = if s.soft1_db > 0.0 && u1 > r1 { -s.soft1_db } else { 0.0 };
+                let u2 = s.soft2_until_ms.max(u1 + SOFT_STEP_MS);
+                let a2 = if a1 < 0.0 && s.soft2_db > 0.0 { -s.soft2_db } else { 0.0 };
+                let h = 0.5 * SOFT_STEP_MS;
+                if u <= -(b + FADE_MS) {
                     1.0
                 } else if u < -b {
                     db_to_gain(d * (u + b + FADE_MS) / FADE_MS)
                 } else if t <= r0 {
                     db_to_gain(d)
+                } else if t < r1 {
+                    db_to_gain(a1 + (d - a1) * (r1 - t) / GROWL_RETURN_MS)
+                } else if a1 == 0.0 {
+                    1.0
+                } else if t <= u1 - h {
+                    db_to_gain(a1)
+                } else if t < u1 + h {
+                    db_to_gain(a1 + (a2 - a1) * (t - (u1 - h)) / SOFT_STEP_MS)
+                } else if a2 == 0.0 || t >= u2 + h {
+                    1.0
+                } else if t <= u2 - h {
+                    db_to_gain(a2)
                 } else {
-                    db_to_gain(d * (r1 - t) / GROWL_RETURN_MS)
+                    db_to_gain(a2 * (u2 + h - t) / SOFT_STEP_MS)
                 }
             }
             SpaceRole::Sub => {
@@ -960,6 +991,23 @@ mod tests {
         assert!((d - 10.0).abs() < 0.3, "{d:.2}");
         let after = rms_db(&y[hit + ms(330.0)..hit + ms(500.0)]) - rms_db(&x[hit + ms(330.0)..hit + ms(500.0)]);
         assert!(after.abs() < 0.05, "{after:.3}");
+    }
+
+    #[test]
+    fn growls_come_back_softer_in_two_steps_and_then_reach_full_level() {
+        let n = ms(1200.0);
+        let at = ms(100.0);
+        let trig = clap(n, at);
+        let x: Vec<f32> = (0..n).map(|i| 0.3 * (2.0 * std::f32::consts::PI * 2000.0 * i as f32 / SR).sin()).collect();
+        let s = SpaceSettings { role: SpaceRole::Growls, soft1_db: 4.5, soft1_until_ms: 375.0, soft2_db: 2.0, soft2_until_ms: 505.0, ..Default::default() };
+        let (y, sp) = run_with(s, &x, &trig);
+        assert_eq!(sp.triggers, 1);
+        let hit = at + ms(LOOK_MS) + ms(HIT_AFTER_TRIGGER_MS);
+        let lvl = |a: f32, b: f32| rms_db(&y[hit + ms(a)..hit + ms(b)]) - rms_db(&x[hit + ms(a)..hit + ms(b)]);
+        assert!((lvl(100.0, 220.0) + 24.0).abs() < 0.5, "{:.2}", lvl(100.0, 220.0));
+        assert!((lvl(280.0, 355.0) + 4.5).abs() < 0.2, "{:.2}", lvl(280.0, 355.0));
+        assert!((lvl(395.0, 485.0) + 2.0).abs() < 0.2, "{:.2}", lvl(395.0, 485.0));
+        assert!(lvl(530.0, 700.0).abs() < 0.05, "{:.3}", lvl(530.0, 700.0));
     }
 
     #[test]

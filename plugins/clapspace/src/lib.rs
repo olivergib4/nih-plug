@@ -35,6 +35,14 @@ pub struct ClapSpaceParams {
     pub depth: FloatParam,
     #[id = "back"]
     pub back: FloatParam,
+    #[id = "soft1"]
+    pub soft1: FloatParam,
+    #[id = "soft1_to"]
+    pub soft1_to: FloatParam,
+    #[id = "soft2"]
+    pub soft2: FloatParam,
+    #[id = "soft2_to"]
+    pub soft2_to: FloatParam,
     #[id = "split"]
     pub split: FloatParam,
     #[id = "sub_hold"]
@@ -60,7 +68,7 @@ fn ms(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
 impl Default for ClapSpaceParams {
     fn default() -> Self {
         ClapSpaceParams {
-            editor_state: ViziaState::new(|| (380, 502)),
+            editor_state: ViziaState::new(|| (380, 622)),
             on: BoolParam::new("On", true),
             job: EnumParam::new("Job", Job::Growls),
             thr: db("Trigger within", 12.0, 3.0, 40.0),
@@ -70,6 +78,10 @@ impl Default for ClapSpaceParams {
                 .with_value_to_string(formatters::v2s_f32_rounded(0)),
             depth: db("Growl duck", 24.0, 0.0, 48.0),
             back: ms("Growls back at", 250.0, 50.0, 600.0),
+            soft1: db("Growls softer after", 0.0, 0.0, 18.0),
+            soft1_to: ms("Softer until", 375.0, 100.0, 900.0),
+            soft2: db("Growls then softer", 0.0, 0.0, 18.0),
+            soft2_to: ms("Then until", 505.0, 150.0, 1200.0),
             split: FloatParam::new("Growl split", 150.0, FloatRange::Skewed { min: 60.0, max: 1000.0, factor: FloatRange::skew_factor(-2.0) })
                 .with_unit(" Hz")
                 .with_step_size(1.0)
@@ -96,6 +108,10 @@ impl ClapSpaceParams {
             before_ms: self.before.value(),
             depth_db: self.depth.value(),
             back_ms: self.back.value(),
+            soft1_db: self.soft1.value(),
+            soft1_until_ms: self.soft1_to.value(),
+            soft2_db: self.soft2.value(),
+            soft2_until_ms: self.soft2_to.value(),
             sub_hold_ms: self.sub_hold.value(),
             sub_back_ms: self.sub_back.value(),
             ..SpaceSettings::default()
@@ -189,6 +205,10 @@ impl Plugin for ClapSpace {
                 Label::new(cx, "Growls").height(Pixels(26.0)).top(Pixels(8.0));
                 row(cx, "Duck by", |p| &p.depth);
                 row(cx, "Back at", |p| &p.back);
+                row(cx, "Then softer by", |p| &p.soft1);
+                row(cx, "until", |p| &p.soft1_to);
+                row(cx, "then softer by", |p| &p.soft2);
+                row(cx, "until", |p| &p.soft2_to);
                 row(cx, "Above", |p| &p.split);
                 Label::new(cx, "Sub").height(Pixels(26.0)).top(Pixels(8.0));
                 row(cx, "Down until", |p| &p.sub_hold);

@@ -75,6 +75,11 @@ pub struct SpaceSettings {
     /// Clap lean (dB): the left channel's mids come up by this much early in the clap and the right
     /// channel's highs by 0.8 of it late, so the clap starts a little left and ends a little right.
     pub lean_db: f32,
+    /// Clap left/right tone split (dB): in the body of the clap (from `TONE_FROM_MS` to `TONE_TO_MS` after the
+    /// hit) the left channel is this much louder than the right around `TONE_MID_HZ`, and the right is
+    /// `TONE_HIGH_RATIO` of it louder than the left around `TONE_HIGH_HZ`. Half goes on each side, so the
+    /// sum of the two stays where it was. Negative mirrors it.
+    pub tone_split_db: f32,
     /// Clap tail to centre (dB): from `CENTRE_FROM_MS` to `tail_to_ms` the sides of the tail come down by
     /// this much and both centre and sides are then raised together so the stereo level stays where it
     /// was. The tail folds to mono louder and loses nothing in stereo.
@@ -109,6 +114,7 @@ impl Default for SpaceSettings {
             body_from_ms: 20.0,
             body_to_ms: 95.0,
             lean_db: 0.0,
+            tone_split_db: 0.0,
             centre_db: 0.0,
             push_db: 0.0,
             push_from_ms: 23.0,
@@ -149,6 +155,16 @@ pub const LEAN_MID_HI_HZ: f32 = 2100.0;
 pub const LEAN_HIGH_LO_HZ: f32 = 1000.0;
 pub const LEAN_HIGH_HI_HZ: f32 = 14000.0;
 pub const LEAN_RIGHT_RATIO: f32 = 0.8;
+/// Left/right tone split: two bells per channel, and the part of the clap they act on.
+pub const TONE_MID_HZ: f32 = 950.0;
+pub const TONE_MID_Q: f32 = 1.0;
+pub const TONE_HIGH_HZ: f32 = 3600.0;
+pub const TONE_HIGH_Q: f32 = 0.8;
+pub const TONE_HIGH_RATIO: f32 = 0.6;
+pub const TONE_FROM_MS: f32 = 12.0;
+pub const TONE_TO_MS: f32 = 105.0;
+const TONE_FADE_IN_MS: f32 = 8.0;
+const TONE_FADE_OUT_MS: f32 = 20.0;
 /// Tail to centre: band, start (the end is `tail_to_ms`) and fades.
 pub const CENTRE_LO_HZ: f32 = 400.0;
 pub const CENTRE_HI_HZ: f32 = 7000.0;
@@ -194,6 +210,19 @@ impl Bq {
         self.b2 = (1.0 + c) / 2.0 / a0;
         self.a1 = -2.0 * c / a0;
         self.a2 = (1.0 - al) / a0;
+    }
+    /// A bell of `gain_db` at `f0`.
+    fn peaking(&mut self, sr: f64, f0: f64, q: f64, gain_db: f64) {
+        let a = 10f64.powf(gain_db / 40.0);
+        let w = 2.0 * std::f64::consts::PI * f0 / sr;
+        let (c, s) = (w.cos(), w.sin());
+        let al = s / (2.0 * q);
+        let a0 = 1.0 + al / a;
+        self.b0 = (1.0 + al * a) / a0;
+        self.b1 = -2.0 * c / a0;
+        self.b2 = (1.0 - al * a) / a0;
+        self.a1 = -2.0 * c / a0;
+        self.a2 = (1.0 - al / a) / a0;
     }
     #[inline]
     fn run(&mut self, x: f64) -> f64 {
@@ -298,6 +327,10 @@ pub struct Space {
     lean_l: [Bq; 2],
     lean_r: [Bq; 2],
     lean_l_gain: f32,
+    /// Tone split: mid and high bell of the left and of the right channel, and how far it is faded in.
+    tone_l: [Bq; 2],
+    tone_r: [Bq; 2],
+    tone_w: f32,
     lean_r_gain: f32,
     /// Tail to centre: band of the mid and of the side channel, their smoothed powers, the weight.
     cen_m: [Bq; 2],
@@ -345,6 +378,9 @@ impl Space {
             lean_l: [Bq::default(); 2],
             lean_r: [Bq::default(); 2],
             lean_l_gain: 1.0,
+            tone_l: [Bq::default(); 2],
+            tone_r: [Bq::default(); 2],
+            tone_w: 0.0,
             lean_r_gain: 1.0,
             cen_m: [Bq::default(); 2],
             cen_s: [Bq::default(); 2],
@@ -412,6 +448,10 @@ impl Space {
         self.cpos = 0;
         self.lean_l_gain = 1.0;
         self.lean_r_gain = 1.0;
+        for b in self.tone_l.iter_mut().chain(self.tone_r.iter_mut()) {
+            b.clear();
+        }
+        self.tone_w = 0.0;
         for b in self.cen_m.iter_mut().chain(self.cen_s.iter_mut()) {
             b.clear();
         }
@@ -441,6 +481,17 @@ impl Space {
                 for (i, b) in ch.iter_mut().enumerate() {
                     b.lowpass(self.sr as f64, f, BW4_Q[i % 2]);
                 }
+            }
+        }
+        if s.tone_split_db != self.cur.tone_split_db {
+            let (sr, d) = (self.sr as f64, s.tone_split_db as f64);
+            let h = d * TONE_HIGH_RATIO as f64;
+            self.tone_l[0].peaking(sr, TONE_MID_HZ as f64, TONE_MID_Q as f64, 0.5 * d);
+            self.tone_l[1].peaking(sr, TONE_HIGH_HZ as f64, TONE_HIGH_Q as f64, -0.5 * h);
+            self.tone_r[0].peaking(sr, TONE_MID_HZ as f64, TONE_MID_Q as f64, -0.5 * d);
+            self.tone_r[1].peaking(sr, TONE_HIGH_HZ as f64, TONE_HIGH_Q as f64, 0.5 * h);
+            for b in self.tone_l.iter_mut().chain(self.tone_r.iter_mut()) {
+                b.clear();
             }
         }
         if s.role != self.cur.role {
@@ -762,6 +813,35 @@ impl Space {
                 }
                 if self.lean_r_gain != 1.0 {
                     channels[1][i] += (self.lean_r_gain - 1.0) * rb;
+                }
+            }
+
+            // left/right tone split, on what the stages above produced: each channel is cross-faded to its
+            // own pair of bells for the body of the clap
+            if role == SpaceRole::ClapTail && nch > 1 && self.cur.tone_split_db != 0.0 {
+                let idle = self.since > (self.sr as usize) * 4;
+                let t = u - HIT_AFTER_TRIGGER_MS;
+                let wt = if idle || t <= TONE_FROM_MS || t >= TONE_TO_MS + TONE_FADE_OUT_MS {
+                    0.0
+                } else if t < TONE_FROM_MS + TONE_FADE_IN_MS {
+                    (t - TONE_FROM_MS) / TONE_FADE_IN_MS
+                } else if t <= TONE_TO_MS {
+                    1.0
+                } else {
+                    (TONE_TO_MS + TONE_FADE_OUT_MS - t) / TONE_FADE_OUT_MS
+                };
+                self.tone_w += (wt - self.tone_w) * self.slew;
+                if (self.tone_w - wt).abs() < 1e-6 {
+                    self.tone_w = wt;
+                }
+                let (xl, xr) = (channels[0][i], channels[1][i]);
+                let ml = self.tone_l[0].run(xl as f64);
+                let yl = self.tone_l[1].run(ml) as f32;
+                let mr = self.tone_r[0].run(xr as f64);
+                let yr = self.tone_r[1].run(mr) as f32;
+                if self.tone_w > 0.0 {
+                    channels[0][i] = xl + self.tone_w * (yl - xl);
+                    channels[1][i] = xr + self.tone_w * (yr - xr);
                 }
             }
 
@@ -1228,6 +1308,38 @@ mod tests {
         // and nothing is left of it afterwards
         assert_eq!(&x[hit + ms(240.0)..], &l[hit + ms(240.0)..]);
         assert_eq!(&x[hit + ms(240.0)..], &r[hit + ms(240.0)..]);
+    }
+
+    #[test]
+    fn tone_split_makes_the_left_louder_in_the_mids_and_the_right_in_the_highs_in_the_body_only() {
+        let n = ms(900.0);
+        let at = ms(400.0);
+        let trig = clap(n, at);
+        let mid = tone(n, 950.0, 0.05);
+        let high = tone(n, 3600.0, 0.05);
+        let mut sp = Space::new(SR);
+        sp.update(&SpaceSettings { role: SpaceRole::ClapTail, tail_db: 0.0, tone_split_db: 3.0, ..Default::default() });
+        sp.reset();
+        let x: Vec<f32> = (0..n).map(|i| trig[i] + mid[i] + high[i]).collect();
+        let (mut l, mut r) = (x.clone(), x.clone());
+        let (li, ri) = (l.clone(), r.clone());
+        sp.process(&mut [&mut l, &mut r], None, n);
+        undelay(&sp, &mut l, &li);
+        undelay(&sp, &mut r, &ri);
+        let hit = at + ms(HIT_AFTER_TRIGGER_MS);
+        let probe = |y: &[f32], w: &[f32], a: f32, b: f32| {
+            let (i0, i1) = (hit + ms(a), hit + ms(b));
+            20.0 * ((y[i0..i1].iter().zip(&w[i0..i1]).map(|(p, q)| p * q).sum::<f32>() / x[i0..i1].iter().zip(&w[i0..i1]).map(|(p, q)| p * q).sum::<f32>()).abs()).log10()
+        };
+        let (lm, rm) = (probe(&l, &mid, 40.0, 100.0), probe(&r, &mid, 40.0, 100.0));
+        assert!((lm - 1.5).abs() < 0.4 && (rm + 1.5).abs() < 0.4, "mids left {lm:.2} right {rm:.2} dB");
+        let (lh, rh) = (probe(&l, &high, 40.0, 100.0), probe(&r, &high, 40.0, 100.0));
+        assert!((lh + 0.9).abs() < 0.4 && (rh - 0.9).abs() < 0.4, "highs left {lh:.2} right {rh:.2} dB");
+        // the first 12 ms after the hit and everything from 200 ms on are as they came in
+        assert!(l[hit..hit + ms(10.0)] == x[hit..hit + ms(10.0)], "moved at the hit");
+        let late = hit + ms(200.0);
+        let err = l[late..].iter().zip(&x[late..]).chain(r[late..].iter().zip(&x[late..])).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(err < 1e-4, "still moving after the body: {err}");
     }
 
     #[test]

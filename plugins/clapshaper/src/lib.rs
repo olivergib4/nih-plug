@@ -28,6 +28,8 @@ pub struct ClapShaperParams {
     pub body_to: FloatParam,
     #[id = "lean_db"]
     pub lean_db: FloatParam,
+    #[id = "tone_db"]
+    pub tone_db: FloatParam,
     #[id = "centre_db"]
     pub centre_db: FloatParam,
     #[id = "push_db"]
@@ -63,7 +65,7 @@ fn ms(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
 impl Default for ClapShaperParams {
     fn default() -> Self {
         ClapShaperParams {
-            editor_state: ViziaState::new(|| (380, 762)),
+            editor_state: ViziaState::new(|| (380, 826)),
             on: BoolParam::new("On", true),
             thr: db("Trigger within", 12.0, 3.0, 40.0),
             body_db: db("Body lift", 8.0, 0.0, 12.0),
@@ -71,6 +73,7 @@ impl Default for ClapShaperParams {
             body_from: ms("Body from", 20.0, 5.0, 100.0),
             body_to: ms("Body to", 95.0, 20.0, 300.0),
             lean_db: db("Lean", 0.0, 0.0, 6.0),
+            tone_db: db("Left/right tone split", 0.0, -6.0, 6.0),
             centre_db: db("Tail to centre", 4.0, 0.0, 9.0),
             push_db: db("Push", 0.0, 0.0, 12.0),
             push_from: ms("Push from", 23.0, 5.0, 100.0),
@@ -100,6 +103,7 @@ impl ClapShaperParams {
             body_from_ms: self.body_from.value(),
             body_to_ms: self.body_to.value(),
             lean_db: self.lean_db.value(),
+            tone_split_db: self.tone_db.value(),
             centre_db: self.centre_db.value(),
             push_db: self.push_db.value(),
             push_from_ms: self.push_from.value(),
@@ -199,6 +203,8 @@ impl Plugin for ClapShaper {
                 row(cx, "To", |p| &p.push_to);
                 Label::new(cx, "Lean (starts left, ends right)").height(Pixels(26.0)).top(Pixels(8.0));
                 row(cx, "Lean by", |p| &p.lean_db);
+                Label::new(cx, "Left/right tone (clap body only)").height(Pixels(26.0)).top(Pixels(8.0));
+                row(cx, "Left mids, right highs", |p| &p.tone_db);
                 Label::new(cx, "Tail").height(Pixels(26.0)).top(Pixels(8.0));
                 row(cx, "Dip by (minus lifts)", |p| &p.tail_db);
                 row(cx, "From", |p| &p.tail_from);

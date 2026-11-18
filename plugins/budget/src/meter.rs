@@ -113,6 +113,11 @@ pub struct Meter {
     hop: usize,
     pub role: Role,
     pub thr_db: f32,
+    /// Gain (linear) that still follows on this bus after the meter: its fader, the drive of a later clip.
+    pub gain_after: f32,
+    /// A clip at full scale follows after that gain (the bus clip the growls and the sub run into), so the
+    /// levels are read as they leave that clip and not as they enter it.
+    pub clip_after: bool,
     band: [Hp4; 2],
     det: Hp4,
     env: f32,
@@ -151,6 +156,8 @@ impl Meter {
             hop: ((sr * HOP_MS / 1000.0).round() as usize).max(1),
             role,
             thr_db: 12.0,
+            gain_after: 1.0,
+            clip_after: false,
             band: [Hp4::new(sr, 150.0); 2],
             det: Hp4::new(sr, 2000.0),
             env: 0.0,
@@ -181,7 +188,7 @@ impl Meter {
     }
 
     pub fn reset(&mut self) {
-        *self = Meter { thr_db: self.thr_db, ..Meter::new(self.sr, self.role) };
+        *self = Meter { thr_db: self.thr_db, gain_after: self.gain_after, clip_after: self.clip_after, ..Meter::new(self.sr, self.role) };
     }
 
     pub fn readings(&self) -> Readings {
@@ -288,6 +295,12 @@ impl Meter {
             let free = self.since == usize::MAX || self.since >= self.retrig;
             if free && self.env > 1e-3 && self.env >= before_peak * rel && self.env >= self.peak * rel {
                 self.on_trigger();
+            }
+            // the level as it will be after what still follows on this bus
+            let (mut l, mut r) = (l * self.gain_after, r * self.gain_after);
+            if self.clip_after {
+                l = l.clamp(-1.0, 1.0);
+                r = r.clamp(-1.0, 1.0);
             }
             let p = if self.role == Role::Sub {
                 0.5 * (l * l + r * r)
@@ -397,5 +410,31 @@ mod tests {
         // a bright growl with no sidechain at all never counts as a clap
         let m = run(Role::Growls, &tone(n, 4000.0, |t| if (t as usize / 200) % 2 == 0 { 0.5 } else { 0.0 }), None);
         assert_eq!(m.triggers, 0);
+    }
+
+    #[test]
+    fn a_fader_and_a_clip_after_the_meter_are_taken_into_account() {
+        let n = ms(9000.0);
+        let side = claps(n, 500.0, 1714.0, 0.8);
+        // a 1 kHz tone 6 dB over full scale, then a -3 dB fader, then a clip at full scale: a square-ish wave
+        let growl = tone(n, 1000.0, |_| 2.0);
+        let mut m = Meter::new(SR, Role::Growls);
+        m.gain_after = 10f32.powf(-3.0 / 20.0);
+        m.clip_after = true;
+        for (k, c) in growl.chunks(512).enumerate() {
+            let s = &side[k * 512..k * 512 + c.len()];
+            m.process([c, c], Some([s, s]));
+        }
+        let rest = m.readings().rest.unwrap();
+        // a sine clipped 3 dB over full scale has an RMS between a sine's (-3 dB) and a square's (0 dB)
+        assert!(rest > -2.0 && rest < 0.0, "{rest:.2}");
+        // without the clip the same signal reads 6 - 3 - 3 = 0 dB
+        let mut m = Meter::new(SR, Role::Growls);
+        m.gain_after = 10f32.powf(-3.0 / 20.0);
+        for (k, c) in growl.chunks(512).enumerate() {
+            let s = &side[k * 512..k * 512 + c.len()];
+            m.process([c, c], Some([s, s]));
+        }
+        assert!((m.readings().rest.unwrap() - 0.0).abs() < 0.3);
     }
 }

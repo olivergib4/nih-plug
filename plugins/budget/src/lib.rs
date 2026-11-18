@@ -78,6 +78,9 @@ pub struct BudgetParams {
     /// Whatever changes this bus's level after this copy (its fader, a later clip's drive).
     #[id = "trim"]
     pub trim: FloatParam,
+    /// A clip at full scale follows after that level change (the bus clip the growls and the sub run into).
+    #[id = "clip_after"]
+    pub clip_after: BoolParam,
     #[id = "g_after"]
     pub g_after: FloatParam,
     #[id = "g_rest"]
@@ -100,10 +103,11 @@ fn db(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
 impl Default for BudgetParams {
     fn default() -> Self {
         BudgetParams {
-            editor_state: ViziaState::new(|| (640, 470)),
+            editor_state: ViziaState::new(|| (700, 540)),
             bus: EnumParam::new("This is", Bus::Drums),
             thr: db("Trigger within", 12.0, 3.0, 40.0),
             trim: db("Level change after this", 0.0, -24.0, 24.0),
+            clip_after: BoolParam::new("Then clipped", false),
             // how far under the clap each one has to stay; the defaults are what sounded right in the
             // tough session (growls) and what the reference does (sub)
             g_after: db("Budget: growls right after the clap", 8.0, 0.0, 30.0),
@@ -163,8 +167,8 @@ fn now_and_left(level: Option<f32>, clap: Option<f32>, budget: f32) -> (String, 
             let left = if left >= 0.0 { format!("{left:.1} dB left") } else { format!("OVER by {:.1} dB", -left) };
             (now, left)
         }
-        (None, _) => (String::from("--"), String::from("no reading")),
-        (_, None) => (String::from("--"), String::from("no clap level")),
+        (None, _) => (String::from("-"), String::from("no reading")),
+        (_, None) => (String::from("-"), String::from("no clap level")),
     }
 }
 
@@ -234,10 +238,12 @@ impl Plugin for Budget {
                     .font_weight(FontWeightKeyword::Thin)
                     .font_size(28.0)
                     .height(Pixels(44.0));
-                Label::new(cx, "One copy last on the drums, the growls and the sub. Put the clap on the sidechain of all three.").height(Pixels(26.0));
+                Label::new(cx, "One copy last on the drums, the growls and the sub.").height(Pixels(22.0));
+                Label::new(cx, "Clap on the sidechain of all three.").height(Pixels(26.0));
                 setting(cx, "This is", |p| &p.bus);
                 setting(cx, "Trigger within", |p| &p.thr);
                 setting(cx, "Level change after this", |p| &p.trim);
+                setting(cx, "Then clipped at full scale", |p| &p.clip_after);
                 Label::new(
                     cx,
                     Data::status.map(|s| {
@@ -254,7 +260,7 @@ impl Plugin for Budget {
                 HStack::new(cx, |cx| {
                     Label::new(cx, "").width(Pixels(150.0));
                     Label::new(cx, "now").width(Pixels(150.0));
-                    Label::new(cx, "budget: stay under by").width(Pixels(130.0));
+                    Label::new(cx, "budget (under by)").width(Pixels(130.0));
                     Label::new(cx, "left").width(Pixels(140.0));
                 })
                 .height(Pixels(24.0))
@@ -299,12 +305,14 @@ impl Plugin for Budget {
             meter.reset();
         }
         meter.thr_db = self.params.thr.value();
+        meter.gain_after = 10f32.powf(self.params.trim.value() / 20.0);
+        meter.clip_after = self.params.clip_after.value();
         let main = buffer.as_slice_immutable();
         let right = if main.len() > 1 { 1 } else { 0 };
         let side = aux.inputs.first().map(|b| b.as_slice_immutable()).filter(|sc| !sc.is_empty() && sc[0].len() >= len);
         let sc: Option<[&[f32]; 2]> = side.map(|sc| [&sc[0][..len], &sc[if sc.len() > 1 { 1 } else { 0 }][..len]]);
         meter.process([&main[0][..len], &main[right][..len]], sc);
-        slot.store(&meter.readings(), self.params.trim.value(), clock_ms());
+        slot.store(&meter.readings(), 0.0, clock_ms());
         self.status.claps.store(meter.triggers, Ordering::Relaxed);
         ProcessStatus::Normal
     }

@@ -6,6 +6,7 @@ sidechain; pick the job:
 | Job | What it does on each clap | Defaults |
 |---|---|---|
 | Growls: duck | Everything above *Above* (150 Hz) goes down by *Duck by* from the clap until *Back at*, then returns over 30 ms. Below the split nothing changes. | 24 dB, 250 ms |
+| Growls: softer return | After coming back the growls can stay a few dB under full level, in up to two steps (*Then softer by* / *until*), before they return to full. Each change takes 20 ms: set the two *until* times into gaps between growl hits and the clap gets its room with no audible swell. | off (0 dB) |
 | Sub: dip | The whole signal drops 32 dB at the hit, stays down until *Down until* and is at full level at *Full at*. | 55 ms, 130 ms |
 
 The defaults were found by ear against the first hit of the reference's second drop: 18 dB or 200 ms already let the

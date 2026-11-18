@@ -1,6 +1,7 @@
 //! Budget: shows how loud the growls and the sub may get before they take room from the clap.
 //!
-//! Put one copy last on the drums, one on the growls and one on the sub, set "This is" on each, and feed
+//! Put one copy last on the drums, one on the growls and one on the sub (or a single "Growls + Sub bus"
+//! copy after the clip the two share), set "This is" on each, and feed
 //! the clap into the sidechain of all three (the same signal Clap Space listens to). The
 //! copies share what they measure, so every one of them shows the whole table: each row is a level
 //! relative to the clap, its budget (how far under the clap it has to stay) and how much is left.
@@ -65,6 +66,10 @@ pub enum Bus {
     Growls,
     #[name = "Sub"]
     Sub,
+    /// A bus that carries the growls and the sub together (after its clip): above 150 Hz counts as the
+    /// growls, below as the sub.
+    #[name = "Growls + Sub bus"]
+    Bed,
 }
 
 #[derive(Params)]
@@ -103,7 +108,7 @@ fn db(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
 impl Default for BudgetParams {
     fn default() -> Self {
         BudgetParams {
-            editor_state: ViziaState::new(|| (700, 540)),
+            editor_state: ViziaState::new(|| (700, 565)),
             bus: EnumParam::new("This is", Bus::Drums),
             thr: db("Trigger within", 12.0, 3.0, 40.0),
             trim: db("Level change after this", 0.0, -24.0, 24.0),
@@ -128,11 +133,13 @@ pub struct Budget {
     params: Arc<BudgetParams>,
     status: Arc<Status>,
     meter: Option<Meter>,
+    /// The low half of a "Growls + Sub bus" copy.
+    lows: Option<Meter>,
 }
 
 impl Default for Budget {
     fn default() -> Self {
-        Budget { params: Arc::new(BudgetParams::default()), status: Arc::new(Status::default()), meter: None }
+        Budget { params: Arc::new(BudgetParams::default()), status: Arc::new(Status::default()), meter: None, lows: None }
     }
 }
 
@@ -238,7 +245,8 @@ impl Plugin for Budget {
                     .font_weight(FontWeightKeyword::Thin)
                     .font_size(28.0)
                     .height(Pixels(44.0));
-                Label::new(cx, "One copy last on the drums, the growls and the sub.").height(Pixels(22.0));
+                Label::new(cx, "One copy last on the drums, one on the growls and one on the sub").height(Pixels(22.0));
+                Label::new(cx, "(or one on the bus they share, after its clip).").height(Pixels(22.0));
                 Label::new(cx, "Clap on the sidechain of all three.").height(Pixels(26.0));
                 setting(cx, "This is", |p| &p.bus);
                 setting(cx, "Trigger within", |p| &p.thr);
@@ -280,11 +288,15 @@ impl Plugin for Budget {
 
     fn initialize(&mut self, _layout: &AudioIOLayout, buffer_config: &BufferConfig, _context: &mut impl InitContext<Self>) -> bool {
         self.meter = Some(Meter::new(buffer_config.sample_rate, Role::Drums));
+        self.lows = Some(Meter::new(buffer_config.sample_rate, Role::Lows));
         true
     }
 
     fn reset(&mut self) {
         if let Some(m) = &mut self.meter {
+            m.reset();
+        }
+        if let Some(m) = &mut self.lows {
             m.reset();
         }
     }
@@ -299,6 +311,7 @@ impl Plugin for Budget {
             Bus::Drums => (Role::Drums, &DRUMS),
             Bus::Growls => (Role::Growls, &GROWLS),
             Bus::Sub => (Role::Sub, &SUB),
+            Bus::Bed => (Role::Growls, &GROWLS),
         };
         if meter.role != role {
             meter.role = role;
@@ -313,6 +326,15 @@ impl Plugin for Budget {
         let sc: Option<[&[f32]; 2]> = side.map(|sc| [&sc[0][..len], &sc[if sc.len() > 1 { 1 } else { 0 }][..len]]);
         meter.process([&main[0][..len], &main[right][..len]], sc);
         slot.store(&meter.readings(), 0.0, clock_ms());
+        if self.params.bus.value() == Bus::Bed {
+            if let Some(lows) = &mut self.lows {
+                lows.thr_db = meter.thr_db;
+                lows.gain_after = meter.gain_after;
+                lows.clip_after = meter.clip_after;
+                lows.process([&main[0][..len], &main[right][..len]], sc);
+                SUB.store(&lows.readings(), 0.0, clock_ms());
+            }
+        }
         self.status.claps.store(meter.triggers, Ordering::Relaxed);
         ProcessStatus::Normal
     }

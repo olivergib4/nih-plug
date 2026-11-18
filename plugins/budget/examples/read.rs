@@ -11,6 +11,7 @@ fn main() {
     let role = match a[1].as_str() {
         "drums" => Role::Drums,
         "growls" => Role::Growls,
+        "lows" => Role::Lows,
         _ => Role::Sub,
     };
     let (l, r) = load(&a[2]);

@@ -7,7 +7,8 @@
 //! * `after`: the loudest 30 ms between 95 and 500 ms after the hit,
 //! * `rest`: the loudest 30 ms from 500 ms after the hit until 60 ms before the next one.
 //!
-//! Drums and growls are measured above 150 Hz, the sub over the full band. The reported value of each
+//! Drums and growls are measured above 150 Hz, the sub over the full band (`Lows`: below 150 Hz, for a
+//! bus that carries growls and sub together). The reported value of each
 //! window is the loudest of the last four claps (the mean for `during`), so one odd bar does not hide.
 
 pub const HOP_MS: f32 = 10.0;
@@ -23,6 +24,8 @@ pub enum Role {
     Drums,
     Growls,
     Sub,
+    /// The part below 150 Hz of a bus that carries the growls and the sub together.
+    Lows,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -37,6 +40,13 @@ struct Biquad {
 }
 
 impl Biquad {
+    fn lowpass(sr: f32, hz: f32, q: f32) -> Self {
+        let w = 2.0 * std::f32::consts::PI * hz / sr;
+        let (s, c) = w.sin_cos();
+        let al = s / (2.0 * q);
+        let a0 = 1.0 + al;
+        Biquad { b0: (1.0 - c) / 2.0 / a0, b1: (1.0 - c) / a0, b2: (1.0 - c) / 2.0 / a0, a1: -2.0 * c / a0, a2: (1.0 - al) / a0, z1: 0.0, z2: 0.0 }
+    }
     fn highpass(sr: f32, hz: f32, q: f32) -> Self {
         let w = 2.0 * std::f32::consts::PI * hz / sr;
         let (s, c) = w.sin_cos();
@@ -60,6 +70,10 @@ struct Hp4(Biquad, Biquad);
 impl Hp4 {
     fn new(sr: f32, hz: f32) -> Self {
         Hp4(Biquad::highpass(sr, hz, 0.541_196_1), Biquad::highpass(sr, hz, 1.306_563))
+    }
+    /// The same slopes as a low-pass.
+    fn low(sr: f32, hz: f32) -> Self {
+        Hp4(Biquad::lowpass(sr, hz, 0.541_196_1), Biquad::lowpass(sr, hz, 1.306_563))
     }
     #[inline]
     fn run(&mut self, x: f32) -> f32 {
@@ -158,7 +172,7 @@ impl Meter {
             thr_db: 12.0,
             gain_after: 1.0,
             clip_after: false,
-            band: [Hp4::new(sr, 150.0); 2],
+            band: if role == Role::Lows { [Hp4::low(sr, 150.0); 2] } else { [Hp4::new(sr, 150.0); 2] },
             det: Hp4::new(sr, 2000.0),
             env: 0.0,
             env_rel: (-1.0 / (0.005 * sr)).exp(),
@@ -436,5 +450,18 @@ mod tests {
             m.process([c, c], Some([s, s]));
         }
         assert!((m.readings().rest.unwrap() - 0.0).abs() < 0.3);
+    }
+
+    #[test]
+    fn one_bus_with_growls_and_sub_is_split_at_150_hz() {
+        let n = ms(9000.0);
+        let side = claps(n, 500.0, 1714.0, 0.8);
+        let g = tone(n, 1000.0, |_| 0.25);
+        let sub = tone(n, 50.0, |_| 0.5);
+        let bus: Vec<f32> = g.iter().zip(&sub).map(|(a, b)| a + b).collect();
+        let hi = run(Role::Growls, &bus, Some(&side)).readings().rest.unwrap();
+        let lo = run(Role::Lows, &bus, Some(&side)).readings().rest.unwrap();
+        assert!((hi - (-12.0 - 3.0)).abs() < 0.3, "{hi:.2}");
+        assert!((lo - (-6.0 - 3.0)).abs() < 0.3, "{lo:.2}");
     }
 }

@@ -5,7 +5,7 @@ Shows how loud the growls and the sub may get before they take room from the cla
 ## Setup
 
 1. Put one copy **last** on the drums bus, one on the growls and one on the sub.
-2. Set **This is** on each copy (Drums, Growls, Sub).
+2. Set **This is** on each copy (Drums, Growls, Sub). If the growls and the sub run into one clip on a shared bus, put a single copy after that clip and set it to **Growls + Sub bus**: it reads what is above 150 Hz as the growls and what is below as the sub, as they leave the clip. That is more exact than a copy on each track.
 3. Feed the clap into the sidechain of all three: the same signal Clap Space listens to. (The drums copy falls back to its own input when the sidechain is silent, but then the kick counts as a clap too.)
 4. If something after a copy changes that bus's level (its fader, the drive of a later clip), enter it as **Level change after this**. If a clip at full scale follows after that (the bus clip the growls and the sub run into), switch on **Then clipped at full scale**: the copy then reads the level as it leaves that clip, not as it enters it.
 

@@ -1,6 +1,7 @@
 //! Clap Shaper: shapes the clap itself after each hit. Put it last on the clap's bus, before the drum bus clip:
 //! it lifts the centre of the body (150 Hz to 1.5 kHz) while the clap sounds and dips the tail afterwards.
-//! It triggers from its own input, so no sidechain; 20 ms of latency for the phase-free body filter. See `clapdsp::space` (`ClapTail`) for the details.
+//! It triggers from its own input, or (with "Trigger from sidechain" on) from the clap fed into its sidechain, which is
+//! what to use on a drum bus where kicks pass through as well; 20 ms of latency for the phase-free body filter. See `clapdsp::space` (`ClapTail`) for the details.
 use clapdsp::space::{Space, SpaceRole, SpaceSettings};
 use nih_plug::prelude::*;
 use nih_plug_vizia::vizia::prelude::*;
@@ -18,6 +19,8 @@ pub struct ClapShaperParams {
     pub on: BoolParam,
     #[id = "thr"]
     pub thr: FloatParam,
+    #[id = "key"]
+    pub key: BoolParam,
     #[id = "body_db"]
     pub body_db: FloatParam,
     #[id = "body_side_db"]
@@ -65,9 +68,10 @@ fn ms(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
 impl Default for ClapShaperParams {
     fn default() -> Self {
         ClapShaperParams {
-            editor_state: ViziaState::new(|| (380, 826)),
+            editor_state: ViziaState::new(|| (380, 858)),
             on: BoolParam::new("On", true),
             thr: db("Trigger within", 12.0, 3.0, 40.0),
+            key: BoolParam::new("Trigger from sidechain", false),
             body_db: db("Body lift", 8.0, 0.0, 12.0),
             body_side_db: db("Body sides lift", 8.0, 0.0, 18.0),
             body_from: ms("Body from", 20.0, 5.0, 100.0),
@@ -108,6 +112,7 @@ impl ClapShaperParams {
             push_db: self.push_db.value(),
             push_from_ms: self.push_from.value(),
             push_to_ms: self.push_to.value(),
+            tail_keyed: self.key.value(),
             ..SpaceSettings::default()
         }
     }
@@ -165,6 +170,8 @@ impl Plugin for ClapShaper {
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
         main_input_channels: NonZeroU32::new(2),
         main_output_channels: NonZeroU32::new(2),
+        aux_input_ports: &[new_nonzero_u32(2)],
+        names: PortNames { layout: None, main_input: None, main_output: None, aux_inputs: &["Clap"], aux_outputs: &[] },
         ..AudioIOLayout::const_default()
     }];
 
@@ -192,6 +199,7 @@ impl Plugin for ClapShaper {
                 Label::new(cx, "Last on the clap's bus, before the drum clip.").height(Pixels(26.0));
                 row(cx, "On", |p| &p.on);
                 row(cx, "Trigger within", |p| &p.thr);
+                row(cx, "Trigger from sidechain", |p| &p.key);
                 Label::new(cx, "Body (150 Hz to 1.5 kHz)").height(Pixels(26.0)).top(Pixels(8.0));
                 row(cx, "Lift centre by", |p| &p.body_db);
                 row(cx, "Lift sides by", |p| &p.body_side_db);
@@ -241,7 +249,7 @@ impl Plugin for ClapShaper {
         }
     }
 
-    fn process(&mut self, buffer: &mut Buffer, _aux: &mut AuxiliaryBuffers, context: &mut impl ProcessContext<Self>) -> ProcessStatus {
+    fn process(&mut self, buffer: &mut Buffer, aux: &mut AuxiliaryBuffers, context: &mut impl ProcessContext<Self>) -> ProcessStatus {
         let Some(space) = &mut self.space else { return ProcessStatus::Normal };
         let len = buffer.samples();
         if len == 0 {
@@ -254,7 +262,9 @@ impl Plugin for ClapShaper {
             self.latency = latency;
             context.set_latency_samples(latency);
         }
-        space.process(buffer.as_slice(), None, len);
+        let side = aux.inputs.first().map(|b| b.as_slice_immutable()).filter(|sc| !sc.is_empty() && sc[0].len() >= len);
+        let sc: Option<[&[f32]; 2]> = side.map(|sc| [&sc[0][..len], &sc[if sc.len() > 1 { 1 } else { 0 }][..len]]);
+        space.process(buffer.as_slice(), sc, len);
         self.status.claps.store(space.triggers, Ordering::Relaxed);
         self.status.gain_tenths.store((space.gain_db * 10.0).round() as i32, Ordering::Relaxed);
         ProcessStatus::Normal

@@ -89,6 +89,10 @@ pub struct SpaceSettings {
     pub push_db: f32,
     pub push_from_ms: f32,
     pub push_to_ms: f32,
+    /// Clap tail: trigger from the sidechain (the clap on its own) instead of from the input. On a drum
+    /// bus the first kick after a silence is the loudest recent hit and would be shaped as if it were a
+    /// clap; keyed from the clap's own bus only claps trigger. Silent or missing sidechain: no triggers.
+    pub tail_keyed: bool,
 }
 
 impl Default for SpaceSettings {
@@ -119,6 +123,7 @@ impl Default for SpaceSettings {
             push_db: 0.0,
             push_from_ms: 23.0,
             push_to_ms: 63.0,
+            tail_keyed: false,
         }
     }
 }
@@ -649,7 +654,7 @@ impl Space {
         let mut min_gain = 1.0f32;
         for i in 0..len {
             // trigger
-            let trig = if keyed {
+            let trig = if keyed || (role == SpaceRole::ClapTail && self.cur.tail_keyed) {
                 match side {
                     Some(sc) => 0.5 * (sc[0][i] + sc[1][i]),
                     None => 0.0,
@@ -1088,6 +1093,48 @@ mod tests {
         assert!((lvl(280.0, 355.0) + 4.5).abs() < 0.2, "{:.2}", lvl(280.0, 355.0));
         assert!((lvl(395.0, 485.0) + 2.0).abs() < 0.2, "{:.2}", lvl(395.0, 485.0));
         assert!(lvl(530.0, 700.0).abs() < 0.05, "{:.3}", lvl(530.0, 700.0));
+    }
+
+    #[test]
+    fn keyed_clap_tail_ignores_a_kick_on_its_input() {
+        // input: a bright click ("kick") at 100 ms after silence, the clap at 957 ms; sidechain: the clap only
+        let n = ms(1800.0);
+        let mut x = vec![0.0f32; n];
+        let mut side = vec![0.0f32; n];
+        for (at, to_side) in [(ms(100.0), false), (ms(957.0), true)] {
+            for i in at..(at + ms(300.0)).min(n) {
+                let t = (i - at) as f32 / SR;
+                let noise = ((i as f32 * 12.9898).sin() * 43758.5).fract();
+                let v = 0.9 * noise * 10f32.powf(-(30.0 / 0.150) * t / 20.0);
+                x[i] += v;
+                if to_side {
+                    side[i] += v;
+                }
+            }
+        }
+        let mut st = SpaceSettings { role: SpaceRole::ClapTail, body_db: 8.0, push_db: 6.0, ..SpaceSettings::default() };
+        let run_with = |st: &SpaceSettings| {
+            let mut sp = Space::new(SR);
+            sp.update(st);
+            let mut l = x.clone();
+            let mut r = x.clone();
+            sp.process(&mut [&mut l[..], &mut r[..]], Some([&side[..], &side[..]]), n);
+            (l, sp.triggers)
+        };
+        let (own, own_trigs) = run_with(&st);
+        st.tail_keyed = true;
+        let (key, key_trigs) = run_with(&st);
+        assert_eq!(own_trigs, 2, "from its own input the kick triggers too");
+        assert_eq!(key_trigs, 1, "keyed: only the clap");
+        let look = ms(BODY_FIR_HALF_MS);
+        // keyed: the kick passes unchanged (delayed by the latency)
+        let a = ms(100.0) + look;
+        let d = rms_db(&key[a..a + ms(90.0)]) - rms_db(&x[ms(100.0)..ms(190.0)]);
+        assert!(d.abs() < 0.05, "kick changed by {d:.2} dB");
+        // the clap is shaped the same either way
+        let c = ms(957.0) + look;
+        let e: f32 = (c..c + ms(300.0)).map(|i| (own[i] - key[i]).abs()).fold(0.0, f32::max);
+        assert!(e < 1e-4, "clap differs by {e}");
     }
 
     #[test]
